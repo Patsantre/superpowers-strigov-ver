@@ -1207,6 +1207,18 @@ process.exit(r.personalConfig?.keptByWrapper === true && JSON.stringify(at(r.per
             echo "    got $st/$ec"
         fi
     done
+    # ZCode suffixes errors with " (traceId: <uuid>)" (findings U4); its digit runs must not match auth.
+    export ZCODE_STUB_MODE=quota
+    export ZCODE_STUB_MESSAGE="$(first_pattern quota) (traceId: 5e401b7c-1429-4d2a-9c3e-0f4012ab7c11)"
+    id="$(start_task --prompt-file "$prompt")"
+    st="$(wait_status "$id" 'completed|failed|cancelled' 20)"
+    ec="$("$ZD" status "$id" --json | jfield job.errorClass)"
+    if [[ "$st" == failed && "$ec" == quota ]]; then
+        pass "6 traceId suffix containing 401/429 is stripped before matching -> failed/quota, not auth"
+    else
+        fail "6 traceId suffix containing 401/429 is stripped before matching -> failed/quota, not auth"
+        echo "    got $st/$ec"
+    fi
     unset ZCODE_STUB_MESSAGE
     export ZCODE_STUB_MODE=ok
     id="$(ZCODE_NODE=/nonexistent/node start_task --prompt-file "$prompt")"
@@ -1972,10 +1984,12 @@ export function parseCliOutput(stdout) {
 }
 
 // First match wins: timeout, launch (spawn error), then the pattern lists, then crash.
+// ZCode ends every error with " (traceId: <uuid>)" (findings U4); strip it before matching,
+// because a uuid can contain digit runs such as 401 or 429.
 export function classifyFailure({ timedOut, spawnError, stdout, stderrTail }) {
   if (timedOut) return "timeout";
   if (spawnError) return "launch";
-  const haystack = `${stderrTail}\n${stdout}`.toLowerCase();
+  const haystack = `${stderrTail}\n${stdout}`.replace(/\s*\(traceId:[^)]*\)/gi, "").toLowerCase();
   for (const errorClass of ["model-not-selected", "auth", "quota", "launch"]) {
     if (PATTERNS[errorClass].some((pattern) => haystack.includes(pattern.toLowerCase()))) return errorClass;
   }
@@ -2365,7 +2379,7 @@ if (invokedDirectly) process.exitCode = await main(process.argv.slice(2));
 - [ ] **Step 6: Run the suite to verify it passes**
 
 Run: `bash tests/test-zcode-dispatch.sh`
-Expected: every line `[PASS] …` (47 assertions), last line `PASS`, exit 0, about 20 s. No `zcode-stub.cjs` process survives (`pgrep -f zcode-stub.cjs` prints nothing).
+Expected: every line `[PASS] …` (48 assertions), last line `PASS`, exit 0, about 20 s. No `zcode-stub.cjs` process survives (`pgrep -f zcode-stub.cjs` prints nothing).
 
 - [ ] **Step 7: Run the existing suite (regression)**
 
