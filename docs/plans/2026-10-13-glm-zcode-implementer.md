@@ -38,7 +38,7 @@ List 3–7 externally observable criteria that define "done" for the whole plan.
 
 1. `docs/zcode-cli-findings.md` exists and resolves spec §10 U1–U8, U10 and U11 — each with the answer, how it was verified and the ZCode version it holds for — plus the `## Inputs for later phases` table (every key of Contract C7 filled) and a `VERDICT: GO | NO-GO` line; on `NO-GO` the plan stops after Ф1 and the user decides.
 2. `bash tests/test-zcode-dispatch.sh` prints `PASS` with zero model calls (the CLI is the stub `tests/fixtures/zcode-stub.cjs`), covering spec §8.1 assertions 1–13; `bash tests/test-sdd-scripts.sh` still prints `PASS`.
-3. `bin/zcode-dispatch` implements `task` / `status` / `result` / `cancel` / `doctor` / `doctor --probe` exactly per Contracts C1–C5 (exit codes 0/1/2, pinned argv and environment, job records, per-workspace ids, guards); it never sets `ZCODE_DATA_BASE_DIR` and never reads or writes `~/.zcode`.
+3. `bin/zcode-dispatch` implements `task` / `status` / `result` / `cancel` / `doctor` / `doctor --probe` exactly per Contracts C1–C5 (exit codes 0/1/2, pinned argv and environment, the model pin in its own personal provider config under the state root passed as `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, job records, per-workspace ids, guards); it never sets `ZCODE_DATA_BASE_DIR` and never reads or writes `~/.zcode`.
 4. `skills/dev-orchestrator/SKILL.md`, `skills/dev-orchestrator/implementer-prompt.md`, the new `skills/zcode-invocation/SKILL.md` and `skills/codex-invocation/SKILL.md` encode spec §5–§6.3: the per-phase channel ladder, the `risk_phases` frontmatter map with its guards, the operation / body / dispatch-file / `.id`-sidecar scheme, GLM infrastructure-failure handling, the gate-stall diagnosis, the review-stall Sol escalation, the `impl=` / `glm=` state-line fields with the session marker, the kill switch, the ZCode preamble and channel-switch notice, and the six new Red Flags; frontend phases are routed exactly as before.
 5. Plugin version is `0.8.0` in `.claude-plugin/plugin.json`, `README.md`, `README.ru.md`, `PLUGIN_README.md` and the hero SVG badges; the docs name GLM-5.3-Flash via ZCode as the default implementer, Luna as the fallback and Sol as the risk-phase implementer and escalation, and carry the terms-respecting-GLM-access guardrail.
 6. The live acceptance (spec §8.2) is recorded in `docs/zcode-cli-findings.md`: `doctor` and `doctor --probe` pass, the E2E task ends `DONE` with nothing committed, the fix round appends `## Fix round 1`, and the 1.5× bonus result (active / not active / inconclusive, with raw numbers) also appears in `zcode-invocation` and both READMEs.
@@ -50,7 +50,7 @@ List explicit exclusions. Reviewers MUST classify requests for these as `REJECTE
 - Approach C — a permission broker over `zcode app-server` with `--mode guarded` (a real approval boundary for GLM). Future work (spec §11).
 - GLM as planner, reviewer, spec writer or diagnosis model; GLM for frontend phases; other GLM models (full GLM-5.3) or efforts other than `max`.
 - Raw Z.ai API or SDK access, token extraction, any use outside the ZCode CLI — forbidden, not deferred.
-- Installing the ZCode `superpowers-plugin` or any plugin into the user's ZCode; changing ZCode settings, model selection, login or plugins programmatically.
+- Installing the ZCode `superpowers-plugin` or any plugin into the user's ZCode; changing the user's ZCode settings (anything under `~/.zcode`, the desktop app's provider config), login or plugins programmatically. The one-time `zcode login zai` is the user's action; the wrapper's own personal provider config under its state root (C5), which carries the model pin, is wrapper state, not a ZCode setting.
 - Changes to the Codex reviewer roles, the plan writer, the ledger, the loop caps, the trivial quickfix path or the frontend route.
 - Automated quota accounting beyond the one-off bonus measurement; Linux / Windows support of the wrapper (macOS app bundle only).
 - Any configuration surface beyond the kill switch (`SP_IMPLEMENTER=luna`, session phrases) and the five `ZCODE_*` overrides of Contract C5.
@@ -132,10 +132,10 @@ zcode-dispatch cancel zt-NNNN [--cwd <path>]
     running → "cancelled zt-NNNN"; terminal → "zt-NNNN is <status>"; exit 0
 zcode-dispatch doctor [--cwd <path>] [--probe]
     one line per check "<ok|WARN|FAIL> <check>: <detail>" for, in order:
-    app, cli, provider-config, node, app-version, git, state-dir, kill-switch
+    app, cli, provider-config, node, app-version, git, state-dir, personal-config, kill-switch
     then "doctor: ok" | "doctor: FAIL" (exit 1 on any FAIL; --probe sends no request then)
     --probe, after "doctor: ok":
-      model-selected: ok | FAIL(<errorClass>)
+      model-selected: ok | FAIL(<errorClass>)   (FAIL(model-not-selected|auth): the CLI is not logged in — the user's one-time `zcode login zai`)
       answers: ok | FAIL
       reported-model: <string> | unreported
       usage: input=<n|-> cached=<n|-> output=<n|->
@@ -176,13 +176,13 @@ Guards on `task` (exit 2, nothing spawned): missing `--background`; `--resume-ta
 
 ### C3. State layout
 
-`<ZCODE_STATE_DIR>/state/<basename(root)>-<first 8 hex of sha1(root)>/jobs/zt-NNNN.{json,log}` (plus `zt-NNNN.json.terminal` once the job is terminal, C2), where `root` = `git rev-parse --show-toplevel` evaluated in `--cwd` (default: process cwd). The log holds the CLI's stderr plus `[zcode-dispatch] <ISO time> …` lines (argv summary with the prompt replaced by `<prompt N bytes>`, start/finish, classification reason, raw stdout on failure).
+`<ZCODE_STATE_DIR>/state/<basename(root)>-<first 8 hex of sha1(root)>/jobs/zt-NNNN.{json,log}` (plus `zt-NNNN.json.terminal` once the job is terminal, C2), and `<ZCODE_STATE_DIR>/personal-provider-config.json` (the wrapper-owned personal provider config, C5), where `root` = `git rev-parse --show-toplevel` evaluated in `--cwd` (default: process cwd). The log holds the CLI's stderr plus `[zcode-dispatch] <ISO time> …` lines (argv summary with the prompt replaced by `<prompt N bytes>`, start/finish, classification reason, raw stdout on failure).
 
 ### C4. Module exports of `bin/lib/zcode-dispatch.mjs`
 
-Constants (values filled from `docs/zcode-cli-findings.md` in Ф2 Step 8): `PINNED_MODEL: string`, `VERIFIED_APP_VERSION: string`, `VERIFIED_NODE_MAJOR: number`, `PROMPT_TRANSPORT: "argv" | "stdin"`, `MAX_PROMPT_BYTES: number`, `APP_VERSION_PLIST_KEY: "CFBundleShortVersionString" | "CFBundleVersion"`, `MODEL_ARGS: string[]`, `MODEL_ENV: Record<string,string>`, `DISALLOWED_TOOLS: string[]`, `REPORTED_MODEL_PATH: string | null`, `USAGE_FIELDS: { input: string|null, cached: string|null, output: string|null }`, `PATTERNS: { "model-not-selected": string[], auth: string[], quota: string[], launch: string[] }`.
+Constants (values filled from `docs/zcode-cli-findings.md` in Ф2 Step 8): `PINNED_MODEL: string`, `VERIFIED_APP_VERSION: string`, `VERIFIED_NODE_MAJOR: number`, `PROMPT_TRANSPORT: "argv" | "stdin"`, `MAX_PROMPT_BYTES: number`, `APP_VERSION_PLIST_KEY: "CFBundleShortVersionString" | "CFBundleVersion"`, `MODEL_ARGS: string[]`, `MODEL_ENV: Record<string,string>`, `SELECTION_PATH: string`, `PERSONAL_CONFIG_BASE: object`, `PINNED_SELECTION: object`, `DISALLOWED_TOOLS: string[]`, `REPORTED_MODEL_PATH: string | null`, `USAGE_FIELDS: { input: string|null, cached: string|null, output: string|null }`, `PATTERNS: { "model-not-selected": string[], auth: string[], quota: string[], launch: string[] }`.
 
-Functions: `main(argv: string[]): Promise<number>`; `readRecord(file: string): object | null` (the `.terminal` record when one was claimed, else the main record); `finalizeRecord(file: string, patch: object): object | null` (never rewrites a terminal record; of two racing finalizers exactly one claim wins and the other returns the winner's record); `buildCliArgv({ bin, prompt, workspaceRoot, sessionId }): string[]`; `parseCliOutput(stdout: string): object | null`; `classifyFailure({ timedOut, spawnError, stdout, stderrTail }): string`. Importing the module does not run `main` (it runs only when the file is the process entry point).
+Functions: `main(argv: string[]): Promise<number>`; `readRecord(file: string): object | null` (the `.terminal` record when one was claimed, else the main record); `finalizeRecord(file: string, patch: object): object | null` (never rewrites a terminal record; of two racing finalizers exactly one claim wins and the other returns the winner's record); `buildCliArgv({ bin, prompt, workspaceRoot, sessionId }): string[]`; `pinPersonalConfig(file: string): object` (sets `SELECTION_PATH` to `PINNED_SELECTION`, keeps the rest of the file, starts from `PERSONAL_CONFIG_BASE` when the file is missing or unreadable; atomic rename); `parseCliOutput(stdout: string): object | null`; `classifyFailure({ timedOut, spawnError, stdout, stderrTail }): string`. Importing the module does not run `main` (it runs only when the file is the process entry point).
 
 ### C5. Pinned CLI invocation
 
@@ -190,11 +190,11 @@ Functions: `main(argv: string[]): Promise<number>`; `readRecord(file: string): o
 <ZCODE_NODE> <ZCODE_BIN> -p <prompt file contents | "-" on the stdin transport> --output-format json --mode yolo --surface terminal --workflow-mode disabled --cwd <workspaceRoot> [...MODEL_ARGS] [--disallowedTools <DISALLOWED_TOOLS joined by ",">] [--resume <sess_…>]
 ```
 
-Spawned with `detached: true` (own process group), cwd = workspaceRoot, stdin `ignore` (or the prompt on the stdin transport), stdout captured, stderr appended to the log. Environment = inherited + `MODEL_ENV` + `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` and `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE` (both `<ZCODE_APP>/Contents/Resources/config/provider/zcode-builtin.json`) + `ZCODE_APP_VERSION` (plist key `APP_VERSION_PLIST_KEY`, read at every `task`). Never `--target`, `--json`, `-c/--continue`. Defaults: `ZCODE_APP=/Applications/ZCode.app`, `ZCODE_BIN=$ZCODE_APP/Contents/Resources/glm/zcode.cjs`, `ZCODE_NODE=node`, `ZCODE_STATE_DIR=~/.claude/plugins/data/superpowers-strigov-ver-zcode`, `ZCODE_TASK_TIMEOUT_MIN=60`. Timeout → SIGTERM to the group, 10 s, SIGKILL. Probe timeout 120 s.
+Spawned with `detached: true` (own process group), cwd = workspaceRoot, stdin `ignore` (or the prompt on the stdin transport), stdout captured, stderr appended to the log. Environment = inherited + `MODEL_ENV` + `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` and `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE` (both `<ZCODE_APP>/Contents/Resources/config/provider/zcode-builtin.json`) + `ZCODE_APP_VERSION` (plist key `APP_VERSION_PLIST_KEY`, read at every `task`) + `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` = `<ZCODE_STATE_DIR>/personal-provider-config.json` (a fourth variable beyond spec §4.3: Ф1 U1 found that a headless run takes its model only from the personal provider config this variable names). The wrapper owns that file: before every CLI run (task runner, `doctor`, `doctor --probe`) `pinPersonalConfig` sets its default selection to `PINNED_SELECTION` (C4). It never lives under `~/.zcode` and holds no credentials. The CLI's login identity stays in ZCode's own credential store, written only by the user's one-time `zcode login zai`, and the wrapper never reads it. Never `--target`, `--json`, `-c/--continue`. Defaults: `ZCODE_APP=/Applications/ZCode.app`, `ZCODE_BIN=$ZCODE_APP/Contents/Resources/glm/zcode.cjs`, `ZCODE_NODE=node`, `ZCODE_STATE_DIR=~/.claude/plugins/data/superpowers-strigov-ver-zcode`, `ZCODE_TASK_TIMEOUT_MIN=60`. Timeout → SIGTERM to the group, 10 s, SIGKILL. Probe timeout 120 s.
 
 ### C6. Test stub `tests/fixtures/zcode-stub.cjs`
 
-`ZCODE_STUB_MODE`: `ok` (JSON `{sessionId:"sess_stub_<pid>", traceId, turnId, response:"DONE\nstub finished", usage:{inputTokens:100, cacheReadTokens:40, outputTokens:7, reasoningTokens:3}, eventCount:1}`, exit 0) · `pong` (response `PONG`) · `resume` (exit 1 unless `--resume <sess>` is present; echoes that session id) · `record` (writes `{argv, stdin, cwd, env:{the two provider vars, ZCODE_APP_VERSION, ZCODE_DATA_BASE_DIR}}` to `$ZCODE_STUB_RECORD`, then as `ok`; reads stdin when `-p -`) · `model-not-selected` / `auth` / `quota` / `launch` (stderr `Error: <$ZCODE_STUB_MESSAGE or a default>`, exit 1) · `hang` (600 s) · `crash` (SIGKILLs itself) · `malformed` (`not json`, exit 0). `ZCODE_STUB_DELAY_MS` delays the action.
+`ZCODE_STUB_MODE`: `ok` (JSON `{sessionId:"sess_stub_<pid>", traceId, turnId, response:"DONE\nstub finished", usage:{inputTokens:100, cacheReadTokens:40, outputTokens:7, reasoningTokens:3}, eventCount:1}`, exit 0) · `pong` (response `PONG`) · `resume` (exit 1 unless `--resume <sess>` is present; echoes that session id) · `record` (writes `{argv, stdin, cwd, env:{the two provider vars, ZCODE_APP_VERSION, ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, ZCODE_DATA_BASE_DIR}, personalConfig:<that file's parsed content at run time, or null>}` to `$ZCODE_STUB_RECORD`, then as `ok`; reads stdin when `-p -`) · `model-not-selected` / `auth` / `quota` / `launch` (stderr `Error: <$ZCODE_STUB_MESSAGE or a default>`, exit 1) · `hang` (600 s) · `crash` (SIGKILLs itself) · `malformed` (`not json`, exit 0). `ZCODE_STUB_DELAY_MS` delays the action.
 
 ### C7. `docs/zcode-cli-findings.md` — `## Inputs for later phases`
 
@@ -203,7 +203,10 @@ A markdown table `| Key | Value | Evidence |`, one row per key, values exactly i
 | Key | Allowed value | Consumed by |
 |---|---|---|
 | `VERDICT` | `GO` \| `NO-GO` (`NO-GO` iff `MODEL_MECHANISM` = `none`) | orchestrator after Ф1 |
-| `MODEL_MECHANISM` | `user-persisted` \| `flag:<--flag-name>` \| `env:<VAR_NAME>` \| `session-bound` \| `none` (`session-bound`: only resuming a session with the model already bound works — `GO`, but the orchestrator stops after Ф1 and asks the user; `none`: all three U1 candidates refused model selection — an untestable or indeterminate session-bound probe is not `none`, Ф1 then ends `BLOCKED` with no value) | Ф2 `MODEL_ARGS`/`MODEL_ENV`; Ф3 "Verified facts"; orchestrator after Ф1 |
+| `MODEL_MECHANISM` | `personal-config` \| `flag:<--flag-name>` \| `env:<VAR_NAME>` \| `none` (`personal-config`: the wrapper owns a personal provider config, passes it as `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, and its default selection is the pin. Requires the user's one-time `zcode login zai`; verified by Ф1 Step 6. `none`: all three spec §10 U1 candidates (persisted default, flag/env, session-bound resume) refused model selection. An untested or indeterminate candidate is not `none`: Ф1 then ends `BLOCKED` with no value) | Ф2 `MODEL_ARGS`/`MODEL_ENV` and the three rows below; Ф3 "Verified facts"; orchestrator after Ф1 |
+| `SELECTION_PATH` | dot path of the default selection inside the personal provider config the login wrote, e.g. `config.defaultModelSelection` | Ф2 `SELECTION_PATH` |
+| `PERSONAL_CONFIG_BASE` | one-line JSON: the file the login wrote with the key at `SELECTION_PATH` removed (Ф1 Step 6 checks it holds no credential-like value) | Ф2 `PERSONAL_CONFIG_BASE` |
+| `PINNED_SELECTION` | one-line JSON: the selection object for GLM-5.3-Flash at reasoning `max` that Ф1 Step 6 wrote at `SELECTION_PATH` and verified with a headless PONG | Ф2 `PINNED_SELECTION` |
 | `RESUME_KEEPS_MODEL` | `yes` \| `no` | Ф3 "Verified facts" (`GLM resume`) |
 | `REPORTED_MODEL_FIELD` | `none` \| dot path in the `--output-format json` object | Ф2 `REPORTED_MODEL_PATH`; Ф3 |
 | `USAGE_INPUT_FIELD` | dot path inside `usage`, or `none` | Ф2 `USAGE_FIELDS.input`; Ф5 |
@@ -236,22 +239,27 @@ The file also carries a line `VERDICT: GO` or `VERDICT: NO-GO — <reason>` unde
 - Session marker: `<scratchpad>/dev-orchestrator/glm-channel`, one line `<ok|down|off> <reason> <ISO time>`.
 - State line suffix: ` impl=<glm:zt-NNNN | luna:task-NNNN | sol:task-NNNN | claude | —> glm=<unprobed | ok | down | off>`; group form `tracks=Ф2:4-r1@glm:zt-0003,Ф3:3@luna:task-0011`.
 - Plan frontmatter key: `risk_phases: { Ф1: [], Ф2: [DATA_LOSS], … }` — every phase id, empty list = scanned, no risk.
-- `zcode-invocation` "Verified facts" lines (exact prefixes dev-orchestrator reads): `- Model selection: user /model` | `- Model selection: wrapper`; `- Model confirmation: required` | `- Model confirmation: not required`; `- GLM resume: enabled` | `- GLM resume: disabled`; `- GLM concurrency: 1` | `- GLM concurrency: 2`; `- Quota bonus (1.5× in ZCode): …`.
+- `zcode-invocation` "Verified facts" lines (exact prefixes dev-orchestrator reads): `- Model selection: wrapper`; `- Model confirmation: required` | `- Model confirmation: not required`; `- GLM resume: enabled` | `- GLM resume: disabled`; `- GLM concurrency: 1` | `- GLM concurrency: 2`; `- Quota bonus (1.5× in ZCode): …`.
 - Gate-stall diagnosis tokens: `ENVIRONMENT` (line 2 `fix-location: in-repo` | `fix-location: machine`) | `CODE` | `CONTEXT`.
 
 ## Test strategy
 
 - **Ф1 (discovery, document).** Evidence, not tests: every U-section names how it was verified (source path at tag `v3.15.1`, or the exact live command and its output). A mechanical completeness check (Ф1 Step 1 command) must print only `check-done`. Live calls are listed in Ф1 and kept to small PONG-style prompts plus one 150 KB prompt. Not tested: anything under `~/.zcode` (never read), logout behaviour (never provoked).
-- **Ф2 (wrapper).** Integration-style bash tests in `tests/test-zcode-dispatch.sh` against the real wrapper with the stub CLI: spec §8.1 assertions 1–13 plus result-on-failure, sticky `finalizeRecord` (including the two cancel-vs-runner interleavings, injected in-process), and the `MODEL_ARGS` / `DISALLOWED_TOOLS` wiring; the tests read exported constants so Ф1's values cannot break them. RED = the suite fails at assertion 13 before the shim exists; GREEN = `PASS`. Regression: `bash tests/test-sdd-scripts.sh`. Not tested: the real ZCode CLI or any model (Ф5 covers it live), Linux, PID reuse.
+- **Ф2 (wrapper).** Integration-style bash tests in `tests/test-zcode-dispatch.sh` against the real wrapper with the stub CLI: spec §8.1 assertions 1–13 plus result-on-failure, sticky `finalizeRecord` (including the two cancel-vs-runner interleavings, injected in-process), the `MODEL_ARGS` / `DISALLOWED_TOOLS` wiring, and the personal provider config pin (file created under the state root before the run, selection re-pinned before every run, other content kept, `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` passed); the tests read exported constants so Ф1's values cannot break them. RED = the suite fails at assertion 13 before the shim exists; GREEN = `PASS`. Regression: `bash tests/test-sdd-scripts.sh`. Not tested: the real ZCode CLI or any model (Ф5 covers it live), Linux, PID reuse.
 - **Ф3 (prose).** A grep-based structural check (Ф3 Step 1 block) proves every required section, rule anchor and Red Flag is present and the stale Luna-as-implementer wording is gone; both test suites still pass. The ladder, stall rules, state-line fields and Red Flags are model-facing prose (spec §8.3): they are verified by the plan review, the fused code review of the skill edits, and the first real `/dev` run on GLM. Not tested: model behaviour under the new prose.
 - **Ф4 (docs).** A grep / `xmllint` / JSON check (Ф4 Step 1 block): version `0.8.0` everywhere, no stale `0.7.0`, new rows and guardrail present in both languages, SVGs well-formed. Not tested: rendering on GitHub.
 - **Ф5 (live acceptance).** End-to-end on the real CLI and the real plan (spec §8.2): `doctor`, `doctor --probe`, an E2E first-round task in a throwaway repo, a fix round, and the quota measurement. The orchestrator then runs the verification gate and the fused review on the resulting doc edits. Not tested: concurrency under load, other app versions.
 
 ## Risks / unknowns / assumptions
 
-- **R1 — U1 kills the feature (GO/NO-GO).** Headless `-p` currently fails with `Select a model before continuing`. If no headless model selection exists by any means, Ф1 ends with `VERDICT: NO-GO`, Ф1 is committed, and the plan stops; the user decides. Plan-time source reading suggests (not concluded): the CLI has no `--model` flag and no model env variable; `prompt-command.ts` feeds `createApp` a `configuredDefaultModelSelection` from the provider registry, and the bundled model-resolution code skips the configured default when resuming (`if(e.resume)return;`) — so a one-time user `/model` selection that persists is the likely mechanism (`MODEL_MECHANISM = user-persisted`).
+- **R1 — U1 kills the feature (GO/NO-GO).** Headless `-p` fails with `Select a model before continuing`. If no headless model selection exists by any means, Ф1 ends with `VERDICT: NO-GO`, Ф1 is committed, and the plan stops; the user decides. Ф1's first run established the following, from source and live runs:
+  - The CLI has no `--model` flag and no model env variable.
+  - The embedded CLI ships without its TUI (`Cannot find package '@zcode/tui'`), so `/model` is impossible. Headless `-p "/model …"` is plain prompt text.
+  - A fresh run takes `defaultModelSelection` from the personal provider config named by `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`. The account provider is entitled only after the CLI's own `zcode login zai`, a user action that writes the identity into ZCode's shared credential store.
+
+  The remaining mechanism is `MODEL_MECHANISM = personal-config`: the user logs the CLI in once, and the wrapper pins GLM-5.3-Flash/max in its own personal provider config. An invalid configured default silently falls back to the first registry model (`registry-fallback` in the bundle), so a PONG alone does not prove the pin. Ф1 Step 6 therefore checks the effective model in the run's own output. If the login fails, the pin is not applied, or the model cannot be confirmed, Ф1 ends `BLOCKED` and the user decides.
 - **R2 — Discovery cannot run in the Codex sandbox.** The Codex implementer's workspace-write sandbox most likely blocks network and writes to `~/.zcode`. Ф1's executor is therefore a Claude subagent (`opus` / `high`), stated in its frontmatter scope and its body; zcode was verified to run from Claude Code's own Bash tool.
-- **R3 — A user step is required.** Selecting the model in the CLI TUI is a user action (Red Flag 6). The TUI needs an interactive TTY; Claude Code's `!` prefix may not host it — Ф1 tells the user to run the line in a separate terminal window, and `zcode-invocation` documents both forms.
+- **R3 — A user step is required.** The one-time `zcode login zai` (Z.ai's own browser OAuth) is a user action (Red Flag 6). It writes the CLI's identity into ZCode's shared credential store under `~/.zcode`; that is the CLI's own write, never ours. Ф1 and `zcode-invocation` give the exact command, with `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` pointing at a file outside `~/.zcode`, so the default model the login writes never touches the desktop app's provider config. The login opens a browser. If Claude Code's `!` prefix cannot host it, the user runs the line in a separate terminal window; `zcode-invocation` documents both forms.
 - **R4 — Live probes spend Coding Plan quota.** Ф1: about ten short prompts plus one 150 KB prompt; Ф5: one probe, one small E2E task, one fix round. All other phases make zero model calls.
 - **R5 — Classifier patterns are broad.** Initial patterns (`401`, `login`, `quota`, …) may misclassify; Ф1 records the exact strings (U4) and Ф2 Step 8 replaces the lists. Unknown strings classify as `crash` → one retry, then Luna: never a false success.
 - **R6 — Prompt text the CLI could misparse.** Node's `parseArgs` treats a `-p` value starting with `-` as ambiguous, and the CLI treats a prompt starting with `/` as a slash command. Every GLM dispatch file begins with the ZCode preamble (`## ZCode headless run …`) and the probe prompt is fixed, so neither can occur; `zcode-invocation` says so.
@@ -269,18 +277,20 @@ The file also carries a line `VERDICT: GO` or `VERDICT: NO-GO — <reason>` unde
 
 ## Ф1: ZCode CLI discovery spike (go/no-go)
 
-**Executor:** a Claude subagent — `Agent(subagent_type="general-purpose", model="opus", effort="high")` — dispatched with the first-round template of `skills/dev-orchestrator/implementer-prompt.md` (it supplies `[REPORT_FILE]` and the status tokens). **Not the Codex implementer:** this phase needs network, real `zcode` runs and the CLI's own writes under `~/.zcode`, which the Codex workspace-write sandbox blocks. `NEEDS_CONTEXT` round trips go through fresh Agent calls carrying the added context (SKILL.md Step 3, Claude path). One step needs the **user** (Step 6). The executor's final message carries `VERDICT: GO` or `VERDICT: NO-GO` on line 2 — except a `BLOCKED` finish (Step 6: the session-bound U1 candidate could not be tested, or its probe was indeterminate), which carries no verdict and is handled as `BLOCKED` (SKILL.md), never as `NO-GO`; on `NO-GO` — or on `GO` with `MODEL_MECHANISM = session-bound` (reported as `DONE_WITH_CONCERNS`, Step 6) — the orchestrator commits Ф1 and stops before Ф2 ("## Multi-phase plans": findings invalidate later phases → ask the user).
+**Executor:** a Claude subagent — `Agent(subagent_type="general-purpose", model="opus", effort="high")` — dispatched with the first-round template of `skills/dev-orchestrator/implementer-prompt.md` (it supplies `[REPORT_FILE]` and the status tokens). **Not the Codex implementer:** this phase needs network, real `zcode` runs and the CLI's own writes under `~/.zcode`, which the Codex workspace-write sandbox blocks. `NEEDS_CONTEXT` round trips go through fresh Agent calls carrying the added context (SKILL.md Step 3, Claude path). One step needs the **user** (Step 6a: the one-time `zcode login zai`). The executor's final message carries `VERDICT: GO` or `VERDICT: NO-GO` on line 2. The exception is a `BLOCKED` finish (Step 6 cases (a)–(e): the login did not complete, the probe file holds a credential-like value, the pinned run failed, the pin was not applied, or the effective model could not be confirmed). A `BLOCKED` finish carries no verdict and is handled as `BLOCKED` (SKILL.md), never as `NO-GO`. On `NO-GO` the orchestrator commits Ф1 and stops before Ф2 ("## Multi-phase plans": findings invalidate later phases → ask the user).
+
+**Resume point (plan revision after the first `BLOCKED`).** Steps 1–5 are done; `[REPORT_FILE]` lists them and records `PROBE_ROOT`. The embedded CLI has no TUI, so the old `/model` user step is replaced by Step 6a. The user ran Step 6a's command themselves. The re-dispatch carries `## Added context: zcode login zai — done` or `— failed: <what the user saw>`. Continue at Step 6b, and do not send the Step 6a message again.
 
 **Files in this phase:**
 - Create: `docs/zcode-cli-findings.md`
 
 **Interfaces:**
 - Consumes: nothing
-- Produces: `docs/zcode-cli-findings.md` with sections `## Go / no-go` (line `VERDICT: GO` | `VERDICT: NO-GO — <reason>`), `## U1 — …` through `## U11 — …`, and `## Inputs for later phases` filled for every key of Contract C7 (`VERDICT`, `MODEL_MECHANISM`, `RESUME_KEEPS_MODEL`, `REPORTED_MODEL_FIELD`, `USAGE_INPUT_FIELD`, `USAGE_CACHED_FIELD`, `USAGE_OUTPUT_FIELD`, `USAGE_REASONING_FIELD`, `CACHED_IS_SUBSET_OF_INPUT`, `PROMPT_TRANSPORT`, `MAX_PROMPT_BYTES`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `APP_VERSION_PLIST_KEY`, `DISALLOWED_TOOLS`, `GLM_CONCURRENCY`, `SESSION_SAVED_ON_SIGTERM`, `INTERFERING_PLUGINS`, `PATTERN_MODEL_NOT_SELECTED`, `PATTERN_AUTH`, `PATTERN_QUOTA`, `PATTERN_LAUNCH`)
+- Produces: `docs/zcode-cli-findings.md` with sections `## Go / no-go` (line `VERDICT: GO` | `VERDICT: NO-GO — <reason>`), `## U1 — …` through `## U11 — …`, and `## Inputs for later phases` filled for every key of Contract C7 (`VERDICT`, `MODEL_MECHANISM`, `SELECTION_PATH`, `PERSONAL_CONFIG_BASE`, `PINNED_SELECTION`, `RESUME_KEEPS_MODEL`, `REPORTED_MODEL_FIELD`, `USAGE_INPUT_FIELD`, `USAGE_CACHED_FIELD`, `USAGE_OUTPUT_FIELD`, `USAGE_REASONING_FIELD`, `CACHED_IS_SUBSET_OF_INPUT`, `PROMPT_TRANSPORT`, `MAX_PROMPT_BYTES`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `APP_VERSION_PLIST_KEY`, `DISALLOWED_TOOLS`, `GLM_CONCURRENCY`, `SESSION_SAVED_ON_SIGTERM`, `INTERFERING_PLUGINS`, `PATTERN_MODEL_NOT_SELECTED`, `PATTERN_AUTH`, `PATTERN_QUOTA`, `PATTERN_LAUNCH`)
 
 Rules for this phase (in addition to the implementer template):
 - Discovery-only exception: the wrapper does not exist yet, so this phase calls the CLI directly (through the `zc` helper below, with exactly the environment the wrapper will use). After this plan, Red Flag 5 forbids that.
-- Never read or write anything under `~/.zcode` yourself (the CLI writes its own state there — that is normal use). Never run `zcode login`, `logout`, `plugins install/enable/disable/remove`, or change any ZCode setting. Never open the ZCode desktop app.
+- Never read or write anything under `~/.zcode` yourself (the CLI writes its own state there — that is normal use). Never run `zcode login`, `logout`, `plugins install/enable/disable/remove`, or change any ZCode setting. Never open the ZCode desktop app. The login is the user's Step 6a. The only ZCode-format file you read and edit is the probe-owned `<PROBE_ROOT>/personal-provider-config.json`, which is outside `~/.zcode` and holds no credentials (Step 6b checks).
 - If `[REPORT_FILE]` already exists when you start, read it first and continue from the first step it does not list as done; record every finished step (and `PROBE_ROOT`) there as you go — a `NEEDS_CONTEXT` round trip restarts you as a fresh session.
 - Shell state does not persist between tool calls: re-set `PROBE_ROOT=<value from the report>` at the top of each command block.
 
@@ -292,13 +302,13 @@ Run from the repo root:
 f=docs/zcode-cli-findings.md
 for u in U1 U2 U3 U4 U5 U6 U7 U8 U9 U10 U11; do grep -q "^## $u — " "$f" 2>/dev/null || echo "missing section $u"; done
 grep -Eq '^VERDICT: (GO|NO-GO)' "$f" 2>/dev/null || echo "missing VERDICT line"
-for k in VERDICT MODEL_MECHANISM RESUME_KEEPS_MODEL REPORTED_MODEL_FIELD USAGE_INPUT_FIELD USAGE_CACHED_FIELD USAGE_OUTPUT_FIELD USAGE_REASONING_FIELD CACHED_IS_SUBSET_OF_INPUT PROMPT_TRANSPORT MAX_PROMPT_BYTES VERIFIED_APP_VERSION VERIFIED_NODE_MAJOR APP_VERSION_PLIST_KEY DISALLOWED_TOOLS GLM_CONCURRENCY SESSION_SAVED_ON_SIGTERM INTERFERING_PLUGINS PATTERN_MODEL_NOT_SELECTED PATTERN_AUTH PATTERN_QUOTA PATTERN_LAUNCH; do
+for k in VERDICT MODEL_MECHANISM SELECTION_PATH PERSONAL_CONFIG_BASE PINNED_SELECTION RESUME_KEEPS_MODEL REPORTED_MODEL_FIELD USAGE_INPUT_FIELD USAGE_CACHED_FIELD USAGE_OUTPUT_FIELD USAGE_REASONING_FIELD CACHED_IS_SUBSET_OF_INPUT PROMPT_TRANSPORT MAX_PROMPT_BYTES VERIFIED_APP_VERSION VERIFIED_NODE_MAJOR APP_VERSION_PLIST_KEY DISALLOWED_TOOLS GLM_CONCURRENCY SESSION_SAVED_ON_SIGTERM INTERFERING_PLUGINS PATTERN_MODEL_NOT_SELECTED PATTERN_AUTH PATTERN_QUOTA PATTERN_LAUNCH; do
   grep -Eq "^\| $k \| *[^| ][^|]* \|" "$f" 2>/dev/null || echo "missing key $k"
 done
 echo check-done
 ```
 
-Expected now: 11 `missing section` lines, `missing VERDICT line`, 22 `missing key` lines, then `check-done`.
+Expected now: 11 `missing section` lines, `missing VERDICT line`, 25 `missing key` lines, then `check-done`.
 
 - [ ] **Step 2: Create the findings skeleton**
 
@@ -312,7 +322,7 @@ Write `docs/zcode-cli-findings.md` with exactly this structure (fill every `- An
 - Source tag read: v3.15.1 (`gh api -H 'Accept: application/vnd.github.raw' repos/zai-org/ZCode/contents/<path>?ref=v3.15.1`)
 - Node:
 - Date:
-- Method: source reading at the tag above, plus direct CLI runs (discovery-only exception — the wrapper did not exist yet) against throwaway git repos. Nothing under `~/.zcode` was read; no login/logout, settings or plugin change was made.
+- Method: source reading at the tag above, plus direct CLI runs (discovery-only exception — the wrapper did not exist yet) against throwaway git repos. Nothing under `~/.zcode` was read; the executor made no login/logout, settings or plugin change. The user ran the one-time `zcode login zai` (U1), with the personal provider config pointed at a probe-owned file.
 
 ## Go / no-go
 
@@ -390,6 +400,9 @@ VERDICT:
 |---|---|---|
 | VERDICT |  | U1 |
 | MODEL_MECHANISM |  | U1 |
+| SELECTION_PATH |  | U1 |
+| PERSONAL_CONFIG_BASE |  | U1 |
+| PINNED_SELECTION |  | U1 |
 | RESUME_KEEPS_MODEL |  | U2 |
 | REPORTED_MODEL_FIELD |  | U3 |
 | USAGE_INPUT_FIELD |  | U3 |
@@ -489,20 +502,100 @@ cat "$PROBE_ROOT/pong1.out"; tail -20 "$PROBE_ROOT/pong1.err"
 Record the exit code and the exact stderr text (U4 model-not-selected). If it already succeeds (the user selected a model earlier), skip Step 6 and use `pong1.out` as `pong2.out` (`cp "$PROBE_ROOT/pong1.out" "$PROBE_ROOT/pong2.out"`).
 If Step 3 found a per-invocation mechanism (a flag or env variable that sets the model selection), register it with the helper before Step 6 — a flag: `printf '%s\n' '<--flag-name>' 'GLM-5.3-Flash$max' > "$PROBE_ROOT/model.args"`; an env variable: `printf '%s\n' '<VAR_NAME>=GLM-5.3-Flash$max' > "$PROBE_ROOT/model.env"` — then re-run the probe command above with `pong2.out` / `pong2.err` in place of `pong1.*`: success → `MODEL_MECHANISM = flag:<name>` or `env:<NAME>`, keep the file (the `zc` helper now adds the mechanism to every later `-p` run — Steps 8–12, including the resume probes and `sigterm-probe.mjs`) and skip Step 6; failure → delete the file again and go on to Step 6.
 
-- [ ] **Step 6: User step — one-time model selection in the CLI TUI (only if Step 5 failed with model-not-selected and no per-invocation mechanism exists)**
+- [ ] **Step 6: User login, then pin GLM-5.3-Flash / max in a probe-owned personal provider config (U1). Runs only if Step 5 failed with model-not-selected and no per-invocation mechanism exists.**
 
-Stop here and finish with this final message (line 1 is the token), filling the report path:
+The embedded CLI ships without its TUI (`Cannot find package '@zcode/tui'`), so `/model` cannot run, and a headless `-p "/model …"` is plain prompt text. Headless `-p` gets an entitled model only after the CLI's own login (`zcode login zai` writes `account-provider:<id>:identity` into ZCode's shared credential store). It takes its default selection from the personal provider config named by `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`. Here that file is probe-owned and lives outside `~/.zcode`.
+
+**6a. User step: one-time `zcode login zai`.** Skip this on the resume dispatch (see "Resume point" above). Otherwise stop here and finish with this final message. Line 1 is the token; fill `<PROBE_ROOT>` and the report path before finishing:
 
 ```
 NEEDS_CONTEXT
-U1 needs a one-time user action: the ZCode CLI has no headless model selection; the model must be selected once in the CLI's own TUI.
-Please run this in a separate terminal window (the TUI needs an interactive terminal; Claude Code's ! prompt may not host it):
-cd <PROBE_ROOT>/repo && ZCODE_BUILTIN_PROVIDER_CONFIG_FILE=/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE=/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json ZCODE_APP_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - /Applications/ZCode.app/Contents/Info.plist)" node /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs
-In the TUI type /model, choose GLM-5.3-Flash with reasoning max (or type /model GLM-5.3-Flash$max), then send one message: Reply with exactly one word: PONG. Note the session id the TUI shows for this conversation (sess_…), then quit the TUI. Reply "done <session id>" when finished.
+U1 needs a one-time user action: the standalone ZCode CLI has no entitled model until it is logged in with Z.ai's own browser login. Its TUI is not shipped, so /model is impossible.
+Please run this in a separate terminal window (it opens the browser for Z.ai's OAuth):
+ZCODE_BUILTIN_PROVIDER_CONFIG_FILE=/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE=/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json ZCODE_APP_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - /Applications/ZCode.app/Contents/Info.plist)" ZCODE_PERSONAL_PROVIDER_CONFIG_FILE=<PROBE_ROOT>/personal-provider-config.json node /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs login zai
+It stores the CLI login in ZCode's own credential store. It writes the default model into the probe file named above, not into ~/.zcode/v2/provider_config.json, so the desktop app's selection stays untouched. Reply "done", or "failed: <what you saw>".
 Report: <[REPORT_FILE] path>
 ```
 
-(Fill `<PROBE_ROOT>` with the recorded value before finishing.) The orchestrator relays it verbatim and re-dispatches this phase (fresh Agent call) with `## Added context: the user selected GLM-5.3-Flash / max in the CLI TUI at <time>; TUI session <sess_… or "none shown">`. On re-dispatch, run probe 2:
+The orchestrator relays the message verbatim. It then re-dispatches this phase (a fresh Agent call) with `## Added context: zcode login zai — done` or `## Added context: zcode login zai — failed: <text>`.
+
+**6b. Record what the login wrote (offline, no quota).** The script prints:
+- `SHAPE <json>`: keys and value types only, no values.
+- `SECRET-LIKE <path>`: a key whose name looks like a credential and whose value is a non-URL string of 16 or more characters. Only the path is printed, never the value.
+- `SELECTION_PATH <path>`: every key named `defaultModelSelection`.
+- `LOGIN_SELECTION <json>` and `FILE <json>`: printed only when there is no `SECRET-LIKE` line.
+
+```bash
+PROBE_ROOT=<from the report>
+F="$PROBE_ROOT/personal-provider-config.json"
+ls -l "$F"
+node -e '
+const fs = require("node:fs");
+let o;
+try { o = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) { console.log("UNREADABLE", e.code || e.message); process.exit(0); }
+const secretName = /token|secret|password|passwd|credential|api.?key|authorization|cookie|private/i;
+const shape = (v) => Array.isArray(v) ? `array(${v.length})` : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, shape(x)])) : typeof v;
+const secrets = [];
+const selections = [];
+const walk = (v, p) => {
+  if (!v || typeof v !== "object") return;
+  for (const [k, x] of Object.entries(v)) {
+    const q = p ? `${p}.${k}` : k;
+    if (secretName.test(k) && typeof x === "string" && x.length >= 16 && !/^https?:\/\//.test(x)) secrets.push(q);
+    if (k === "defaultModelSelection") selections.push(q);
+    walk(x, q);
+  }
+};
+walk(o, "");
+console.log("SHAPE", JSON.stringify(shape(o)));
+for (const q of secrets) console.log("SECRET-LIKE", q); // the path only, never the value
+for (const q of selections) console.log("SELECTION_PATH", q);
+if (secrets.length === 0) {
+  for (const q of selections) console.log("LOGIN_SELECTION", JSON.stringify(q.split(".").reduce((a, k) => a[k], o)));
+  console.log("FILE", JSON.stringify(o));
+}' "$F"
+```
+
+Work through these in order; the first that applies wins:
+- (a) The added context says `failed`, the file is missing, empty or `UNREADABLE`, or no `SELECTION_PATH` line was printed → record what happened in U1 and `[REPORT_FILE]`. Leave `MODEL_MECHANISM` and `VERDICT` unset (no `none`, no `NO-GO`), ask the user nothing more, and finish with line 1 `BLOCKED` and the reason `zcode login zai did not complete — <user report | file missing | unreadable | no defaultModelSelection>`.
+- (b) A `SECRET-LIKE` line → do not print, copy or edit the file. Record only the path in U1, leave both unset, and finish with line 1 `BLOCKED` and the reason `probe personal provider config holds a credential-like value at <path>; not copied`.
+- Otherwise record in U1 the `SHAPE`, the `SELECTION_PATH` and the `LOGIN_SELECTION` (the JSON shape the login writes). The findings file was written before this revision, so make two edits if they are missing:
+  1. Add the rows `| SELECTION_PATH |  | U1 |`, `| PERSONAL_CONFIG_BASE |  | U1 |` and `| PINNED_SELECTION |  | U1 |` right after the `MODEL_MECHANISM` row.
+  2. Replace the header's `- Method:` line with the Step 2 skeleton's version.
+
+  If more than one `SELECTION_PATH` was printed, use the one directly under the file's `config` object, or the top-level one if there is none, and record the others in U1.
+
+**6c. Pin GLM-5.3-Flash / max in the probe-owned file (offline, no quota).** First confirm the selection schema in the bundle (read-only):
+
+```bash
+B=/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs
+grep -o '.\{80\}options:m.object({reasoningLevel.\{60\}' "$B" | head -3
+```
+
+Plan-time reading of 3.15.1 found a strict `{providerId, modelId, options?: {reasoningLevel?}}` selection object; the personal-config serializer writes it under `config`. If the grep shows a different shape for the reasoning level, adapt only that part of the object in the script below and record why in U1. Then run the following, with `<SELECTION_PATH>` = the path from 6b:
+
+```bash
+PROBE_ROOT=<from the report>
+F="$PROBE_ROOT/personal-provider-config.json"
+cp "$F" "$PROBE_ROOT/personal-provider-config.login.json"
+node -e '
+const fs = require("node:fs");
+const [file, selPath] = process.argv.slice(1);
+const o = JSON.parse(fs.readFileSync(file, "utf8"));
+const keys = selPath.split(".");
+const parent = keys.slice(0, -1).reduce((a, k) => a[k], o);
+const login = parent[keys.at(-1)];
+parent[keys.at(-1)] = { providerId: login.providerId, modelId: "GLM-5.3-Flash", options: { ...(login.options || {}), reasoningLevel: "max" } };
+fs.writeFileSync(file, `${JSON.stringify(o, null, 2)}\n`);
+console.log("PINNED_SELECTION", JSON.stringify(parent[keys.at(-1)]));
+delete parent[keys.at(-1)];
+console.log("PERSONAL_CONFIG_BASE", JSON.stringify(o));' "$F" "<SELECTION_PATH>"
+printf '%s\n' "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE=$F" > "$PROBE_ROOT/model.env"
+```
+
+Record both printed values in `[REPORT_FILE]`. With `model.env` in place, the `zc` helper (Step 4) exports the variable on every later `-p` run: probe 2, Steps 8–12, the resume probes and `sigterm-probe.mjs`. The rest of Ф1 therefore runs on the pin.
+
+**6d. Probe 2: a fresh headless PONG on the pin (U1, U3).** Two short requests:
 
 ```bash
 PROBE_ROOT=<from the report>
@@ -510,22 +603,24 @@ cd "$PROBE_ROOT/repo" && "$PROBE_ROOT/zc" -p 'Reply with exactly one word: PONG'
   --surface terminal --workflow-mode disabled --cwd "$PROBE_ROOT/repo" \
   > "$PROBE_ROOT/pong2.out" 2> "$PROBE_ROOT/pong2.err"; echo "exit=$?"
 cat "$PROBE_ROOT/pong2.out"; tail -20 "$PROBE_ROOT/pong2.err"
+cd "$PROBE_ROOT/repo" && "$PROBE_ROOT/zc" -p 'Reply with exactly one word: PONG' --output-format stream-json --verbose --mode yolo \
+  --surface terminal --workflow-mode disabled --cwd "$PROBE_ROOT/repo" \
+  > "$PROBE_ROOT/pong2s.out" 2> "$PROBE_ROOT/pong2s.err"; echo "exit=$?"
+cat "$PROBE_ROOT/pong2s.out" "$PROBE_ROOT/pong2s.err" \
+  | grep -aoE '"(modelId|model|mainModel)" *: *"[^"]*"|"reasoningLevel" *: *"[^"]*"|GLM-[0-9][0-9.]*(-[A-Za-z]+)?(\$[a-z]+)?' \
+  | sort | uniq -c | sort -rn | head -30
 ```
 
-Exit 0 with a JSON object whose `response` contains `PONG` → `MODEL_MECHANISM = user-persisted`. Still `Select a model…` → the persisted-default and flag/env candidates of spec §10 U1 have failed; before any NO-GO, test the third one — the model bound to a session on `--resume` — with probe 3 against the TUI session the user reported (if the added context says `none shown`, use a read-only session listing if `help.txt` names one, else finish once more with `NEEDS_CONTEXT` asking the user for that session id; never look it up under `~/.zcode`. If no id can be had even then, probe 3 cannot run and the third candidate is untested, not failed: record that in U1 and `[REPORT_FILE]`, leave `MODEL_MECHANISM` and `VERDICT` unset (no `none`, no `NO-GO`), ask the user nothing more, and finish with line 1 `BLOCKED` and the reason `persisted default and flag/env fail; session-bound resume untestable — no session id after the one re-request`):
+The JSON summary has no model field (U3, source). An invalid configured default silently falls back to the first registry model (R1). So the model evidence is the stream run's model-identifying matches: if needed, read the lines around them in `pong2s.*` to see which model the turn's request used. Decide; the first match wins:
+- (c) `pong2` exits non-zero → record the exit code and the exact stderr in U1 and `[REPORT_FILE]`, leave `MODEL_MECHANISM` and `VERDICT` unset, and finish with line 1 `BLOCKED` and one of these reasons:
+  - A model-not-selected string (`Select a model before continuing` / `Model creation failed`): the login gave the CLI no entitled model, since the fallback found nothing either. Reason: `login gave the CLI no entitled model — <stderr>`.
+  - An auth string: reason `CLI auth failed after zcode login zai — <stderr>`.
+  - Anything else (launch, timeout, crash): reason `pinned PONG indeterminate — <exit code / stderr summary>`.
+- (d) `pong2` succeeds, but the matches show the run used a different model (for example `GLM-5.3` without `-Flash`) or a reasoning level other than `max`. The pin was not applied: the registry fell back. Record the matches in U1 and leave both unset. Session-bound resume, the third spec §10 U1 candidate, stays untested in this build (no TUI, no session with the model bound), so this is not `none`. Finish with line 1 `BLOCKED` and the reason `pinned selection rejected — run used <model / level>; session-bound resume untested`.
+- (e) `pong2` succeeds, but the matches name no model, or name GLM-5.3-Flash and another model with no way to tell which one ran → record the matches, leave both unset, and finish with line 1 `BLOCKED` and the reason `effective model unverified — <matches>`.
+- (f) `pong2` exits 0 with a JSON object whose `response` contains `PONG`, and the matches show `GLM-5.3-Flash` as the run's model (and `max` wherever a reasoning level appears). Set `MODEL_MECHANISM = personal-config`, then `SELECTION_PATH`, `PERSONAL_CONFIG_BASE` and `PINNED_SELECTION` (the 6b/6c values, one line each). Quote the deciding matches in U1 and continue with Step 7.
 
-```bash
-PROBE_ROOT=<from the report>
-TUI_SID=<sess_… from the added context>
-cd "$PROBE_ROOT/repo" && "$PROBE_ROOT/zc" -p 'Reply with exactly one word: PONG' --output-format json --mode yolo \
-  --surface terminal --workflow-mode disabled --cwd "$PROBE_ROOT/repo" --resume "$TUI_SID" \
-  > "$PROBE_ROOT/pong3.out" 2> "$PROBE_ROOT/pong3.err"; echo "exit=$?"
-cat "$PROBE_ROOT/pong3.out"; tail -20 "$PROBE_ROOT/pong3.err"
-```
-
-- Exit 0 with `response` containing `PONG` → `MODEL_MECHANISM = session-bound`: a headless run gets the model only by resuming a session that already has it bound. That is a headless mechanism, so the verdict is **not** NO-GO — but the wrapper of Ф2 starts every first-round task as a fresh session and cannot use it as designed. Set `VERDICT = GO`, fill what you have (U3 from `pong3.out`), skip to Step 13, and report `DONE_WITH_CONCERNS` (Step 15) so the orchestrator stops after Ф1 and asks the user (Step 16).
-- An explicit model-selection refusal (`Select a model…` or another model-not-selected string) → every U1 candidate is shown not to work (persisted default: probe 2; flag/env: Steps 3 and 5; session-bound resume: probe 3) → `MODEL_MECHANISM = none`, `VERDICT = NO-GO`: fill what you have, skip to Step 13.
-- Any other failure of probe 3 (launch, auth, timeout, crash — anything but an explicit model-selection refusal) is an indeterminate result, not proof that the mechanism is absent: record the exit code and exact stderr in U1 and `[REPORT_FILE]`, leave `MODEL_MECHANISM` and `VERDICT` unset (no `none`, no `NO-GO`), and finish with line 1 `BLOCKED` and the reason `session-bound resume probe indeterminate — <exit code / stderr summary>`.
+Step 6 never sets `MODEL_MECHANISM = none` or `VERDICT = NO-GO`. Every failure above ends `BLOCKED` with no verdict, and the user decides (spec §10 U1, "No way at all").
 
 - [ ] **Step 7: U3 — JSON keys and usage semantics**
 
@@ -640,7 +735,9 @@ Fill every `- Answer:` / `- How verified:` / `- Holds for:` (`ZCode <short versi
 - `PATTERN_LAUNCH`: `ZCODE_BUILTIN_PROVIDER;provider config;Cannot find module` plus any exact startup-error string found.
 - `APP_VERSION_PLIST_KEY`: `CFBundleVersion` only if Step 3 showed the desktop app passes the full `3.15.1.8093`-style version; otherwise `CFBundleShortVersionString`.
 - `VERIFIED_APP_VERSION`: the value Step 4 printed for that **same** plist key (the short `3.15.1` with `CFBundleShortVersionString`, the full `3.15.1.8093`-style value with `CFBundleVersion`) — the wrapper's `doctor` compares the value it reads via `APP_VERSION_PLIST_KEY` against it, so both sides come from one key.
-- `VERDICT`: `NO-GO` iff `MODEL_MECHANISM` is `none` (all three U1 candidates shown to fail with an explicit model-selection refusal — Step 6); otherwise `GO`. A session-bound candidate that could not be tested or gave an indeterminate result never reaches this step: Step 6 finishes `BLOCKED` with no verdict. Write the `## Go / no-go` line as `VERDICT: GO` (with `MODEL_MECHANISM = session-bound`: `VERDICT: GO — model only via a session-bound resume (U1); the Ф2 wrapper design cannot use it, user decides`) or `VERDICT: NO-GO — no headless model selection by any means (U1)`.
+- U1: replace the first run's `Unresolved (Ф1 BLOCKED …)` text with the Step 6 outcome. Cover the login, the JSON shape it wrote, the pinned selection, and the PONG and model evidence of probe 2. Under `Design consequence:` write that the wrapper owns its personal provider config and pins `PINNED_SELECTION` before every run, and that the user's one-time `zcode login zai` is a prerequisite.
+- `SELECTION_PATH`, `PERSONAL_CONFIG_BASE`, `PINNED_SELECTION`: the values Step 6 recorded, each a single line (the two JSON values exactly as printed).
+- `VERDICT`: `NO-GO` iff `MODEL_MECHANISM` is `none` (all three spec §10 U1 candidates shown to fail with an explicit model-selection refusal); otherwise `GO`. Step 6 never produces `none`, so a run that reaches this step has `MODEL_MECHANISM = personal-config` (or a Step 5 `flag:` / `env:`) and `VERDICT = GO`. Every Step 6 failure finishes `BLOCKED` with no verdict and never reaches this step. Write the `## Go / no-go` line as `VERDICT: GO` or `VERDICT: NO-GO — no headless model selection by any means (U1)`.
 
 - [ ] **Step 14: Run the completeness check (passes)**
 
@@ -648,7 +745,7 @@ Run the Step 1 command block again. Expected: only `check-done`.
 
 - [ ] **Step 15: Report**
 
-Final message: line 1 `DONE` (or `DONE_WITH_CONCERNS` — always with `MODEL_MECHANISM = session-bound`, naming it as the concern), line 2 exactly `VERDICT: GO` or `VERDICT: NO-GO`, then the report path. Do not commit. (A Step 6 `BLOCKED` finish skips Steps 13–15.)
+Final message: line 1 `DONE` (or `DONE_WITH_CONCERNS`, naming the concern), line 2 exactly `VERDICT: GO` or `VERDICT: NO-GO`, then the report path. Do not commit. (A Step 6 `BLOCKED` finish skips Steps 13–15.)
 
 - [ ] **Step 16: Commit the phase (orchestrator)**
 
@@ -657,7 +754,7 @@ git add -f docs/zcode-cli-findings.md
 git commit -m "docs(zcode): record ZCode CLI discovery findings"
 ```
 
-On `VERDICT: NO-GO`, or `MODEL_MECHANISM = session-bound`: after this commit, stop and ask the user — do not start Ф2.
+On `VERDICT: NO-GO`: after this commit, stop and ask the user — do not start Ф2.
 
 ## Ф2: `zcode-dispatch` wrapper and stubbed unit tests
 
@@ -672,8 +769,8 @@ On `VERDICT: NO-GO`, or `MODEL_MECHANISM = session-bound`: after this commit, st
 - Test: `tests/test-zcode-dispatch.sh`
 
 **Interfaces:**
-- Consumes: `docs/zcode-cli-findings.md` with sections `## Go / no-go` (line `VERDICT: GO` | `VERDICT: NO-GO — <reason>`), `## U1 — …` through `## U11 — …`, and `## Inputs for later phases` filled for every key of Contract C7 (`VERDICT`, `MODEL_MECHANISM`, `RESUME_KEEPS_MODEL`, `REPORTED_MODEL_FIELD`, `USAGE_INPUT_FIELD`, `USAGE_CACHED_FIELD`, `USAGE_OUTPUT_FIELD`, `USAGE_REASONING_FIELD`, `CACHED_IS_SUBSET_OF_INPUT`, `PROMPT_TRANSPORT`, `MAX_PROMPT_BYTES`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `APP_VERSION_PLIST_KEY`, `DISALLOWED_TOOLS`, `GLM_CONCURRENCY`, `SESSION_SAVED_ON_SIGTERM`, `INTERFERING_PLUGINS`, `PATTERN_MODEL_NOT_SELECTED`, `PATTERN_AUTH`, `PATTERN_QUOTA`, `PATTERN_LAUNCH`) — this phase reads the Ф2 keys of C7 (Step 8).
-- Produces: `bin/zcode-dispatch` with the command surface of Contract C1 (verbs `task`, `status`, `result`, `cancel`, `doctor`, `doctor --probe`; start line `ZCode Task started in the background as zt-NNNN`; exit codes 0/1/2), job records per Contract C2 under the layout of Contract C3, errorClass set `timeout | crash | model-not-selected | auth | quota | launch | malformed`, and `bin/lib/zcode-dispatch.mjs` exports per Contract C4 (`PINNED_MODEL`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `PROMPT_TRANSPORT`, `MAX_PROMPT_BYTES`, `APP_VERSION_PLIST_KEY`, `MODEL_ARGS`, `MODEL_ENV`, `DISALLOWED_TOOLS`, `REPORTED_MODEL_PATH`, `USAGE_FIELDS`, `PATTERNS`, `main`, `readRecord`, `finalizeRecord`, `buildCliArgv`, `parseCliOutput`, `classifyFailure`); the test suite `tests/test-zcode-dispatch.sh`.
+- Consumes: `docs/zcode-cli-findings.md` with sections `## Go / no-go` (line `VERDICT: GO` | `VERDICT: NO-GO — <reason>`), `## U1 — …` through `## U11 — …`, and `## Inputs for later phases` filled for every key of Contract C7 (`VERDICT`, `MODEL_MECHANISM`, `SELECTION_PATH`, `PERSONAL_CONFIG_BASE`, `PINNED_SELECTION`, `RESUME_KEEPS_MODEL`, `REPORTED_MODEL_FIELD`, `USAGE_INPUT_FIELD`, `USAGE_CACHED_FIELD`, `USAGE_OUTPUT_FIELD`, `USAGE_REASONING_FIELD`, `CACHED_IS_SUBSET_OF_INPUT`, `PROMPT_TRANSPORT`, `MAX_PROMPT_BYTES`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `APP_VERSION_PLIST_KEY`, `DISALLOWED_TOOLS`, `GLM_CONCURRENCY`, `SESSION_SAVED_ON_SIGTERM`, `INTERFERING_PLUGINS`, `PATTERN_MODEL_NOT_SELECTED`, `PATTERN_AUTH`, `PATTERN_QUOTA`, `PATTERN_LAUNCH`) — this phase reads the Ф2 keys of C7 (Step 8).
+- Produces: `bin/zcode-dispatch` with the command surface of Contract C1 (verbs `task`, `status`, `result`, `cancel`, `doctor`, `doctor --probe`; start line `ZCode Task started in the background as zt-NNNN`; exit codes 0/1/2), job records per Contract C2 under the layout of Contract C3, errorClass set `timeout | crash | model-not-selected | auth | quota | launch | malformed`, and `bin/lib/zcode-dispatch.mjs` exports per Contract C4 (`PINNED_MODEL`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `PROMPT_TRANSPORT`, `MAX_PROMPT_BYTES`, `APP_VERSION_PLIST_KEY`, `MODEL_ARGS`, `MODEL_ENV`, `SELECTION_PATH`, `PERSONAL_CONFIG_BASE`, `PINNED_SELECTION`, `DISALLOWED_TOOLS`, `REPORTED_MODEL_PATH`, `USAGE_FIELDS`, `PATTERNS`, `main`, `readRecord`, `finalizeRecord`, `buildCliArgv`, `pinPersonalConfig`, `parseCliOutput`, `classifyFailure`); the test suite `tests/test-zcode-dispatch.sh`.
 
 - [ ] **Step 1: Write the test fixtures**
 
@@ -735,6 +832,12 @@ async function run() {
       return emit("DONE\nresumed");
     case "record": {
       const stdin = flag("-p") === "-" ? await readStdin() : null;
+      let personalConfig = null; // the personal provider config as the wrapper left it for this run
+      try {
+        personalConfig = JSON.parse(fs.readFileSync(process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, "utf8"));
+      } catch {
+        personalConfig = null;
+      }
       fs.writeFileSync(
         process.env.ZCODE_STUB_RECORD,
         JSON.stringify({
@@ -745,8 +848,10 @@ async function run() {
             ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE ?? null,
             ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: process.env.ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE ?? null,
             ZCODE_APP_VERSION: process.env.ZCODE_APP_VERSION ?? null,
+            ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE ?? null,
             ZCODE_DATA_BASE_DIR: process.env.ZCODE_DATA_BASE_DIR ?? null,
           },
+          personalConfig,
         }),
       );
       return emit("DONE\nrecorded");
@@ -1008,6 +1113,42 @@ process.exit(ok ? 0 : 1);'; then
         fail "2 CLI argv pins json/yolo/terminal/workflow-disabled/--cwd root, prompt per PROMPT_TRANSPORT, env = provider config x2 + app version, no ZCODE_DATA_BASE_DIR"
         echo "    status: $st record: $(cat "$TEST_ROOT/record.json" 2>/dev/null | head -c 600)"
     fi
+
+    # --- 2. personal provider config: wrapper-owned, pinned before every run, passed by env ---
+    local pcfg sel_path pinned
+    pcfg="$ZCODE_STATE_DIR/personal-provider-config.json"
+    sel_path="$(const_of SELECTION_PATH)"
+    pinned="$(const_of PINNED_SELECTION)"
+    if [[ "$st" == completed ]] && REC="$TEST_ROOT/record.json" PCFG="$pcfg" SEL_PATH="$sel_path" PINNED="$pinned" node -e '
+const fs = require("node:fs");
+const r = JSON.parse(fs.readFileSync(process.env.REC, "utf8"));
+const at = (o) => process.env.SEL_PATH.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
+process.exit(r.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE === process.env.PCFG && r.personalConfig !== null
+  && JSON.stringify(at(r.personalConfig)) === process.env.PINNED ? 0 : 1);'; then
+        pass "2 the CLI gets ZCODE_PERSONAL_PROVIDER_CONFIG_FILE=<state root>/personal-provider-config.json, created before the run with SELECTION_PATH = PINNED_SELECTION"
+    else
+        fail "2 the CLI gets ZCODE_PERSONAL_PROVIDER_CONFIG_FILE=<state root>/personal-provider-config.json, created before the run with SELECTION_PATH = PINNED_SELECTION"
+        echo "    status: $st file: $(head -c 400 "$pcfg" 2>/dev/null)"
+    fi
+    PCFG="$pcfg" SEL_PATH="$sel_path" node -e '
+const fs = require("node:fs");
+const o = JSON.parse(fs.readFileSync(process.env.PCFG, "utf8"));
+const keys = process.env.SEL_PATH.split(".");
+keys.slice(0, -1).reduce((a, k) => a[k], o)[keys.at(-1)] = { providerId: "p", modelId: "GLM-5.3" };
+o.keptByWrapper = true;
+fs.writeFileSync(process.env.PCFG, JSON.stringify(o));'
+    id="$(start_task --prompt-file "$prompt")"
+    st="$(wait_status "$id" 'completed|failed|cancelled' 20)"
+    if [[ "$st" == completed ]] && REC="$TEST_ROOT/record.json" SEL_PATH="$sel_path" PINNED="$pinned" node -e '
+const fs = require("node:fs");
+const r = JSON.parse(fs.readFileSync(process.env.REC, "utf8"));
+const at = (o) => process.env.SEL_PATH.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
+process.exit(r.personalConfig?.keptByWrapper === true && JSON.stringify(at(r.personalConfig)) === process.env.PINNED ? 0 : 1);'; then
+        pass "2 a changed selection is re-pinned before the next run; other content of the file is kept"
+    else
+        fail "2 a changed selection is re-pinned before the next run; other content of the file is kept"
+        echo "    status: $st record: $(head -c 600 "$TEST_ROOT/record.json" 2>/dev/null)"
+    fi
     unset ZCODE_STUB_RECORD
 
     # --- 3. status running -> completed; result; stored fields; recent cap ---
@@ -1039,7 +1180,7 @@ process.exit(ok ? 0 : 1);'; then
     local n_recent n_all
     n_recent="$("$ZD" status --json | jfield recent | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).length))')"
     n_all="$("$ZD" status --json --all | jfield recent | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).length))')"
-    if [[ "$n_recent" -eq 10 && "$n_all" -eq 12 ]]; then
+    if [[ "$n_recent" -eq 10 && "$n_all" -eq 13 ]]; then
         pass "3 status without id lists the 10 newest terminal jobs; --all lists every job"
     else
         fail "3 status without id lists the 10 newest terminal jobs; --all lists every job"
@@ -1278,13 +1419,13 @@ process.exit(injected && runner.status === "cancelled" && m.readRecord(file).sta
     rc=0
     out="$("$ZD" doctor)" || rc=$?
     local checks=0 c
-    for c in app cli provider-config node app-version git state-dir kill-switch; do
+    for c in app cli provider-config node app-version git state-dir personal-config kill-switch; do
         if grep -Eq "^(ok|WARN) $c: " <<<"$out"; then checks=$((checks + 1)); fi
     done
-    if [[ "$rc" -eq 0 && "$checks" -eq 8 && "$(tail -1 <<<"$out")" == "doctor: ok" ]] && ! grep -q '^FAIL' <<<"$out"; then
-        pass "11 doctor against the fixtures: 8 checks ok/WARN, 'doctor: ok', exit 0"
+    if [[ "$rc" -eq 0 && "$checks" -eq 9 && "$(tail -1 <<<"$out")" == "doctor: ok" ]] && ! grep -q '^FAIL' <<<"$out"; then
+        pass "11 doctor against the fixtures: 9 checks ok/WARN, 'doctor: ok', exit 0"
     else
-        fail "11 doctor against the fixtures: 8 checks ok/WARN, 'doctor: ok', exit 0"
+        fail "11 doctor against the fixtures: 9 checks ok/WARN, 'doctor: ok', exit 0"
         echo "    exit: $rc"
         echo "$out" | sed 's/^/    /'
     fi
@@ -1406,7 +1547,9 @@ exec node "$MJS" "$@"
 //
 // Pure Node ESM, no dependencies, no shell: every child process is spawned with
 // an argv array. Never reads or writes ~/.zcode, never sets ZCODE_DATA_BASE_DIR,
-// never calls the Z.ai API itself — the ZCode CLI is the only channel.
+// never calls the Z.ai API itself — the ZCode CLI is the only channel. The model pin
+// travels in the wrapper's own personal provider config under the state root
+// (ZCODE_PERSONAL_PROVIDER_CONFIG_FILE); the CLI login is the user's `zcode login zai`.
 //
 // Usage: zcode-dispatch <task|status|result|cancel|doctor> [args...]
 // Exit codes: 0 success · 1 runtime failure · 2 usage error or guard refusal.
@@ -1428,6 +1571,11 @@ export const MAX_PROMPT_BYTES = 200 * 1024;
 export const APP_VERSION_PLIST_KEY = "CFBundleShortVersionString";
 export const MODEL_ARGS = []; // MODEL_MECHANISM flag:<--name> → ["<--name>", PINNED_MODEL]
 export const MODEL_ENV = {}; // MODEL_MECHANISM env:<NAME> → { "<NAME>": PINNED_MODEL }
+// MODEL_MECHANISM personal-config: the selection written at SELECTION_PATH of the wrapper-owned
+// personal provider config before every run; PERSONAL_CONFIG_BASE seeds a missing file.
+export const SELECTION_PATH = "config.defaultModelSelection";
+export const PERSONAL_CONFIG_BASE = { schemaVersion: 1, config: { providerConfigRules: { providerRules: [] }, modelConfigRules: {} } };
+export const PINNED_SELECTION = { providerId: "account:zai-individual-coding-plan", modelId: "GLM-5.3-Flash", options: { reasoningLevel: "max" } };
 export const DISALLOWED_TOOLS = []; // DISALLOWED_TOOLS list → one --disallowedTools a,b,c
 export const REPORTED_MODEL_PATH = null; // REPORTED_MODEL_FIELD dot path; null = not exposed
 export const USAGE_FIELDS = { input: "inputTokens", cached: "cacheReadTokens", output: "outputTokens" };
@@ -1468,6 +1616,8 @@ function zcodePaths(env = process.env) {
 function stateRoot(env = process.env) {
   return env.ZCODE_STATE_DIR || path.join(os.homedir(), ".claude", "plugins", "data", "superpowers-strigov-ver-zcode");
 }
+
+const personalConfigFile = (env = process.env) => path.join(stateRoot(env), "personal-provider-config.json");
 
 function readAppVersion(plist) {
   const r = spawnSync("plutil", ["-extract", APP_VERSION_PLIST_KEY, "raw", "-o", "-", plist], { encoding: "utf8" });
@@ -1563,6 +1713,26 @@ function updateRunning(file, patch) {
   const next = { ...current, ...patch };
   writeRecord(file, next);
   return fs.existsSync(terminalFile(file)) ? null : next;
+}
+
+// The wrapper-owned personal provider config (ZCODE_PERSONAL_PROVIDER_CONFIG_FILE). Before every CLI
+// run the default selection at SELECTION_PATH is set to PINNED_SELECTION; everything else in the file
+// (e.g. what the user's one-time `zcode login zai` wrote there) is kept, and a missing or unreadable
+// file starts from PERSONAL_CONFIG_BASE. It lives under the state root, never under ~/.zcode, and
+// holds no credentials.
+export function pinPersonalConfig(file) {
+  const current = readJson(file);
+  const config = current && typeof current === "object" && !Array.isArray(current) ? current : structuredClone(PERSONAL_CONFIG_BASE);
+  const keys = SELECTION_PATH.split(".");
+  let node = config;
+  for (const key of keys.slice(0, -1)) {
+    if (!node[key] || typeof node[key] !== "object" || Array.isArray(node[key])) node[key] = {};
+    node = node[key];
+  }
+  node[keys.at(-1)] = structuredClone(PINNED_SELECTION);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  writeRecord(file, config); // atomic rename
+  return config;
 }
 
 function listRecords(jobsDir) {
@@ -1706,6 +1876,7 @@ function buildCliEnv(paths, appVersion) {
     ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: paths.providerConfig,
     ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: paths.providerConfig,
     ZCODE_APP_VERSION: appVersion,
+    ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: personalConfigFile(),
   };
 }
 
@@ -1951,6 +2122,12 @@ async function runJob(id, jobsDir) {
     finalizeRecord(file, { status: "failed", errorClass: "launch", note: `cannot read prompt file: ${error.message}` });
     return 1;
   }
+  try {
+    pinPersonalConfig(personalConfigFile());
+  } catch (error) {
+    finalizeRecord(file, { status: "failed", errorClass: "launch", note: `cannot write the personal provider config: ${error.message}` });
+    return 1;
+  }
   const paths = zcodePaths();
   const argv = buildCliArgv({ bin: paths.bin, prompt, workspaceRoot: record.workspaceRoot, sessionId: record.resumeOf ? record.sessionId : null });
   appendLog(log, `start ${id}: ${JSON.stringify(paths.node)} ${summarizeArgv(argv)}`);
@@ -2094,6 +2271,14 @@ async function cmdDoctor(args) {
   } catch (error) {
     report("FAIL", "state-dir", `${stateRoot()} is not writable: ${error.message}`);
   }
+  try {
+    pinPersonalConfig(personalConfigFile());
+    const selection = pick(readJson(personalConfigFile()) ?? {}, SELECTION_PATH);
+    if (JSON.stringify(selection) === JSON.stringify(PINNED_SELECTION)) report("ok", "personal-config", `${personalConfigFile()} pins ${PINNED_MODEL}`);
+    else report("FAIL", "personal-config", `${personalConfigFile()}: ${SELECTION_PATH} does not hold PINNED_SELECTION after pinning`);
+  } catch (error) {
+    report("FAIL", "personal-config", `cannot write ${personalConfigFile()}: ${error.message}`);
+  }
   if (process.env.SP_IMPLEMENTER === "luna") report("WARN", "kill-switch", "SP_IMPLEMENTER=luna is set; task will refuse");
   else report("ok", "kill-switch", "SP_IMPLEMENTER is not luna");
 
@@ -2105,6 +2290,7 @@ async function cmdDoctor(args) {
 
 // One synchronous PONG request: the only diagnostic that spends quota.
 async function runProbe(paths, appVersion, root) {
+  pinPersonalConfig(personalConfigFile());
   const argv = buildCliArgv({ bin: paths.bin, prompt: PROBE_PROMPT, workspaceRoot: root, sessionId: null });
   const result = await runCli({
     node: paths.node,
@@ -2178,7 +2364,7 @@ if (invokedDirectly) process.exitCode = await main(process.argv.slice(2));
 - [ ] **Step 6: Run the suite to verify it passes**
 
 Run: `bash tests/test-zcode-dispatch.sh`
-Expected: every line `[PASS] …` (45 assertions), last line `PASS`, exit 0, about 20 s. No `zcode-stub.cjs` process survives (`pgrep -f zcode-stub.cjs` prints nothing).
+Expected: every line `[PASS] …` (47 assertions), last line `PASS`, exit 0, about 20 s. No `zcode-stub.cjs` process survives (`pgrep -f zcode-stub.cjs` prints nothing).
 
 - [ ] **Step 7: Run the existing suite (regression)**
 
@@ -2196,7 +2382,10 @@ Open `docs/zcode-cli-findings.md` → `## Inputs for later phases` and edit only
 | `VERIFIED_APP_VERSION` = `<v>` | `export const VERIFIED_APP_VERSION = "<v>";` |
 | `VERIFIED_NODE_MAJOR` = `<n>` | `export const VERIFIED_NODE_MAJOR = <n>;` |
 | `APP_VERSION_PLIST_KEY` = `<key>` | `export const APP_VERSION_PLIST_KEY = "<key>";` |
-| `MODEL_MECHANISM` = `user-persisted` | leave `MODEL_ARGS = []` and `MODEL_ENV = {}` |
+| `MODEL_MECHANISM` = `personal-config` | leave `MODEL_ARGS = []` and `MODEL_ENV = {}`; apply the next three rows |
+| `SELECTION_PATH` = `<path>` | `export const SELECTION_PATH = "<path>";` |
+| `PERSONAL_CONFIG_BASE` = `<json>` | `export const PERSONAL_CONFIG_BASE = <json>;` (the JSON pasted unchanged as the object literal) |
+| `PINNED_SELECTION` = `<json>` | `export const PINNED_SELECTION = <json>;` (the JSON pasted unchanged as the object literal) |
 | `MODEL_MECHANISM` = `flag:<--name>` | `export const MODEL_ARGS = ["<--name>", PINNED_MODEL];` |
 | `MODEL_MECHANISM` = `env:<NAME>` | `export const MODEL_ENV = { "<NAME>": PINNED_MODEL };` |
 | `DISALLOWED_TOOLS` = `none` / `a,b` | leave `[]` / `export const DISALLOWED_TOOLS = ["a", "b"];` |
@@ -2209,7 +2398,7 @@ Open `docs/zcode-cli-findings.md` → `## Inputs for later phases` and edit only
 - [ ] **Step 9: Re-run both suites**
 
 Run: `bash tests/test-zcode-dispatch.sh && bash tests/test-sdd-scripts.sh`
-Expected: both end with `PASS` (the tests read the exported constants, so Step 8's values are exercised: transport, plist key, `MODEL_ARGS`, `DISALLOWED_TOOLS`, first pattern of each class).
+Expected: both end with `PASS` (the tests read the exported constants, so Step 8's values are exercised: transport, plist key, `MODEL_ARGS`, `DISALLOWED_TOOLS`, `SELECTION_PATH` / `PINNED_SELECTION`, first pattern of each class).
 
 - [ ] **Step 10: Commit the phase**
 
@@ -2236,7 +2425,7 @@ All edits below are exact find/replace pairs: **Find** text occurs exactly once 
 - Modify: `skills/dev-orchestrator/codex-control-review-prompt.md`
 
 **Interfaces:**
-- Consumes: `docs/zcode-cli-findings.md` with sections `## Go / no-go` (line `VERDICT: GO` | `VERDICT: NO-GO — <reason>`), `## U1 — …` through `## U11 — …`, and `## Inputs for later phases` filled for every key of Contract C7 (`VERDICT`, `MODEL_MECHANISM`, `RESUME_KEEPS_MODEL`, `REPORTED_MODEL_FIELD`, `USAGE_INPUT_FIELD`, `USAGE_CACHED_FIELD`, `USAGE_OUTPUT_FIELD`, `USAGE_REASONING_FIELD`, `CACHED_IS_SUBSET_OF_INPUT`, `PROMPT_TRANSPORT`, `MAX_PROMPT_BYTES`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `APP_VERSION_PLIST_KEY`, `DISALLOWED_TOOLS`, `GLM_CONCURRENCY`, `SESSION_SAVED_ON_SIGTERM`, `INTERFERING_PLUGINS`, `PATTERN_MODEL_NOT_SELECTED`, `PATTERN_AUTH`, `PATTERN_QUOTA`, `PATTERN_LAUNCH`) — this phase reads `MODEL_MECHANISM`, `REPORTED_MODEL_FIELD`, `RESUME_KEEPS_MODEL`, `GLM_CONCURRENCY`; and `bin/zcode-dispatch` with the command surface of Contract C1 (verbs `task`, `status`, `result`, `cancel`, `doctor`, `doctor --probe`; start line `ZCode Task started in the background as zt-NNNN`; exit codes 0/1/2), job records per Contract C2 under the layout of Contract C3, errorClass set `timeout | crash | model-not-selected | auth | quota | launch | malformed`.
+- Consumes: `docs/zcode-cli-findings.md` with sections `## Go / no-go` (line `VERDICT: GO` | `VERDICT: NO-GO — <reason>`), `## U1 — …` through `## U11 — …`, and `## Inputs for later phases` filled for every key of Contract C7 (`VERDICT`, `MODEL_MECHANISM`, `SELECTION_PATH`, `PERSONAL_CONFIG_BASE`, `PINNED_SELECTION`, `RESUME_KEEPS_MODEL`, `REPORTED_MODEL_FIELD`, `USAGE_INPUT_FIELD`, `USAGE_CACHED_FIELD`, `USAGE_OUTPUT_FIELD`, `USAGE_REASONING_FIELD`, `CACHED_IS_SUBSET_OF_INPUT`, `PROMPT_TRANSPORT`, `MAX_PROMPT_BYTES`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `APP_VERSION_PLIST_KEY`, `DISALLOWED_TOOLS`, `GLM_CONCURRENCY`, `SESSION_SAVED_ON_SIGTERM`, `INTERFERING_PLUGINS`, `PATTERN_MODEL_NOT_SELECTED`, `PATTERN_AUTH`, `PATTERN_QUOTA`, `PATTERN_LAUNCH`) — this phase reads `MODEL_MECHANISM`, `REPORTED_MODEL_FIELD`, `RESUME_KEEPS_MODEL`, `GLM_CONCURRENCY`; and `bin/zcode-dispatch` with the command surface of Contract C1 (verbs `task`, `status`, `result`, `cancel`, `doctor`, `doctor --probe`; start line `ZCode Task started in the background as zt-NNNN`; exit codes 0/1/2), job records per Contract C2 under the layout of Contract C3, errorClass set `timeout | crash | model-not-selected | auth | quota | launch | malformed`.
 - Produces: the protocol artifacts of Contract C8 (operations, body / dispatch / sidecar file names, session marker, state-line suffix, `risk_phases`, the `zcode-invocation` "Verified facts" lines including `- Quota bonus (1.5× in ZCode): not measured yet — live acceptance pending.`, gate-stall tokens); the skill `skills/zcode-invocation/SKILL.md` (name `zcode-invocation`); the ZCode preamble and channel-switch notice sections in `skills/dev-orchestrator/implementer-prompt.md`.
 
 - [ ] **Step 1: Write the structural check and run it (fails)**
@@ -2324,7 +2513,7 @@ The plan's terms (docs.z.ai/devpack/usage-policy): the Coding Plan may be used o
 - GLM concurrency: ⟨GLM_CONCURRENCY⟩
 - Quota bonus (1.5× in ZCode): not measured yet — live acceptance pending.
 
-dev-orchestrator reads these lines: `Model confirmation: required` → one user confirmation per session, before the first GLM dispatch, that the CLI's `/model` selection is GLM-5.3-Flash with reasoning `max`; `GLM resume: disabled` → every GLM follow-up is a FRESH dispatch (dev-orchestrator Step 3); `GLM concurrency: 1` → at most one GLM track per parallel group.
+dev-orchestrator reads these lines: `Model selection: wrapper` → the wrapper pins GLM-5.3-Flash at `max` in its own personal provider config before every run, and the user's only setup step is the one-time CLI login ("One-time setup"); `Model confirmation: required` → one user confirmation per session, before the first GLM dispatch, that ZCode runs GLM-5.3-Flash with reasoning `max`; `GLM resume: disabled` → every GLM follow-up is a FRESH dispatch (dev-orchestrator Step 3); `GLM concurrency: 1` → at most one GLM track per parallel group.
 
 ## Working path
 
@@ -2342,21 +2531,21 @@ Same idiom as `$DISPATCH` in `codex-invocation`: `command -v` when the marketpla
 ### 2. One-time setup (user actions only — never run by the orchestrator)
 
 1. Install ZCode.app into `/Applications`.
-2. Log in **inside the app** with the GLM Coding Plan account.
-3. If "Model selection" above reads `user /model`, select the model once in the CLI's own TUI. The user runs (the `!` prefix makes it a user-shell command; if the `!` prompt cannot host an interactive TUI, run the same line without `!` in a separate terminal window):
+2. Log the **CLI** in once with Z.ai's own browser login (GLM Coding Plan account). The embedded CLI ships without its TUI, so there is no `/model` step. The user runs the line below; the `!` prefix makes it a user-shell command. It opens the browser; if the `!` prompt cannot host it, run the same line without `!` in a separate terminal window:
 
    ```
-   ! ZCODE_BUILTIN_PROVIDER_CONFIG_FILE=/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE=/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json ZCODE_APP_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - /Applications/ZCode.app/Contents/Info.plist)" node /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs
+   ! mkdir -p ~/.claude/plugins/data/superpowers-strigov-ver-zcode && ZCODE_BUILTIN_PROVIDER_CONFIG_FILE=/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE=/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json ZCODE_APP_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - /Applications/ZCode.app/Contents/Info.plist)" ZCODE_PERSONAL_PROVIDER_CONFIG_FILE="$HOME/.claude/plugins/data/superpowers-strigov-ver-zcode/personal-provider-config.json" node /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs login zai
    ```
 
-   then types `/model`, picks **GLM-5.3-Flash** with reasoning **max**, and quits the TUI. If "Model selection" reads `wrapper`, skip this step — the wrapper passes the model on every run.
+   The login stores the CLI's identity in ZCode's own credential store; the wrapper never reads it. It also writes a default model into the wrapper's personal provider config named above, not into `~/.zcode/v2/provider_config.json`, so the desktop app's selection stays untouched. The model itself needs no user step: the wrapper pins GLM-5.3-Flash at `max` in that file before every run. One login per machine is enough; repeat it only when step 3 applies.
+3. Login missing or expired: `doctor --probe` prints `model-selected: FAIL(model-not-selected)` or `FAIL(auth)`, and a task fails with the same `errorClass`. Then `glm=down` and Luna max for the rest of the session (dev-orchestrator channel ladder, unchanged). Tell the user to run step 2; never run it yourself.
 
-Model selection, login and plugins belong to the user: the orchestrator asks, never does.
+Login and plugins belong to the user: the orchestrator asks, never does.
 
 ### 3. `doctor`, then `doctor --probe` — once per session
 
 ```bash
-"$ZDISPATCH" doctor            # offline: app, cli, provider-config, node, app-version, git, state-dir, kill-switch
+"$ZDISPATCH" doctor            # offline: app, cli, provider-config, node, app-version, git, state-dir, personal-config, kill-switch
 "$ZDISPATCH" doctor --probe    # offline checks + ONE synchronous PONG request (spends a little quota)
 ```
 
@@ -2370,7 +2559,7 @@ usage: input=<n> cached=<n> output=<n>
 probe: ok | FAIL
 ```
 
-Exit 0 iff the model answered, the answer contains `PONG`, and `reported-model` is `unreported` or the pinned GLM-5.3-Flash. Any FAIL of either command means **Luna for the rest of the session** (dev-orchestrator sets `glm=down` and writes its session marker). After compaction the dev-orchestrator session marker (`<scratchpad>/dev-orchestrator/glm-channel`), not a new probe, restores the state.
+Exit 0 iff the model answered, the answer contains `PONG`, and `reported-model` is `unreported` or the pinned GLM-5.3-Flash. `model-selected: FAIL(model-not-selected)` or `FAIL(auth)` means the CLI login is missing or expired ("One-time setup", step 3). Any FAIL of either command means **Luna for the rest of the session** (dev-orchestrator sets `glm=down` and writes its session marker). After compaction the dev-orchestrator session marker (`<scratchpad>/dev-orchestrator/glm-channel`), not a new probe, restores the state.
 
 ### 4. Submit a task (ALWAYS `--background`, ALWAYS `--prompt-file`)
 
@@ -2421,7 +2610,7 @@ Exit codes everywhere: **0** success · **1** runtime failure (failed job on `re
 
 Refusals (exit 2, nothing spawned): `--cwd` not inside a git work tree; missing or empty prompt file, or one larger than `MAX_PROMPT_BYTES` on the argv transport; `Info.plist` unreadable; `zcode.cjs` or the provider config missing; another job `running` in the same workspace; `SP_IMPLEMENTER=luna`; a bad `--resume-task` (see "Resume semantics"); unknown verbs or flags; an unknown id on `status` / `result` / `cancel`.
 
-Pins (not configurable): `--output-format json`, `--mode yolo`, `--surface terminal`, `--workflow-mode disabled`, `--cwd <workspace root>`; never `--target`, `--json` or `-c/--continue`; `--disallowedTools` only for the tools `docs/zcode-cli-findings.md` (U6) confirmed, never as a substitute for the preamble. Environment = the inherited one plus `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` and `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE` (both the app's `zcode-builtin.json`) and `ZCODE_APP_VERSION` read from `Info.plist` at every task; `ZCODE_DATA_BASE_DIR` is never set.
+Pins (not configurable): `--output-format json`, `--mode yolo`, `--surface terminal`, `--workflow-mode disabled`, `--cwd <workspace root>`; never `--target`, `--json` or `-c/--continue`; `--disallowedTools` only for the tools `docs/zcode-cli-findings.md` (U6) confirmed, never as a substitute for the preamble. Environment = the inherited one plus `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` and `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE` (both the app's `zcode-builtin.json`) and `ZCODE_APP_VERSION` read from `Info.plist` at every task, plus `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` = the wrapper's own `personal-provider-config.json` under the state root, where the model pin is written before every run; `ZCODE_DATA_BASE_DIR` is never set.
 
 Env overrides (tests and relocated installs only): `ZCODE_APP` (default `/Applications/ZCode.app`), `ZCODE_BIN` (default `$ZCODE_APP/Contents/Resources/glm/zcode.cjs`), `ZCODE_NODE` (default `node`), `ZCODE_STATE_DIR` (default `~/.claude/plugins/data/superpowers-strigov-ver-zcode`), `ZCODE_TASK_TIMEOUT_MIN` (default 60). Nothing else — no override for the model, the mode, the surface or the app version.
 
@@ -2448,7 +2637,7 @@ Env overrides (tests and relocated installs only): `ZCODE_APP` (default `/Applic
 | Terminal state | Action |
 |---|---|
 | `completed` | `result`; parse line 1; malformed token → re-dispatch once with `--resume-task <zt-id>`, then the user |
-| `failed` / `quota`, `auth`, `model-not-selected` | `glm=down` for the session (state line + marker); announce; the **same operation** on Luna max FRESH — next-seq `.luna` dispatch file in the FRESH composition for its operation type, unchanged body |
+| `failed` / `quota`, `auth`, `model-not-selected` | `glm=down` for the session (state line + marker); announce; the **same operation** on Luna max FRESH — next-seq `.luna` dispatch file in the FRESH composition for its operation type, unchanged body. On `auth` / `model-not-selected`, also tell the user the CLI login is likely missing ("One-time setup", step 2) |
 | `failed` / `timeout`, `crash`, `launch`, `malformed` | one retry of the **same operation** on GLM: `--fresh`, next-seq `.glm` dispatch file in the FRESH composition, unchanged body; second failure → Luna as above (`glm=down` only if the second class is quota/auth/model-not-selected) |
 | `cancelled` | report to the user, wait |
 | `doctor --probe` FAIL (before any task) | `glm=down` (state line + marker); announce once; Luna for the session |
@@ -2475,7 +2664,7 @@ Kill switch: within a session, the user's "через Luna" or "без GLM" turn
 - Run two write tasks in one working tree across both dispatchers, or more than 2 write tasks in total.
 - Switch implementer channels silently — every fallback and escalation is one announced line.
 - Call `zcode -p` or `node zcode.cjs` bypassing the wrapper — the wrapper guarantees the env, the identification headers, the git-tree guard and the job record.
-- Change ZCode settings, plugins or login on the user's behalf — `/model`, logging in, enabling or disabling plugins are user actions.
+- Change ZCode settings, plugins or login on the user's behalf — logging in (`zcode login zai`), enabling or disabling plugins are user actions. The wrapper's own personal provider config (the model pin) is the only ZCode-format file it writes.
 - Run `doctor --probe` when the dev-orchestrator session marker already exists — one probe per session; the marker carries the result across compaction, and the probe spends quota.
 - Omit `--background`; print per-poll status from the Monitor loop.
 
@@ -2483,7 +2672,8 @@ Kill switch: within a session, the user's "через Luna" or "без GLM" turn
 
 - Wrapper: `<plugin-root>/bin/zcode-dispatch` → `<plugin-root>/bin/lib/zcode-dispatch.mjs`
 - State: `~/.claude/plugins/data/superpowers-strigov-ver-zcode/state/<workspace-slug>/jobs/` — `zt-NNNN.json` (the job record) and `zt-NNNN.log`; `<workspace-slug>` = `<basename of the git root>-<first 8 hex of sha1(root)>`
-- Constants in the `.mjs`, filled from `docs/zcode-cli-findings.md`: `PINNED_MODEL`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `MAX_PROMPT_BYTES`, `PROMPT_TRANSPORT`, and the classifier `PATTERNS`
+- Personal provider config (wrapper-owned; holds the model pin, no credentials): `~/.claude/plugins/data/superpowers-strigov-ver-zcode/personal-provider-config.json`
+- Constants in the `.mjs`, filled from `docs/zcode-cli-findings.md`: `PINNED_MODEL`, `PINNED_SELECTION`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `MAX_PROMPT_BYTES`, `PROMPT_TRANSPORT`, and the classifier `PATTERNS`
 - Discovery facts and the live-acceptance results: `docs/zcode-cli-findings.md`
 ````
 
@@ -2491,8 +2681,8 @@ Then replace the four `⟨…⟩` tokens under "Verified facts" from `docs/zcode
 
 | Token | Value |
 |---|---|
-| `⟨MODEL_SELECTION⟩` | `user /model` if `MODEL_MECHANISM` = `user-persisted`; `wrapper` if it is `flag:…` or `env:…` |
-| `⟨MODEL_CONFIRMATION⟩` | `required` if `REPORTED_MODEL_FIELD` = `none` **and** `MODEL_MECHANISM` = `user-persisted`; otherwise `not required` |
+| `⟨MODEL_SELECTION⟩` | `wrapper` (`MODEL_MECHANISM` = `personal-config`, `flag:…` or `env:…`) |
+| `⟨MODEL_CONFIRMATION⟩` | `not required` (Ф1 reaches `GO` only after Step 6 confirmed the effective model) |
 | `⟨GLM_RESUME⟩` | `enabled` if `RESUME_KEEPS_MODEL` = `yes`; `disabled` if `no` |
 | `⟨GLM_CONCURRENCY⟩` | the `GLM_CONCURRENCY` value (`1` or `2`) |
 
@@ -3103,7 +3293,7 @@ For a parallel track, run `"$WS"` with cwd inside the track's worktree. Fix roun
 ```text
 For a parallel track, run `"$WS"` with cwd inside the track's worktree. Fix rounds append to the same file — never mint a new report path for round 2+.
 3. **Non-frontend phase: decide the channel** — at the phase's first Step 3 dispatch, run the channel ladder below; write the result into the state line (`impl=`) and announce it in one line ("## Reporting cadence").
-4. **Before the first GLM dispatch of a session** (only when the ladder reaches item 3 with `glm=unprobed`): resolve `$ZDISPATCH` (snippet in `zcode-invocation`), run `"$ZDISPATCH" doctor`, then `"$ZDISPATCH" doctor --probe` (cwd inside the repo). Both exit 0 → `glm=ok`. Either fails → `glm=down`, one announcement (`ZCode doctor failed (<first FAIL line>) — implementer for this session: Luna max.`), and ladder item 3 applies for the rest of the session. If `zcode-invocation` records `Model confirmation: required`, then — after a passing probe, once per session — ask the user (`AskUserQuestion`) to confirm that the ZCode CLI's `/model` selection is GLM-5.3-Flash with reasoning `max`; a "no" → `glm=down` with reason `model not confirmed`. Write the result to the session marker. The probe runs **once per session**; after compaction the marker, not a new probe, restores the state.
+4. **Before the first GLM dispatch of a session** (only when the ladder reaches item 3 with `glm=unprobed`): resolve `$ZDISPATCH` (snippet in `zcode-invocation`), run `"$ZDISPATCH" doctor`, then `"$ZDISPATCH" doctor --probe` (cwd inside the repo). Both exit 0 → `glm=ok`. Either fails → `glm=down`, one announcement (`ZCode doctor failed (<first FAIL line>) — implementer for this session: Luna max.`), and ladder item 3 applies for the rest of the session. If `zcode-invocation` records `Model confirmation: required`, then — after a passing probe, once per session — ask the user (`AskUserQuestion`) to confirm that ZCode runs GLM-5.3-Flash with reasoning `max`; a "no" → `glm=down` with reason `model not confirmed`. Write the result to the session marker. The probe runs **once per session**; after compaction the marker, not a new probe, restores the state.
 
 **Channel ladder** (non-frontend phases; decided **once per phase**, at its first Step 3 dispatch; Steps 3.5, 4, 5 and "## Parallel groups" use the channel it picked). First match wins:
 
@@ -3440,7 +3630,7 @@ The Step 2 plan review and control review rounds 2+ stay FRESH by design. Ids ar
 - **Run two write tasks in one working tree across both dispatchers**, or more than 2 write tasks in total — `status` on **both** dispatchers before every dispatch.
 - **Switch implementer channels silently** — every fallback and escalation is one announced line ("## Reporting cadence").
 - **Call `zcode -p` (or `node zcode.cjs`) bypassing the wrapper** — the wrapper is what guarantees the env, the identification headers, the git-tree guard and the job record.
-- **Change ZCode settings, plugins or login on the user's behalf** — model selection via `/model`, logging in, enabling or disabling plugins are user actions; ask, never do.
+- **Change ZCode settings, plugins or login on the user's behalf** — logging in (`zcode login zai`), enabling or disabling plugins are user actions; ask, never do. The wrapper's own personal provider config (the model pin) is the only ZCode-format file it writes.
 ```
 
 **E57.** **Find** in `skills/dev-orchestrator/SKILL.md`:
@@ -3733,7 +3923,7 @@ npm install -g @openai/codex
 codex login
 ```
 
-Optional — the default implementer, **GLM-5.3-Flash via Z.ai's ZCode**: install [ZCode.app](https://github.com/zai-org/ZCode) into `/Applications`, log in inside the app with a GLM Coding Plan account, and follow the one-time model selection in the `zcode-invocation` skill. Without it, `zcode-dispatch doctor` fails and the pipeline implements on Codex Luna `max` instead — announced, never silent.
+Optional — the default implementer, **GLM-5.3-Flash via Z.ai's ZCode**: install [ZCode.app](https://github.com/zai-org/ZCode) into `/Applications`, then log its CLI in once with your GLM Coding Plan account via `zcode login zai` (the exact command is in the `zcode-invocation` skill, "One-time setup"). Without it, `zcode-dispatch doctor` fails and the pipeline implements on Codex Luna `max` instead — announced, never silent.
 
 ### 2. Install the plugin
 ````
@@ -3948,7 +4138,7 @@ npm install -g @openai/codex
 codex login
 ```
 
-Необязательно — имплементер по умолчанию, **GLM-5.3-Flash через ZCode от Z.ai**: установите [ZCode.app](https://github.com/zai-org/ZCode) в `/Applications`, войдите в приложении под аккаунтом GLM Coding Plan и один раз выберите модель по инструкции из скилла `zcode-invocation`. Без этого `zcode-dispatch doctor` не проходит, и пайплайн реализует фазы на Codex Luna `max` — с объявлением, никогда молча.
+Необязательно — имплементер по умолчанию, **GLM-5.3-Flash через ZCode от Z.ai**: установите [ZCode.app](https://github.com/zai-org/ZCode) в `/Applications` и один раз войдите в его CLI под аккаунтом GLM Coding Plan через `zcode login zai` (точная команда — в скилле `zcode-invocation`, раздел «One-time setup»). Без этого `zcode-dispatch doctor` не проходит, и пайплайн реализует фазы на Codex Luna `max` — с объявлением, никогда молча.
 
 ### 2. Установите плагин
 ````
@@ -4180,7 +4370,7 @@ The only external dependency is the standalone `codex` CLI (`npm install -g @ope
 ```text
 The only external dependency is the standalone `codex` CLI (`npm install -g @openai/codex`) and a one-time `!codex login` per machine.
 
-The GLM channel assumes `/Applications/ZCode.app` (macOS) with its embedded Agent CLI at `Contents/Resources/glm/zcode.cjs` — there is no `zcode` on `PATH` — run under the system `node` (major version at least `VERIFIED_NODE_MAJOR` in `bin/lib/zcode-dispatch.mjs`), with the user logged in inside the app. `bin/zcode-dispatch` keeps its job state under `~/.claude/plugins/data/superpowers-strigov-ver-zcode` and never touches `~/.zcode`. Without ZCode.app, `zcode-dispatch doctor` fails and dev-orchestrator implements on Codex Luna max (announced).
+The GLM channel assumes `/Applications/ZCode.app` (macOS) with its embedded Agent CLI at `Contents/Resources/glm/zcode.cjs` — there is no `zcode` on `PATH` — run under the system `node` (major version at least `VERIFIED_NODE_MAJOR` in `bin/lib/zcode-dispatch.mjs`), with the CLI logged in once by the user (`zcode login zai`, see `zcode-invocation`). `bin/zcode-dispatch` keeps its job state and its own personal provider config (the model pin) under `~/.claude/plugins/data/superpowers-strigov-ver-zcode` and never touches `~/.zcode`. Without ZCode.app, `zcode-dispatch doctor` fails and dev-orchestrator implements on Codex Luna max (announced).
 ```
 
 - [ ] **Step 6: Edit the README SVGs**
@@ -4284,10 +4474,12 @@ git commit -m "chore(release): 0.8.0 — GLM-5.3-Flash via ZCode as default impl
 - Modify: `README.ru.md`
 
 **Interfaces:**
-- Consumes: `bin/zcode-dispatch` with the command surface of Contract C1 (verbs `task`, `status`, `result`, `cancel`, `doctor`, `doctor --probe`; start line `ZCode Task started in the background as zt-NNNN`; exit codes 0/1/2), job records per Contract C2 under the layout of Contract C3, errorClass set `timeout | crash | model-not-selected | auth | quota | launch | malformed`; `docs/zcode-cli-findings.md` with sections `## Go / no-go` (line `VERDICT: GO` | `VERDICT: NO-GO — <reason>`), `## U1 — …` through `## U11 — …`, and `## Inputs for later phases` filled for every key of Contract C7 (`VERDICT`, `MODEL_MECHANISM`, `RESUME_KEEPS_MODEL`, `REPORTED_MODEL_FIELD`, `USAGE_INPUT_FIELD`, `USAGE_CACHED_FIELD`, `USAGE_OUTPUT_FIELD`, `USAGE_REASONING_FIELD`, `CACHED_IS_SUBSET_OF_INPUT`, `PROMPT_TRANSPORT`, `MAX_PROMPT_BYTES`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `APP_VERSION_PLIST_KEY`, `DISALLOWED_TOOLS`, `GLM_CONCURRENCY`, `SESSION_SAVED_ON_SIGTERM`, `INTERFERING_PLUGINS`, `PATTERN_MODEL_NOT_SELECTED`, `PATTERN_AUTH`, `PATTERN_QUOTA`, `PATTERN_LAUNCH`); the protocol artifacts of Contract C8 (operations, body / dispatch / sidecar file names, session marker, state-line suffix, `risk_phases`, the `zcode-invocation` "Verified facts" lines including `- Quota bonus (1.5× in ZCode): not measured yet — live acceptance pending.`, gate-stall tokens); the ZCode preamble and channel-switch notice sections in `skills/dev-orchestrator/implementer-prompt.md`; the README paragraphs Ф5 appends to — `README.md` paragraph starting "`max` is reserved for the implementers GLM and Luna" and `README.ru.md` paragraph starting "`max` зарезервирован за имплементерами GLM и Luna".
+- Consumes: `bin/zcode-dispatch` with the command surface of Contract C1 (verbs `task`, `status`, `result`, `cancel`, `doctor`, `doctor --probe`; start line `ZCode Task started in the background as zt-NNNN`; exit codes 0/1/2), job records per Contract C2 under the layout of Contract C3, errorClass set `timeout | crash | model-not-selected | auth | quota | launch | malformed`; `docs/zcode-cli-findings.md` with sections `## Go / no-go` (line `VERDICT: GO` | `VERDICT: NO-GO — <reason>`), `## U1 — …` through `## U11 — …`, and `## Inputs for later phases` filled for every key of Contract C7 (`VERDICT`, `MODEL_MECHANISM`, `SELECTION_PATH`, `PERSONAL_CONFIG_BASE`, `PINNED_SELECTION`, `RESUME_KEEPS_MODEL`, `REPORTED_MODEL_FIELD`, `USAGE_INPUT_FIELD`, `USAGE_CACHED_FIELD`, `USAGE_OUTPUT_FIELD`, `USAGE_REASONING_FIELD`, `CACHED_IS_SUBSET_OF_INPUT`, `PROMPT_TRANSPORT`, `MAX_PROMPT_BYTES`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `APP_VERSION_PLIST_KEY`, `DISALLOWED_TOOLS`, `GLM_CONCURRENCY`, `SESSION_SAVED_ON_SIGTERM`, `INTERFERING_PLUGINS`, `PATTERN_MODEL_NOT_SELECTED`, `PATTERN_AUTH`, `PATTERN_QUOTA`, `PATTERN_LAUNCH`); the protocol artifacts of Contract C8 (operations, body / dispatch / sidecar file names, session marker, state-line suffix, `risk_phases`, the `zcode-invocation` "Verified facts" lines including `- Quota bonus (1.5× in ZCode): not measured yet — live acceptance pending.`, gate-stall tokens); the ZCode preamble and channel-switch notice sections in `skills/dev-orchestrator/implementer-prompt.md`; the README paragraphs Ф5 appends to — `README.md` paragraph starting "`max` is reserved for the implementers GLM and Luna" and `README.ru.md` paragraph starting "`max` зарезервирован за имплементерами GLM и Luna".
 - Produces: nothing
 
 - [ ] **Step 1: Preconditions and `doctor` (no quota)**
+
+Prerequisite (user, once per machine): the ZCode CLI is logged in with `zcode login zai`. The exact command is in `skills/zcode-invocation/SKILL.md` → "One-time setup", step 2. On this machine Ф1 Step 6a already did it, because the login identity is shared by every CLI run. Repeat it only when Step 3 fails with `model-selected: FAIL(model-not-selected)` or `FAIL(auth)`; then restart Ф5 from Step 1. The wrapper pins the model itself, so there is no model-selection step.
 
 In the fresh session, from the repo root:
 
@@ -4316,7 +4508,7 @@ The user opens the Z.ai console → Plan Overview and reads the current credit d
 "$ZDISPATCH" doctor --probe
 ```
 
-Expected: `model-selected: ok`, `answers: ok`, `reported-model: GLM-5.3-Flash…` or `unreported` (with the U3 fallback in force), `probe: ok`, exit 0. Copy the `usage:` line into the report verbatim.
+Expected: `model-selected: ok`, `answers: ok`, `reported-model: GLM-5.3-Flash…` or `unreported` (with the U3 fallback in force), `probe: ok`, exit 0. Copy the `usage:` line into the report verbatim. `model-selected: FAIL(model-not-selected)` or `FAIL(auth)` means the CLI login is missing: stop, the user runs the one-time login (Step 1 prerequisite), then restart from Step 1. In the dev-orchestrator pipeline the same failure means Luna for the session (unchanged ladder).
 
 - [ ] **Step 4: E2E first round in a throwaway repo (request 2 of 3)**
 
