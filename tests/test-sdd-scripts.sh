@@ -296,6 +296,20 @@ PLAN
         fail "WORKTREE mode: .superpowers excluded from the diff"
     fi
 
+    # An embedded repo with no commit inside a non-ignored .superpowers/ makes
+    # `git add` abort if it walks the workspace — the add must exclude it.
+    git init -q "$repo/.superpowers/empty"
+    local nest_pkg="$TEST_ROOT/nested.diff"
+    rc=0
+    ( cd "$repo" && "$BIN/review-package" HEAD WORKTREE "$nest_pkg" >/dev/null 2>&1 ) || rc=$?
+    if [[ "$rc" -eq 0 ]] && grep -q '^+uncommitted$' "$nest_pkg"; then
+        pass "WORKTREE mode: embedded repo in non-ignored .superpowers/ does not abort"
+    else
+        fail "WORKTREE mode: embedded repo in non-ignored .superpowers/ does not abort"
+        echo "    exit: $rc"
+    fi
+    rm -rf "$repo/.superpowers/empty"
+
     ( cd "$repo" && git add src.txt && git add -f .superpowers/sdd/tracked.txt \
         && git "${git_id[@]}" commit -qm c2 )
     local range_pkg="$TEST_ROOT/range-excl.diff"
@@ -340,10 +354,17 @@ PLAN
     ign="$(cd "$TEST_ROOT/ign" && git rev-parse --show-toplevel)"
     printf '.superpowers/\ngen/\n' > "$ign/.gitignore"
     printf 'base\n' > "$ign/src.txt"
-    ( cd "$ign" && git add .gitignore src.txt && git "${git_id[@]}" commit -qm i0 )
+    # A force-tracked file inside the ignored workspace must not mask that the
+    # dir itself is ignored.
+    mkdir -p "$ign/.superpowers"
+    printf 'kept v1\n' > "$ign/.superpowers/kept.txt"
+    ( cd "$ign" && git add .gitignore src.txt && git add -f .superpowers/kept.txt \
+        && git "${git_id[@]}" commit -qm i0 )
     local ign_dir
     ign_dir="$(cd "$ign" && "$BIN/sdd-workspace")"
     printf 'workspace scratch\n' > "$ign_dir/notes.md"
+    printf 'kept v2\n' > "$ign/.superpowers/kept.txt"
+    git init -q "$ign/.superpowers/empty"
     printf 'ign-modified\n' >> "$ign/src.txt"
     printf 'ign-untracked\n' > "$ign/fresh.txt"
     mkdir -p "$ign/gen"

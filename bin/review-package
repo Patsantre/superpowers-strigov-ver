@@ -78,17 +78,23 @@ if [ "$head" = "WORKTREE" ]; then
   # intent-to-add files under ignored dirs (`git add -N -f`) — carry over
   # with the copy; ignored untracked files are skipped (no -f).
   #
-  # No "$exclude" here: when the repo's own .gitignore ignores .superpowers/,
-  # `git add` treats the exclude pathspec as an explicitly named ignored path
-  # and fails. Registering workspace files in this throwaway index is
-  # harmless — the diffs below exclude them.
+  # The workspace is excluded from the add (so `git add` never walks into it,
+  # e.g. an embedded repo there would abort it) — unless the repo's own
+  # .gitignore already ignores .superpowers/: then `git add` treats the
+  # exclude pathspec as an explicitly named ignored path and fails, and
+  # without -f it skips the ignored dir anyway. --no-index: a force-tracked
+  # file inside must not hide that the dir itself is ignored.
   tmpidx="$(mktemp)"
   trap 'rm -f "$tmpidx"' EXIT
   idx="$(git rev-parse --git-path index)"
   if [ -f "$idx" ]; then
     cp "$idx" "$tmpidx"
   fi
-  GIT_INDEX_FILE="$tmpidx" git add --intent-to-add -A -- .
+  if git check-ignore -q --no-index .superpowers; then
+    GIT_INDEX_FILE="$tmpidx" git add --intent-to-add -A -- .
+  else
+    GIT_INDEX_FILE="$tmpidx" git add --intent-to-add -A -- . "$exclude"
+  fi
   {
     echo "# Review package: ${base}..WORKTREE"
     echo
