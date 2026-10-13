@@ -1248,7 +1248,22 @@ process.exit(injected && runner.status === "cancelled" && m.readRecord(file).sta
         head -c $((max + 1)) /dev/zero | tr '\0' 'a' > "$TEST_ROOT/big.md"
         expect_exit 2 "10 prompt file larger than MAX_PROMPT_BYTES ($max)" "$ZD" task --background --prompt-file "$TEST_ROOT/big.md"
     else
-        pass "10 prompt size guard skipped (PROMPT_TRANSPORT=stdin)"
+        # stdin transport: the size guard does not apply (C1), so the big prompt starts a task.
+        local max
+        max="$(const_of MAX_PROMPT_BYTES)"
+        head -c $((max + 1)) /dev/zero | tr '\0' 'a' > "$TEST_ROOT/big.md"
+        rc=0
+        out="$("$ZD" task --background --prompt-file "$TEST_ROOT/big.md" 2>&1)" || rc=$?
+        st=""
+        if [[ "$rc" -eq 0 && "$out" == "ZCode Task started in the background as zt-"* ]]; then
+            st="$(wait_status "${out##* }" 'completed|failed|cancelled' 20)"
+        fi
+        if [[ "$st" == completed ]]; then
+            pass "10 prompt file larger than MAX_PROMPT_BYTES ($max) is accepted on the stdin transport"
+        else
+            fail "10 prompt file larger than MAX_PROMPT_BYTES ($max) is accepted on the stdin transport"
+            echo "    exit: $rc out: $out status: $st"
+        fi
     fi
     expect_exit 2 "10 SP_IMPLEMENTER=luna" env SP_IMPLEMENTER=luna "$ZD" task --background --prompt-file "$prompt"
     mkdir -p "$TEST_ROOT/NoPlist.app/Contents"
