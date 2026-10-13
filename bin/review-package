@@ -74,14 +74,21 @@ mkdir -p "$(dirname "$out")"
 if [ "$head" = "WORKTREE" ]; then
   # Make untracked files visible to `git diff <commit>`: intent-to-add them
   # in a temporary index copy (the real index stays untouched, nothing is
-  # staged or committed).
+  # staged or committed). Entries already in the real index — including
+  # intent-to-add files under ignored dirs (`git add -N -f`) — carry over
+  # with the copy; ignored untracked files are skipped (no -f).
+  #
+  # No "$exclude" here: when the repo's own .gitignore ignores .superpowers/,
+  # `git add` treats the exclude pathspec as an explicitly named ignored path
+  # and fails. Registering workspace files in this throwaway index is
+  # harmless — the diffs below exclude them.
   tmpidx="$(mktemp)"
   trap 'rm -f "$tmpidx"' EXIT
   idx="$(git rev-parse --git-path index)"
   if [ -f "$idx" ]; then
     cp "$idx" "$tmpidx"
   fi
-  GIT_INDEX_FILE="$tmpidx" git add --intent-to-add -A -- . "$exclude"
+  GIT_INDEX_FILE="$tmpidx" git add --intent-to-add -A -- .
   {
     echo "# Review package: ${base}..WORKTREE"
     echo
