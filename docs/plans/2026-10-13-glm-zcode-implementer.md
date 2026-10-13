@@ -5,10 +5,11 @@ status: in-progress
 phases:
   - id: Ф1
     scope: "[Executor: Claude subagent opus/high + one user step] ZCode CLI discovery spike → docs/zcode-cli-findings.md; GO/NO-GO gate"
-    status: in-progress
+    status: done
+    commits: "7bfbd61.."
   - id: Ф2
     scope: "bin/zcode-dispatch shim + bin/lib/zcode-dispatch.mjs job wrapper, stubbed unit tests tests/test-zcode-dispatch.sh"
-    status: pending
+    status: in-progress
   - id: Ф3
     scope: "Protocol: dev-orchestrator SKILL.md + implementer-prompt.md + new zcode-invocation skill + codex-invocation + reviewer prompts"
     status: pending
