@@ -1,4 +1,4 @@
-# Codex xhigh — Control Review on Diff (Step 4.2)
+# Codex Astra high — Control Review on Diff (Step 4.2)
 
 Use AFTER Opus review (Step 4.1) returned `REVIEW_OK`. This is a second-opinion cross-check from a different model family, tuned for "what might Opus have missed".
 
@@ -7,8 +7,8 @@ Use AFTER Opus review (Step 4.1) returned `REVIEW_OK`. This is a second-opinion 
 ```bash
 "$DISPATCH" task \
   --background \
-  --model gpt-5.6-sol \
-  --effort xhigh \
+  --model gpt-6-astra \
+  --effort high \
   [--cwd <worktree-path>] \
   --prompt-file <scratch>/control-review.md
 ```

@@ -8,18 +8,17 @@ Use when Sonnet orchestrator needs Opus to review the implementer's (Codex Luna)
 Agent tool:
   subagent_type: "general-purpose"
   model: "opus"
+  effort: "high"        # "xhigh" on SECURITY / DATA_LOSS phases and in round 4
   description: "Review <phase-id>"
   prompt: |
     <prompt below>
 ```
 
-**The prompt's literal first line MUST be `ultrathink`** — it runs Opus at max thinking effort. The template below already starts with it; keep it first.
+**Effort is set on the dispatch:** `high` by default, `xhigh` when the phase carries SECURITY / DATA_LOSS risk or in round 4 of the fused loop (SKILL.md Step 4.1). Do not add `ultrathink` to the prompt — it does not change the effort sent to the API and only blurs the role's pinned level.
 
 ## Prompt template
 
 ```
-ultrathink
-
 You are the code-review stage of dev-orchestrator. You are a fresh Opus subagent with no prior context on this phase — treat the diff skeptically and verify independently.
 
 ## Phase context

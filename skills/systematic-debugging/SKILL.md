@@ -113,6 +113,7 @@ You MUST complete each phase before proceeding to the next.
    Agent(
      subagent_type="general-purpose",
      model="opus",
+     effort="high",
      description="Evidence analysis: <bug summary>",
      prompt=<see below>
    )
@@ -172,6 +173,7 @@ You MUST complete each phase before proceeding to the next.
 Agent(
   subagent_type="general-purpose",
   model="opus",
+  effort="high",
   description="Root cause hypotheses: <bug summary>",
   prompt=<see below>
 )
@@ -254,6 +256,7 @@ Main thread picks which hypothesis to test first (typically highest likelihood w
    Agent(
      subagent_type="general-purpose",
      model="opus",
+     effort="high",
      description="Architecture question: <bug summary>",
      prompt=<see below>
    )
@@ -270,9 +273,9 @@ Main thread picks which hypothesis to test first (typically highest likelihood w
    2. Propose 2-3 architectural alternatives, each with trade-offs and rough refactor scope.
    3. Recommend the smallest change that would resolve the pattern at its root.
 
-   **Then: single-shot Codex xhigh implementability check** — NOT a review loop, just one cross-opinion pass. Opus reasoned from patterns; Codex reads the code to verify each alternative is actually feasible.
+   **Then: single-shot Codex Astra high implementability check** — NOT a review loop, just one cross-opinion pass. Opus reasoned from patterns; Codex reads the code to verify each alternative is actually feasible.
 
-   Invocation per `codex-invocation` skill (read-only, `--effort xhigh`, no `--write`, no `--resume-last`, cap=1):
+   Invocation per `codex-invocation` skill (read-only, `--model gpt-6-astra --effort high`, no `--write`, no `--resume-last`, cap=1):
 
    ```
    IMPLEMENTABILITY CHECK — read-only, do not modify code.

@@ -207,6 +207,7 @@ COMMIT_COUNT=$(git rev-list --count "$BASE_BRANCH"..HEAD)
 Agent(
   subagent_type="general-purpose",
   model="opus",
+  effort="high",
   description="PR body: <branch name>",
   prompt=<see below>
 )

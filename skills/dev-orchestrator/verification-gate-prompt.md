@@ -8,6 +8,7 @@ Use between implementation (Step 3, or a Step 4 fix round) and the fused review.
 Agent tool:
   subagent_type: "general-purpose"
   model: "sonnet"
+  effort: "medium"
   description: "Verification gate <phase-id>"
   prompt: |
     <prompt below>

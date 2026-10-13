@@ -31,7 +31,7 @@
 
     <g transform="translate(232 132)">
       <rect width="158" height="192" rx="18" fill="#131B32" stroke="#475477"/>
-      <text x="20" y="34" fill="#7C8CFF" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17">02 / SOL</text>
+      <text x="20" y="34" fill="#7C8CFF" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17">02 / ASTRA</text>
       <text x="20" y="74" fill="#F5F7FF" font-size="25" font-weight="700">Ревью</text>
       <text x="20" y="105" fill="#AEB7D0" font-size="17">пробелы</text>
       <text x="20" y="129" fill="#AEB7D0" font-size="17">контракты</text>
@@ -66,8 +66,8 @@
       <rect width="158" height="192" rx="18" fill="#17182F" stroke="#7668A7"/>
       <text x="20" y="34" fill="#B8ACFF" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17">05 / 2× REVIEW</text>
       <text x="20" y="74" fill="#F7F5FF" font-size="25" font-weight="700">Ревью</text>
-      <text x="20" y="105" fill="#C0B9D8" font-size="17">Opus / Fable</text>
-      <text x="20" y="129" fill="#C0B9D8" font-size="17">контроль Sol</text>
+      <text x="20" y="105" fill="#C0B9D8" font-size="17">Opus</text>
+      <text x="20" y="129" fill="#C0B9D8" font-size="17">контроль Astra</text>
       <text x="20" y="153" fill="#C0B9D8" font-size="17">фикс-цикл ≤ 4</text>
       <path d="M20 168H138" stroke="#3F395B"/>
       <text x="20" y="186" fill="#8F86B5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">REVIEW PKG</text>

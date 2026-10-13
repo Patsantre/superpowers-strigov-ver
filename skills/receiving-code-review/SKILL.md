@@ -122,6 +122,7 @@ FOR multi-item feedback:
 Agent(
   subagent_type="general-purpose",
   model="opus",
+  effort="high",
   description="Review triage: <PR/thread id>",
   prompt=<see below>
 )

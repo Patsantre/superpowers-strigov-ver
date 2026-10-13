@@ -8,6 +8,7 @@ Use after a fused review converged in 2+ rounds (or the user accepted at an esca
 Agent tool:
   subagent_type: "general-purpose"
   model: "sonnet"
+  effort: "medium"
   description: "Synthesize review <phase-id>"
   prompt: |
     <prompt below>
@@ -40,7 +41,7 @@ Write `docs/reviews/<slug>-<phase-id>.md` (create `docs/reviews/` if missing) wi
 - **Date**: <YYYY-MM-DD>
 - **Phase scope**: <one-line>
 - **Base commit**: <base-sha>
-- **Rounds**: <k> (Opus 4.1 + Codex xhigh 4.2 control)
+- **Rounds**: <k> (Opus 4.1 + Codex Astra 4.2 control)
 - **Outcome**: <CLEAN | ACCEPTED AT ESCALATION>
 
 ## Findings history

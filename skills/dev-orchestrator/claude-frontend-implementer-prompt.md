@@ -8,26 +8,27 @@ Use when dispatching a frontend-only phase (or a frontend-only task routed strai
 Agent tool:
   subagent_type: "general-purpose"
   model: "opus" | "sonnet"
+  effort: "high" | "medium"     # opus → high, sonnet → medium
   description: "Frontend: <phase id or short slug>"
   prompt: |
     <prompt below>
 ```
 
 Model choice:
-- **Opus** — new UI (new page/component, visible redesign, visual rework). The prompt **MUST** begin with the literal keyword `ultrathink` on its own first line to run Opus at max thinking effort.
-- **Sonnet** — simple tweaks (CSS change, copy edit, minor markup). Omit the `ultrathink` line — Sonnet does not use it.
+- **Opus, effort `high`** — new UI (new page/component, visible redesign, visual rework).
+- **Sonnet, effort `medium`** — simple tweaks (CSS change, copy edit, minor markup).
+
+Effort is set on the dispatch. Do not add `ultrathink` to the prompt — it does not change the effort sent to the API and only blurs the role's pinned level.
 
 The subagent has NO session context. The prompt must be fully self-contained — include plan path + phase id + visual intent + any screenshot references + relevant existing files/components to follow.
 
 Both templates take a `[REPORT_FILE]` placeholder — the implementer writes its full report there so the detail never transits your context. Resolve it once per phase as `$(sdd-workspace <plan-file>)/phase-<id>-report.md` and substitute the absolute path, exactly as for the Codex implementer (see SKILL.md Step 3). Fix rounds append to the same file — never mint a new report path for round 2+.
 
-For follow-up rounds after the fused review (Step 4), start a **fresh** Agent call with the COMBINED BLOCKING list (the open ACCEPTED / PARTIALLY_ACCEPTED ledger items, merged from Opus review + Codex Sol xhigh control review by the orchestrator) and the same `[REPORT_FILE]`. Claude subagents do not have a `--resume-last` equivalent; every round is a fresh dispatch with full context.
+For follow-up rounds after the fused review (Step 4), start a **fresh** Agent call with the COMBINED BLOCKING list (the open ACCEPTED / PARTIALLY_ACCEPTED ledger items, merged from Opus review + Codex Astra control review by the orchestrator) and the same `[REPORT_FILE]`. Claude subagents do not have a `--resume-last` equivalent; every round is a fresh dispatch with full context.
 
 ## First-round prompt template
 
 ```
-ultrathink
-
 You are implementing one phase of an approved plan. This phase is frontend / UI work. Follow the plan exactly — do not expand scope beyond the named phase.
 
 ## Use the frontend-design skill
@@ -123,9 +124,7 @@ Do NOT silently produce work you're unsure about — use `DONE_WITH_CONCERNS`.
 ## Follow-up prompt (round 2+, fresh Agent call)
 
 ```
-ultrathink
-
-Previous frontend implementation had blocking issues from the fused review (Opus + Codex Sol xhigh control). Fix them, re-test, re-report.
+Previous frontend implementation had blocking issues from the fused review (Opus + Codex Astra control). Fix them, re-test, re-report.
 
 ## Plan + phase
 
@@ -133,7 +132,7 @@ Path: `<repo-root>/docs/plans/<slug>.md`, phase `<id>`. Read the plan file for s
 
 ## Combined blocking list
 
-1. <issue 1> — file:line — <reviewer: opus | codex-xhigh> — <what to change>
+1. <issue 1> — file:line — <reviewer: opus | codex-control> — <what to change>
 2. <issue 2>
 ...
 

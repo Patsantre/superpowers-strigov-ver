@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.6.2" src="https://img.shields.io/badge/version-0.6.2-7c8cff?style=flat-square">
+  <img alt="Version 0.7.0" src="https://img.shields.io/badge/version-0.7.0-7c8cff?style=flat-square">
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square">
   <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-35d6a6?style=flat-square">
 </p>
@@ -70,28 +70,35 @@ You can also describe the implementation task normally. The plugin recognizes En
   <img src="./assets/readme/workflow-en.svg" width="100%" alt="Six-stage delivery protocol from plan to whole-branch merge gate">
 </p>
 
-1. **Plan** — an Opus subagent explores the repository and writes a durable implementation plan with scope, interfaces, global constraints, tests, and risks.
-2. **Challenge** — a fresh Codex Sol review finds material gaps; authorized corrections go back to a fresh Opus writer through the ledger.
-3. **Build** — Luna implements one phase and writes a report. Terra can continue the same thread when deeper reasoning is required.
-4. **Verify** — a Sonnet gate runs lint, typecheck, and affected tests before expensive review begins.
-5. **Review twice** — Opus checks spec compliance and quality, then a fresh Sol control review probes edge cases, races, security, and regressions. Fable takes the primary judgment role for SECURITY/DATA_LOSS phases or from round three, with an explicit Opus fallback.
-6. **Gate the branch** — after all phases pass, a fresh Opus review checks the complete branch and full test suite. One consolidated Luna fix wave is allowed before the final verdict.
+1. **Plan** — an Opus `xhigh` subagent explores the repository and writes a durable implementation plan with scope, interfaces, global constraints, tests, and risks.
+2. **Challenge** — a fresh Codex Astra `xhigh` review finds material gaps; authorized corrections go back to a fresh Opus `high` reviser through the ledger.
+3. **Build** — Luna `max` implements one phase and writes a report. Sol 6.1 `xhigh` continues the same thread when an Opus diagnosis says deeper reasoning is required.
+4. **Verify** — a Sonnet `medium` gate runs lint, typecheck, and affected tests before expensive review begins.
+5. **Review twice** — Opus `high` checks spec compliance and quality (`xhigh` on SECURITY/DATA_LOSS phases and in the last round), then a fresh Codex Astra `high` control review probes edge cases, races, security, and regressions.
+6. **Gate the branch** — after all phases pass, a fresh Opus `xhigh` review checks the complete branch and full test suite (Astra `xhigh` if Opus is unavailable). One consolidated Luna fix wave is allowed before the final verdict.
 
 Every Codex continuation is thread-addressed with `--resume-task <task-id>`. Reviewers receive a generated package containing the commit list, stat, and contextual diff instead of reconstructing the change from chat history.
 
 ## Model roles
 
-- **Orchestrator · Claude Sonnet** — triage, dispatch, polling, state transitions, and safe Git bookkeeping. Never writes production code.
-- **Plan writer · Claude Opus + `ultrathink`** — explores the repository, writes the plan, and applies authorized plan revisions.
-- **Plan reviewer · GPT-5.6 Sol `max`** — reviews the plan read-only in a fresh task each round and blocks on material gaps.
-- **Implementer · GPT-5.6 Luna `max`** — implements non-frontend phases and authorized fix rounds.
-- **Reasoning escalation · GPT-5.6 Terra `xhigh`** — continues a blocked implementation thread when more reasoning is needed.
-- **Primary code reviewer · Claude Opus + `ultrathink`** — checks spec compliance and code quality in routine rounds.
-- **Judgment escalation · Claude Fable 5 + `ultrathink`** — handles high-risk/late review rounds, BLOCKED diagnosis, and impasse summaries; explicit Opus fallback.
-- **Control reviewer · GPT-5.6 Sol `xhigh`** — supplies a fresh, read-only second opinion after the primary review clears.
-- **Verification and synthesis · Claude Sonnet** — runs mechanical gates and consolidates multi-round review history.
+Every role runs on a pinned model + effort pair. Claude subagents receive an explicit `effort` on the Agent call (no `ultrathink`); Codex tasks receive explicit `--model` + `--effort`.
 
-`ultra` is never chosen automatically. The Sol plan reviewer uses it only when the user explicitly requests it.
+| Role | Model · effort |
+|---|---|
+| Orchestrator (main thread) | Claude Sonnet · `medium` |
+| Plan writer / spec writer | Claude Opus · `xhigh` |
+| Plan and spec reviser | Claude Opus · `high` |
+| Plan and spec reviewer | GPT-6 Astra · `xhigh` |
+| Implementer, fix rounds, final fix wave | GPT-6 Luna · `max` |
+| Reasoning escalation (BLOCKED) | GPT-6.1 Sol · `xhigh`, same thread |
+| Frontend implementer | Claude Opus · `high` (new UI) / Claude Sonnet · `medium` (tweaks) |
+| Primary code review (4.1) | Claude Opus · `high`; `xhigh` on SECURITY/DATA_LOSS phases and in round 4 |
+| Control review (4.2) | GPT-6 Astra · `high` |
+| Final whole-branch review | Claude Opus · `xhigh`; GPT-6 Astra · `xhigh` if Opus is unavailable |
+| BLOCKED diagnosis, impasse summaries | Claude Opus · `high` |
+| Verification gate, synthesis, quickfix, integration check | Claude Sonnet · `medium` |
+
+`max` is reserved for Luna (or used when the user asks for it by name); `ultra` is never chosen automatically — only when the user explicitly asks for it.
 
 ## Guardrails
 
@@ -111,7 +118,6 @@ Every Codex continuation is thread-addressed with `--resume-task <task-id>`. Rev
 |---|---|
 | `dev-orchestrator` | Complete planning, implementation, verification, review, commit, and resume protocol |
 | `codex-invocation` | Reliable background Codex dispatch through the vendored companion runtime |
-| `codex-ask` | Grounded, read-only Codex second opinions with one thread per topic |
 | `architecture-memory` | Compact persistent architecture map in `docs/ARCHI.md` |
 | `/dev` | Explicit entry point for the full delivery protocol |
 | `bin/review-package` | Generates reviewer-ready commit and diff packages |
@@ -137,7 +143,6 @@ The upstream `subagent-driven-development` skill is replaced by `dev-orchestrato
 ├── skills/
 │   ├── dev-orchestrator/            # Protocol and role prompt templates
 │   ├── codex-invocation/
-│   ├── codex-ask/
 │   ├── architecture-memory/
 │   └── ...                          # Adapted Superpowers skills
 ├── tests/test-sdd-scripts.sh        # Workspace/package integration tests
@@ -151,7 +156,7 @@ The upstream `subagent-driven-development` skill is replaced by `dev-orchestrato
 
 All Codex calls go through `bin/codex-dispatch`. The wrapper works from a marketplace installation or local checkout and isolates state under `~/.claude/plugins/data/superpowers-strigov-ver-codex`.
 
-The upstream base is recorded in `vendor/codex-companion/VERSION`. Local patches add thread-addressed resume, GPT-5.6 `max`/`ultra` reasoning efforts, broker cleanup, and optional review-authorization fields.
+The upstream base is recorded in `vendor/codex-companion/VERSION`. Local patches add thread-addressed resume, GPT-6 `max`/`ultra` reasoning efforts, broker cleanup, and optional review-authorization fields.
 
 </details>
 
@@ -168,7 +173,7 @@ For a release, synchronize the version in `.claude-plugin/plugin.json`, both REA
 ## Provenance
 
 - [Superpowers](https://github.com/obra/superpowers) by Jesse Vincent / obra — MIT. This fork includes adapted v5.0.7 skills and selected source-verified mechanisms from Superpowers 6 v6.1.1.
-- [TRIP-workflow](https://github.com/PiLastDigit/TRIP-workflow) by PiLastDigit — MIT. Thread-addressed resume, verification gates, review synthesis, `codex-ask`, and architecture-memory concepts were adapted from this project.
+- [TRIP-workflow](https://github.com/PiLastDigit/TRIP-workflow) by PiLastDigit — MIT. Thread-addressed resume, verification gates, review synthesis, the ad-hoc consultation template, and architecture-memory concepts were adapted from this project.
 - The vendored Codex companion originates from OpenAI's `codex-plugin-cc` and retains its Apache-2.0 license.
 
 ## License

@@ -1,6 +1,6 @@
-# Opus Subagent — Final Whole-Branch Review (Step 5)
+# Opus Subagent (xhigh) — Final Whole-Branch Review (Step 5)
 
-Use AFTER the last phase has passed Step 4 and been committed, BEFORE plan archival. This is the single broad merge review of the entire branch — every phase already passed its phase-scoped gate (Step 4); this review checks what those gates cannot see: cross-phase integration, whole-branch architecture, and merge readiness. Codex control review does NOT participate in Step 5. Loop cap=2: round 1 review → ONE fixer → round 2 re-review; still blocking after round 2 → escalate to the user. Fresh subagent each round (no bias from the previous round).
+Use AFTER the last phase has passed Step 4 and been committed, BEFORE plan archival. This is the single broad merge review of the entire branch — every phase already passed its phase-scoped gate (Step 4); this review checks what those gates cannot see: cross-phase integration, whole-branch architecture, and merge readiness. Codex control review does NOT participate in Step 5 (Codex appears only as the announced Astra availability fallback below). Loop cap=2: round 1 review → ONE fixer → round 2 re-review; still blocking after round 2 → escalate to the user. Fresh subagent each round (no bias from the previous round).
 
 ## Invocation
 
@@ -8,12 +8,22 @@ Use AFTER the last phase has passed Step 4 and been committed, BEFORE plan archi
 Agent tool:
   subagent_type: "general-purpose"
   model: "opus"
+  effort: "xhigh"
   description: "Final review <slug>"
   prompt: |
     <prompt below>
 ```
 
-**The prompt's literal first line MUST be `ultrathink`** — it runs Opus at max thinking effort. The template below already starts with it; keep it first.
+**Effort is set on the dispatch: `xhigh`.** Do not add `ultrathink` to the prompt — it does not change the effort sent to the API and only blurs the role's pinned level.
+
+**Availability fallback — Codex Astra xhigh.** Only when the Opus dispatch fails for availability (usage cap, launch error). Codex without `--write` runs in a read-only sandbox, so check 6 cannot run there — split it off:
+
+1. BEFORE the Astra dispatch, run check 6 as a dispatched Sonnet subagent (`model: "sonnet"`, `effort: "medium"`) with the integration-check prompt from SKILL.md "Parallel groups" step 7 (full tests + typecheck + linter, `INTEGRATION_OK | INTEGRATION_FAIL`) against the branch tree.
+2. Write the filled prompt below to a scratch file and adapt it: change the opening "You are a fresh Opus subagent" to "You are a fresh Codex reviewer"; replace check 6 with "Check 6 was run by the orchestrator; result: <INTEGRATION_OK/INTEGRATION_FAIL + summary>. Do not run tests yourself — the sandbox is read-only. Treat a reported failure as a BLOCKING item."; drop the `git worktree add` advice under "Read-only review" (it cannot write either).
+3. Dispatch `"$DISPATCH" task --background --model gpt-6-astra --effort xhigh --prompt-file <scratch>/final-review-r<k>.md` (no `--write`; poll per `codex-invocation`).
+4. An `INTEGRATION_FAIL` is a BLOCKING item (ledger `FR<k>-B<n>`) whatever Astra's verdict is. Repeat steps 1–3 in round 2.
+
+Tell the user the final review ran on Astra and that it is same-family with the Luna-written code (a declared exception to the family rule) — never a silent substitution. The ledger reviewer id stays `opus-final`.
 
 Before dispatching, build the whole-branch review package with `bin/review-package` (resolve it the same way as `$DISPATCH` per SKILL.md; only the printed path enters your context, never the diff):
 
@@ -25,8 +35,6 @@ Never build the package from `HEAD~1` — MERGE_BASE is the recorded branch star
 ## Prompt template
 
 ```
-ultrathink
-
 You are the final whole-branch review stage of dev-orchestrator (Step 5). You are a fresh Opus subagent with no context from the per-phase reviews — treat the branch skeptically and verify independently. This is a merge review of the ENTIRE branch, not a phase gate: do not re-run the per-phase checklists; your job is the whole.
 
 ## Branch context
@@ -110,4 +118,4 @@ You are a fresh subagent; the orchestrator inlines the fix list from round 1 (BL
 
 ## After the verdict (orchestrator)
 
-`REVIEW_OK` → proceed to plan archival. `REVIEW_BLOCKING` → record the findings in the ledger (ids `FR<round>-B<n>`, reviewer `opus-final`), then dispatch ONE fixer — a single Codex Luna max FRESH task (`--write --model gpt-5.6-luna --effort max`; no resume — the whole-plan fix wave has no single implementer thread) — with the COMPLETE findings list (all BLOCKING items plus all MUST_FIX_BEFORE_MERGE ledger items; items labeled `plan-mandated` are excluded — those are escalated to the human, never handed to a fixer), not one fixer per finding. Per-finding fixers each rebuild context and re-run suites; a real session's final-review fix wave cost more than all its tasks combined.
+`REVIEW_OK` → proceed to plan archival. `REVIEW_BLOCKING` → record the findings in the ledger (ids `FR<round>-B<n>`, reviewer `opus-final`), then dispatch ONE fixer — a single Codex Luna max FRESH task (`--write --model gpt-6-luna --effort max`; no resume — the whole-plan fix wave has no single implementer thread) — with the COMPLETE findings list (all BLOCKING items plus all MUST_FIX_BEFORE_MERGE ledger items; items labeled `plan-mandated` are excluded — those are escalated to the human, never handed to a fixer), not one fixer per finding. Per-finding fixers each rebuild context and re-run suites; a real session's final-review fix wave cost more than all its tasks combined.

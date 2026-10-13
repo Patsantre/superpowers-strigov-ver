@@ -6,11 +6,11 @@
 # isolated from OpenAI's separately-installed codex plugin if it happens to be
 # present on the same machine.
 #
-# Also pins the model to $CODEX_DEFAULT_MODEL (default: gpt-5.6-sol) for
+# Also pins the model to $CODEX_DEFAULT_MODEL (default: gpt-6.1-sol) for
 # subcommands that accept --model, unless the caller already passed --model.
 # This blocks the backend from auto-downgrading to spark on small/low-effort
 # tasks. Protocol dispatches (dev-orchestrator) always pass an explicit
-# --model per role (sol/luna/terra); the pin only backs up ad-hoc calls.
+# --model per role (astra/luna/sol); the pin only backs up ad-hoc calls.
 # Override with `CODEX_DEFAULT_MODEL=... codex-dispatch ...` or by passing
 # an explicit --model flag.
 #
@@ -51,7 +51,7 @@ fi
 
 export CLAUDE_PLUGIN_DATA="${CLAUDE_PLUGIN_DATA_OVERRIDE:-$HOME/.claude/plugins/data/superpowers-strigov-ver-codex}"
 
-CODEX_DEFAULT_MODEL="${CODEX_DEFAULT_MODEL:-gpt-5.6-sol}"
+CODEX_DEFAULT_MODEL="${CODEX_DEFAULT_MODEL:-gpt-6.1-sol}"
 
 if [ "$#" -gt 0 ]; then
   subcommand="$1"

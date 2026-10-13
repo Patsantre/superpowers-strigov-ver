@@ -1,14 +1,14 @@
-# Codex Plan Reviewer Prompt (Sol max) — Plan Review (Step 2)
+# Codex Plan Reviewer Prompt (Astra xhigh) — Plan Review (Step 2)
 
-Use when dispatching a plan review to Codex. The plan was written by an Opus subagent at max thinking effort — the reviewer is deliberately from the other model family.
+Use when dispatching a plan review to Codex. The plan was written by an Opus subagent at xhigh effort — the reviewer is deliberately from the other model family.
 
 ## Invocation
 
 ```bash
 "$DISPATCH" task \
   --background \
-  --model gpt-5.6-sol \
-  --effort max \
+  --model gpt-6-astra \
+  --effort xhigh \
   --prompt-file <scratch>/plan-review-<slug>-r<k>.md
 ```
 
@@ -16,7 +16,7 @@ Use when dispatching a plan review to Codex. The plan was written by an Opus sub
 
 **No `--write`.** This is a read-only review: Codex must not touch the plan file. Revisions go back to the Opus writer (`./opus-plan-writer-prompt.md` Mode B) through the ledger — that separation is what makes the review independent.
 
-**Effort is `max`, never `ultra`, unless the user EXPLICITLY asked for ultra in their own words.** Do not propose ultra yourself — not as a question, not as a recommendation. (Ultra is Sol's parallel-subagent mode: 4× the tokens; the user opts in when they want it.)
+**Effort is `xhigh` — never `max` or `ultra` unless the user EXPLICITLY asked for that level in their own words.** Do not propose a higher level yourself — not as a question, not as a recommendation. (`max` bills noticeably more; `ultra` is the parallel-subagent mode at ~4× the tokens; the user opts in when they want them.)
 
 **Every round is a FRESH task — never `--resume-task`.** Reviewer freshness is a bias decision, exactly as for the Step 4.2 control review: a reviewer that remembers its own prior rounds anchors on them. The AUTHORIZED_CHANGE_LEDGER, not thread memory, carries the round history. Rounds 2+ use the follow-up template below.
 
@@ -31,7 +31,7 @@ Do NOT paste the full plan text in any round — always point at the file; Codex
 ```
 REVIEW MODE — read-only. Do not modify any file; this task has no write permission. If you find yourself wanting to edit the plan, report the finding instead.
 
-You are the plan-review stage of dev-orchestrator: a fresh Codex (GPT-5.6 Sol, effort max) review of an implementation plan written by a Claude Opus subagent. Review it skeptically for correctness, completeness, and risk.
+You are the plan-review stage of dev-orchestrator: a fresh Codex (GPT-6 Astra, effort xhigh) review of an implementation plan written by a Claude Opus subagent. Review it skeptically for correctness, completeness, and risk.
 
 ## Plan file (authoritative — read it)
 

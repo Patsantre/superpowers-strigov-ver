@@ -20,17 +20,17 @@ Assume they are a skilled developer, but know almost nothing about our toolset o
 
 ## Model split
 
-Same writer/reviewer pair as `dev-orchestrator` Steps 1–2: **Opus max writes, Codex Sol max reviews** — writer and reviewer never share a model family.
+Same writer/reviewer pair as `dev-orchestrator` Steps 1–2: **Opus xhigh writes (Opus high revises), Codex Astra xhigh reviews** — writer and reviewer never share a model family.
 
 **Main thread (orchestration only):** announces, gathers context, assembles the writer prompt from the guidance below, dispatches the Opus plan writer, runs the Codex review loop, commits, offers execution options. Never writes the plan directly.
 
-**Opus subagent (max thinking)** writes the plan. Invocation per `../dev-orchestrator/opus-plan-writer-prompt.md`:
+**Opus subagent (effort `xhigh`)** writes the plan. Invocation per `../dev-orchestrator/opus-plan-writer-prompt.md`:
 
 ```
-Agent(subagent_type="general-purpose", model="opus", prompt=<assembled prompt>)
+Agent(subagent_type="general-purpose", model="opus", effort="xhigh", prompt=<assembled prompt>)
 ```
 
-**The prompt's literal first line MUST be `ultrathink`.** There is no task id to record — every writer dispatch is fresh; the plan file on disk and the ledger are the continuity, so revisions re-read the plan instead of resuming a thread. The subagent has no session context; the prompt must be fully self-contained and include:
+**Effort is set on the dispatch — no `ultrathink` in the prompt.** Revisions (Mode B) run at `effort="high"`. There is no task id to record — every writer dispatch is fresh; the plan file on disk and the ledger are the continuity, so revisions re-read the plan instead of resuming a thread. The subagent has no session context; the prompt must be fully self-contained and include:
 
 - The Mode A opening block from `../dev-orchestrator/opus-plan-writer-prompt.md` (research-the-repo / write-plan-file-only framing, no-git rule).
 - User's original request verbatim.
@@ -42,23 +42,23 @@ Agent(subagent_type="general-purpose", model="opus", prompt=<assembled prompt>)
 
 **Pre-dispatch verification — run on the assembled prompt before dispatching:**
 
-1. `model="opus"` and the literal first line is `ultrathink`.
+1. `model="opus"`, `effort="xhigh"` (Mode B revisions: `effort="high"`), and no `ultrathink` in the prompt.
 2. Every bullet above is physically present in the prompt. In particular the FULL TEXT of these sections must be pasted in: Scope Check, File Structure, Bite-Sized Step Granularity, Plan Document Header, Required body sections, Phase Structure, No Placeholders, Remember, Self-Review. Litmus test: if the prompt does not contain the fenced YAML frontmatter template and the `## Ф1:` example layout, you referenced instead of pasted — go back and paste.
 3. No unfilled `<placeholder>` tokens remain (scan the prompt for `<`).
 4. All paths absolute.
 
 **After the writer returns — mechanical frontmatter validation (main thread):**
 
-Read the plan file's first 30 lines and check: file starts with `---`; frontmatter has `slug`, `created`, `status: in-progress`, and a `phases:` list; first phase `status: in-progress`, all others `status: pending`; every `phases[].id` matches a `## <id>:` H2 in the body (check via `grep -n '^## Ф' <plan-file>`); if any `parallel_group` is present, each group id appears on exactly 2 phases. If a check fails: frontmatter-only defects you may fix mechanically yourself; body defects → dispatch a fresh Opus writer (Mode B shape: plan path + the specific defect as the authorized change). Do not send a malformed plan to review.
+Read the plan file's first 30 lines and check: file starts with `---`; frontmatter has `slug`, `created`, `status: in-progress`, and a `phases:` list; first phase `status: in-progress`, all others `status: pending`; every `phases[].id` matches a `## <id>:` H2 in the body (check via `grep -n '^## Ф' <plan-file>`); if any `parallel_group` is present, each group id appears on exactly 2 phases. If a check fails: frontmatter-only defects you may fix mechanically yourself; body defects → dispatch a fresh Opus writer at effort `high` (Mode B shape: plan path + the specific defect as the authorized change). Do not send a malformed plan to review.
 
 This skill produces plans in the YAML-frontmatter + phases format consumed natively by `dev-orchestrator`. The TDD discipline (failing test → minimal impl → passing test → commit) lives **inside** each phase as the step pattern — phases are the orchestration unit, TDD steps are the work pattern. The canonical format definition lives in `../dev-orchestrator/opus-plan-writer-prompt.md` Mode A — keep this skill's format guidance below in sync with it.
 
-**Codex Sol max** reviews the plan after the Opus writer produces it. Reuse `../dev-orchestrator/codex-plan-reviewer-prompt.md` verbatim (`--model gpt-5.6-sol --effort max`, no `--write`, fresh task each round; adapt the opening line to name this skill instead of dev-orchestrator). The review stages, finding classes, and output format apply unchanged. Loop cap=4.
+**Codex Astra xhigh** reviews the plan after the Opus writer produces it. Reuse `../dev-orchestrator/codex-plan-reviewer-prompt.md` verbatim (`--model gpt-6-astra --effort xhigh`, no `--write`, fresh task each round; adapt the opening line to name this skill instead of dev-orchestrator). The review stages, finding classes, and output format apply unchanged. Loop cap=4.
 
 Verdict handling (identical to dev-orchestrator Step 2):
 
 - `APPROVED` → commit the plan file separately (`docs(plans): add <slug>`, stage only the plan file, Co-Authored-By trailer). Then proceed to Execution Handoff.
-- `CHANGES_REQUESTED` → run the ledger sequence from `../dev-orchestrator/SKILL.md` Step 2, in order: (a) triage the BLOCKING list, (b) write/update the ledger (see "Authorized Change Ledger" below), (c) dispatch a fresh Opus writer (Mode B from `../dev-orchestrator/opus-plan-writer-prompt.md`) with the plan file path, the ledger path, and the open ACCEPTED / PARTIALLY_ACCEPTED items inline — revise in place, not rewrite, (d) after the writer returns, dispatch a FRESH Codex Sol max reviewer with the follow-up template. Never dispatch the writer on the raw BLOCKING list before the ledger exists. Increment counter.
+- `CHANGES_REQUESTED` → run the ledger sequence from `../dev-orchestrator/SKILL.md` Step 2, in order: (a) triage the BLOCKING list, (b) write/update the ledger (see "Authorized Change Ledger" below), (c) dispatch a fresh Opus writer at effort `high` (Mode B from `../dev-orchestrator/opus-plan-writer-prompt.md`) with the plan file path, the ledger path, and the open ACCEPTED / PARTIALLY_ACCEPTED items inline — revise in place, not rewrite, (d) after the writer returns, dispatch a FRESH Codex Astra xhigh reviewer with the follow-up template. Never dispatch the writer on the raw BLOCKING list before the ledger exists. Increment counter.
 - Round 4 without APPROVED → escalate to user: plan path + last blocking list + one-sentence disagreement summary. User picks: accept / another round / close.
 
 Anti-pingpong: if the reviewer repeats a blocking point that was explicitly rejected with reasoning in a prior round, mark `resolved-by-decision`, do not loop on it. No-progress: if two consecutive rounds produce an identical blocking list, escalate immediately.
@@ -242,7 +242,7 @@ If you find issues, fix them inline. No need to re-review — just fix and move 
 
 After the Codex review returns APPROVED and the plan is committed, hand off to the implementer:
 
-**"Plan complete (written by Opus max, reviewed by Sol max), saved to `docs/plans/<filename>.md`. Ready to execute via `dev-orchestrator` — one phase at a time, with auto-commit per phase and fused Opus + Codex review on each diff. Start now?"**
+**"Plan complete (written by Opus xhigh, reviewed by Astra xhigh), saved to `docs/plans/<filename>.md`. Ready to execute via `dev-orchestrator` — one phase at a time, with auto-commit per phase and fused Opus + Codex review on each diff. Start now?"**
 
 - **REQUIRED SUB-SKILL:** Use `dev-orchestrator` (it reads the YAML frontmatter, picks up the first `status: in-progress` phase, and dispatches the implementer).
 

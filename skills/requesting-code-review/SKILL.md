@@ -50,6 +50,7 @@ Read the template at `./code-reviewer.md`, fill the placeholders, then dispatch:
 Agent(
   subagent_type="general-purpose",
   model="opus",
+  effort="high",
   description="Code review: <short scope>",
   prompt=<filled template>
 )
@@ -71,9 +72,9 @@ The subagent has no session context — the filled template is all it sees.
 - Note Minor issues for later
 - Push back if reviewer is wrong (with reasoning)
 
-**4. Fused review: Codex xhigh control review**
+**4. Fused review: Codex Astra high control review**
 
-When Opus returns a clean verdict (no Critical/Important issues), dispatch a Codex xhigh control review for an orthogonal second opinion — the same fused-review pattern dev-orchestrator uses in Step 4.
+When Opus returns a clean verdict (no Critical/Important issues), dispatch a Codex Astra high control review for an orthogonal second opinion — the same fused-review pattern dev-orchestrator uses in Step 4.
 
 **Skip Codex control review only when:**
 - Trivial diff (single typo, <5 lines, no logic change).
@@ -89,7 +90,7 @@ Reuse the template at `../dev-orchestrator/codex-control-review-prompt.md`. Adap
 - Fill "Implementer report:" with `none — standalone review` and "Verify additionally" with `none`.
 - Ledger references (`AUTHORIZED_CHANGE_LEDGER`, `docs/plans/<slug>.ledger.json`): no ledger exists in standalone use — delete those sentences from the filled prompt.
 
-Invocation is read-only (`--effort xhigh`, no `--write`). Poll via Monitor per `codex-invocation` skill.
+Invocation is read-only (`--model gpt-6-astra --effort high`, no `--write`). Poll via Monitor per `codex-invocation` skill.
 
 **Combined verdict handling (same loop as dev-orchestrator Step 4, cap=4):**
 
@@ -109,7 +110,7 @@ You: Let me request code review before proceeding.
 BASE_SHA=$(git log --oneline | grep "Task 1" | head -1 | awk '{print $1}')
 HEAD_SHA=$(git rev-parse HEAD)
 
-[Dispatch Opus subagent via Agent(subagent_type="general-purpose", model="opus", ...)]
+[Dispatch Opus subagent via Agent(subagent_type="general-purpose", model="opus", effort="high", ...)]
   WHAT_WAS_IMPLEMENTED: Verification and repair functions for conversation index
   PLAN_OR_REQUIREMENTS: Task 2 from docs/superpowers/plans/deployment-plan.md
   BASE_SHA: a7981ec

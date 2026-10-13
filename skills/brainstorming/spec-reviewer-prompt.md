@@ -1,12 +1,13 @@
-# Spec Reviewer Prompt (Codex xhigh)
+# Spec Reviewer Prompt (Codex Astra xhigh)
 
-Use when dispatching a design spec review to Codex Sol xhigh after Fable writes the spec (cross-family: Claude writes, OpenAI reviews).
+Use when dispatching a design spec review to Codex Astra xhigh after Opus writes the spec (cross-family: Claude writes, OpenAI reviews).
 
 ## Invocation
 
 ```bash
 "$DISPATCH" task \
   --background \
+  --model gpt-6-astra \
   --effort xhigh \
   --prompt-file <scratch>/spec-review.md
 ```

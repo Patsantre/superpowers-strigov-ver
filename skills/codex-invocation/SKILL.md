@@ -10,7 +10,7 @@ The plugin vendors the Codex companion runtime under `vendor/codex-companion/` a
 The wrapper handles three things on every call:
 1. Resolves the bundled `codex-companion.mjs` from the marketplace cache or the local dev tree.
 2. Pins `CLAUDE_PLUGIN_DATA` to `~/.claude/plugins/data/superpowers-strigov-ver-codex` so jobs/broker state stays isolated from any other codex install on the machine.
-3. For `task`/`review`/`adversarial-review`, injects `--model gpt-5.6-sol` (overridable via `CODEX_DEFAULT_MODEL` env or by passing an explicit `--model` flag). This blocks the backend from auto-downgrading to spark on small or low-effort tasks. Protocol dispatches always pass an explicit `--model` per role (see the role table below); the pin only backs up ad-hoc calls like `codex-ask`.
+3. For `task`/`review`/`adversarial-review`, injects `--model gpt-6.1-sol` (overridable via `CODEX_DEFAULT_MODEL` env or by passing an explicit `--model` flag). This blocks the backend from auto-downgrading to spark on small or low-effort tasks. Protocol dispatches always pass an explicit `--model` per role (see the role table below); the pin only backs up ad-hoc calls (see "Ad-hoc consultation" below).
 
 On this Mac in Claude Code terminal mode, the standard Codex invocation paths silently auto-reject. Use this wrapper with background tasks and Monitor polling.
 
@@ -53,24 +53,28 @@ A JSON snapshot (workspaceRoot, sessionRuntime, running, recent) means the wrapp
 "$DISPATCH" task \
   --background \
   [--write] \
-  [--model gpt-5.6-<sol|terra|luna>] \
+  [--model <gpt-6-astra|gpt-6-luna|gpt-6.1-sol>] \
   [--effort <low|medium|high|xhigh|max|ultra>] \
   [--resume-task task-XXXX | --resume-last | --fresh] \
   "<prompt>"
 ```
 
-**Role table (GPT-5.6 routing).** Every dev-orchestrator dispatch passes `--model` + `--effort` explicitly:
+**Role table (GPT-6 routing).** Every dev-orchestrator dispatch passes `--model` + `--effort` explicitly:
 
 | Role | Flags |
 |---|---|
-| Plan review (dev-orchestrator Step 2, writing-plans) | `--model gpt-5.6-sol --effort max` (no `--write`; fresh task every round) |
-| Control review (Step 4.2) | `--model gpt-5.6-sol --effort xhigh` |
-| Spec review (brainstorming) | `--model gpt-5.6-sol --effort xhigh` |
-| Implementation + fix rounds (Step 3 / 4) | `--model gpt-5.6-luna --effort max --write` |
-| Reasoning escalation on BLOCKED | `--model gpt-5.6-terra --effort xhigh` (resume the implementer thread) |
-| codex-ask / ad-hoc consultation | wrapper default (`gpt-5.6-sol`), `--effort xhigh` |
+| Plan review (dev-orchestrator Step 2, writing-plans) | `--model gpt-6-astra --effort xhigh` (no `--write`; fresh task every round) |
+| Spec review (brainstorming) | `--model gpt-6-astra --effort xhigh` |
+| Control review (Step 4.2, requesting-code-review) | `--model gpt-6-astra --effort high` |
+| Implementability check (systematic-debugging, 3+ failed fixes) | `--model gpt-6-astra --effort high` (no `--write`, single shot) |
+| Final-review fallback (Step 5, only when Opus is unavailable) | `--model gpt-6-astra --effort xhigh` (no `--write`) |
+| Implementation + fix rounds (Step 3 / 4 / 5, integration repair) | `--model gpt-6-luna --effort max --write` |
+| Reasoning escalation on BLOCKED | `--model gpt-6.1-sol --effort xhigh --write` (resume the implementer thread) |
+| Ad-hoc consultation / one-off calls | no `--model` — wrapper default (`gpt-6.1-sol`); `--effort xhigh` (`high` for quick checks) |
 
-**`--effort ultra` is user-initiated ONLY.** Ultra is Sol's parallel-subagent mode (~4× tokens). Never offer it, suggest it, or fall back to it on your own — use it exclusively when the user explicitly said "ultra" in their own words. Note: ultra may be rejected on some Codex plans/transport paths; if the dispatch errors on effort, report that to the user rather than silently downgrading.
+Astra is the reviewer model, Luna the implementer, Sol 6.1 the escalation and ad-hoc default. `gpt-6-luna` always runs at `max` (it has no `ultra`); a Luna dispatch at any lower level is a wrong dispatch. `max` on any other role only when the user asks for it by name.
+
+**`--effort ultra` is user-initiated ONLY.** Ultra is the parallel-subagent mode of Astra / Sol (~4× tokens). Never offer it, suggest it, or fall back to it on your own — use it exclusively when the user explicitly said "ultra" in their own words. Note: ultra may be rejected on some Codex plans/transport paths; if the dispatch errors on effort, report that to the user rather than silently downgrading.
 
 Expected output: `Codex Task started in the background as task-XXXX`.
 
@@ -83,16 +87,16 @@ Expected output: `Codex Task started in the background as task-XXXX`.
 **Flag sanity before submitting** (re-check every dispatch):
 - `--background` — always;
 - `--write` — ONLY when the task must modify files (implementation); never on reviews, and no plan-stage Codex role writes files any more;
-- `--model` + `--effort` match the role table above (plan review = sol/max; control + spec review = sol/xhigh; implementation = luna/max; escalation = terra/xhigh); no `ultra` unless the user explicitly asked;
+- `--model` + `--effort` match the role table above (plan + spec review = astra/xhigh; control review = astra/high; final-review fallback = astra/xhigh; implementation = luna/max; escalation = sol 6.1/xhigh; implementability check = astra/high); ad-hoc consultations omit `--model` and take the wrapper default; no `ultra` unless the user explicitly asked;
 - `--resume-task task-XXXX` — the standard way to continue a prior Codex conversation: resumes the thread of exactly that task id, regardless of what ran in between (see "Resume semantics" below). Track the task id of each role's last dispatch and resume by it;
 - `--resume-last` — legacy positional resume ("newest thread in this repo"); only safe when no other Codex task ran in between. Prefer `--resume-task` everywhere; first round of a new loop goes without either.
 
-### Ultra smoke test (run ONCE per machine, on the user's first ultra request)
+### Ultra smoke test (run ONCE per machine and model family, on the user's first ultra request)
 
 Ultra requires a Plus-or-higher Codex plan AND a transport that supports it — Codex Desktop does; third-party `/responses` relays were observed capped at xhigh/max, and the app-server path this wrapper uses is unverified. Before the first real ultra dispatch on a machine, offer the user this cheap probe (seconds of tokens):
 
 ```bash
-"$DISPATCH" task --background --model gpt-5.6-sol --effort ultra "Reply with one word: PONG"
+"$DISPATCH" task --background --model <the role's model, e.g. gpt-6-astra> --effort ultra "Reply with one word: PONG"
 # after the Monitor loop reports terminal:
 "$DISPATCH" status task-XXXX --json     # failed → read the log below
 "$DISPATCH" result task-XXXX
@@ -136,8 +140,8 @@ Relay Codex's report to the next step verbatim (or summarize into the next promp
 
 - `--background` — return immediately with task id. **Mandatory.**
 - `--write` — Codex may modify files (implementer). Omit for review-only runs (default is read-only).
-- `--effort <low|medium|high|xhigh|max|ultra>` — reasoning effort (max/ultra are a local companion patch; upstream stops at xhigh). In dev-orchestrator: plan review / implementation = `max`, control review / escalation = `xhigh`. Nothing lower. `ultra` only on explicit user request.
-- `--model <name>` — the role's model (see role table above). The wrapper auto-pins `gpt-5.6-sol` if you don't pass this. Override the wrapper default globally with `CODEX_DEFAULT_MODEL=...` in the env.
+- `--effort <low|medium|high|xhigh|max|ultra>` — reasoning effort (max/ultra are a local companion patch; upstream stops at xhigh). In dev-orchestrator: implementation = `max`; plan review, spec review, escalation and the final-review fallback = `xhigh`; control review = `high`. Nothing lower. `ultra` only on explicit user request.
+- `--model <name>` — the role's model (see role table above). The wrapper auto-pins `gpt-6.1-sol` if you don't pass this. Override the wrapper default globally with `CODEX_DEFAULT_MODEL=...` in the env.
 - `--resume-task <task-id>` — continue the Codex conversation of exactly that prior task. Thread-addressed: immune to whatever ran in between. **Preferred resume mechanism.**
 - `--resume-last` — continue the newest task thread in this repo. Legacy; safe only when no other Codex task ran in between. Prefer `--resume-task`.
 - `--fresh` — force new session. Use when a stale job record prevents resume (see below).
@@ -155,13 +159,53 @@ Related commands: `status [job-id] [--all] [--json]`, `result [job-id] [--json]`
 
 **`--resume-last`** resumes the NEWEST completed task thread in this repo — regardless of what role that task played. It remains ONLY as a fallback when a task id got lost; if you use it, first confirm via `status --json` that the newest thread really is the one you intend to continue. Prefer `--resume-task` in every loop:
 
-- **Spec review loop** (brainstorming: Codex review → Fable revision → Codex re-review): `--resume-task <spec-review-task-id>`.
+- **Spec review loop** (brainstorming: Codex review → Opus revision → Codex re-review): `--resume-task <spec-review-task-id>`.
 - **dev-orchestrator Step 2 plan review**: FRESH task every round, never resumed — same bias decision as Step 4.2 below. Use the follow-up template plus the ledger, not thread memory.
-- **Implementer `NEEDS_CONTEXT` / effort-upgrade re-dispatch**: `--resume-task <implementer-task-id>`.
+- **Implementer `NEEDS_CONTEXT` / Sol reasoning-escalation re-dispatch**: `--resume-task <implementer-task-id>`.
 - **dev-orchestrator Step 4 fix rounds**: `--resume-task <implementer-task-id>` — the fixer continues its own implementation thread with full context even though the control reviewer ran in between. (Before `--resume-task` existed this loop was forced to use fresh fully re-briefed dispatches.)
 - **Step 4 control review rounds 2+**: still dispatched FRESH **by design** — an independent second opinion must not anchor on its own prior rounds. This is a bias decision, not a resume limitation.
 
 When in doubt, dispatch fresh with a full prompt: a fresh task merely costs Codex a context re-read; a wrong resume poisons the thread with another role's instructions.
+
+## Ad-hoc consultation (second opinion)
+
+A free-form, read-only second opinion from Codex — an architecture call before it hardens, a debugging hypothesis, a conclusion to red-team. Advisory only: no verdict tokens, nothing gated on the answer. **Agreement is weak evidence; disagreement is a strong signal** — relay any disagreement to the user verbatim, attributed to Codex. Not from the dev-orchestrator main thread while its protocol is active (its channels are fixed), and not for questions that need the user's own judgment.
+
+Dispatch without `--model` — the wrapper default applies — and never with `--write`:
+
+```bash
+"$DISPATCH" task --background --effort xhigh --prompt-file <scratch>/ask-<topic>.md
+```
+
+Drop to `--effort high` for a quick sanity check. Follow-ups on the same topic resume its thread: same command plus `--resume-task <task id of the previous round>`. Prompt template:
+
+```
+ADVISORY CONSULTATION — read-only. Do not modify any files. You are being asked for a grounded second opinion, not a review verdict and not an implementation.
+
+## Question
+
+<the question — one paragraph, specific>
+
+## My draft position (red-team this)
+
+<your current recommendation / hypothesis and the reasoning; omit the section header only if you genuinely have no position yet>
+
+## Context
+
+- Repository root: <path>
+- Relevant files / evidence so far: <paths, error messages, measurements>
+
+## What I want back
+
+1. Your independent answer, grounded in the actual code you inspected (cite file:line for every claim about the repo).
+2. Where you AGREE with my position — one line each, no elaboration.
+3. Where you DISAGREE or see a risk I missed — elaborate ONLY here.
+4. What evidence would settle each disagreement.
+
+Be direct. "Your position holds, no material objections" is a complete, valid answer.
+```
+
+Always include a draft position when you have one — a consultation without a position to attack degenerates into a generic essay.
 
 ## Parallel tasks and worktrees
 
@@ -172,7 +216,7 @@ Each `--background` task is its own detached OS process — there is no serial q
 - **Dispatching into a worktree**: pass `--cwd <worktree-path>` (no `cd` needed):
 
   ```bash
-  "$DISPATCH" task --background --write --model gpt-5.6-luna --effort max --cwd <worktree-path> --prompt-file <scratch>/prompt.md
+  "$DISPATCH" task --background --write --model gpt-6-luna --effort max --cwd <worktree-path> --prompt-file <scratch>/prompt.md
   ```
 
   The companion resolves the workspace from `--cwd` (`git rev-parse --show-toplevel`), so each worktree gets its OWN state directory, broker, job list, and thread history — fully isolated tracks.

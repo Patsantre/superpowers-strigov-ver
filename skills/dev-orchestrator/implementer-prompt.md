@@ -1,6 +1,6 @@
 # Implementer Prompt (Codex Luna max)
 
-Use when dispatching implementation to the Codex implementer (Luna max). Reasoning escalation for BLOCKED phases goes to Terra xhigh on the same thread.
+Use when dispatching implementation to the Codex implementer (Luna max). Luna always runs at `max`. Reasoning escalation for BLOCKED phases goes to Sol 6.1 xhigh (`--model gpt-6.1-sol --effort xhigh`) on the same thread.
 
 ## Invocation
 
@@ -8,7 +8,7 @@ Use when dispatching implementation to the Codex implementer (Luna max). Reasoni
 "$DISPATCH" task \
   --background \
   --write \
-  --model gpt-5.6-luna \
+  --model gpt-6-luna \
   --effort max \
   [--cwd <worktree-path>] \
   --prompt-file <scratch>/implement-<phase-id>.md
@@ -117,7 +117,7 @@ Do NOT silently produce work you're unsure about — use `DONE_WITH_CONCERNS`.
 ## Fix-round prompt (round 2+ — `--resume-task <implementer-task-id>`)
 
 ```
-You are in the fix round of a review loop, continuing the thread in which you implemented this phase. The fused review (Opus + Sol control) found blocking issues in your diff. Fix ONLY the AUTHORIZED_BLOCKERS below, re-test, re-report.
+You are in the fix round of a review loop, continuing the thread in which you implemented this phase. The fused review (Opus + Astra control) found blocking issues in your diff. Fix ONLY the AUTHORIZED_BLOCKERS below, re-test, re-report.
 
 Re-inspect your current diff first — `git diff <base-sha>` plus `git status --porcelain` (files you CREATED are untracked, invisible to `git diff` against a commit — read them directly) — the tree may have moved since your last turn. Your report from the previous round is at [REPORT_FILE]; you will append your fix results to that same file.
 
@@ -187,7 +187,7 @@ Re-run the tests that cover the amended code after fixes. Every change in the di
 **Fresh fallback re-brief block** — when the fix round cannot resume the implementer thread (Claude-implemented phase, lost task id, stale job record), replace the opening paragraph above with:
 
 ```
-You are in the fix round of a review loop. A previous run implemented one phase of an approved plan; the fused review (Opus + Sol control) found blocking issues. You are a fresh session with no memory of that run — re-read the context below, then fix ONLY the AUTHORIZED_BLOCKERS, re-test, re-report.
+You are in the fix round of a review loop. A previous run implemented one phase of an approved plan; the fused review (Opus + Astra control) found blocking issues. You are a fresh session with no memory of that run — re-read the context below, then fix ONLY the AUTHORIZED_BLOCKERS, re-test, re-report.
 
 ## Plan + phase (authoritative — read it)
 

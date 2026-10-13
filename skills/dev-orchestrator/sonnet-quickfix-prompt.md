@@ -8,6 +8,7 @@ Use for trivial single-file changes (<~20 lines, no architectural judgment).
 Agent tool:
   subagent_type: "general-purpose"
   model: "sonnet"
+  effort: "medium"
   description: "<short task name>"
   prompt: |
     <prompt below>

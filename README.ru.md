@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="Версия 0.6.2" src="https://img.shields.io/badge/version-0.6.2-7c8cff?style=flat-square">
+  <img alt="Версия 0.7.0" src="https://img.shields.io/badge/version-0.7.0-7c8cff?style=flat-square">
   <img alt="Плагин Claude Code" src="https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square">
   <img alt="Лицензия MIT" src="https://img.shields.io/badge/license-MIT-35d6a6?style=flat-square">
 </p>
@@ -70,28 +70,35 @@ Companion runtime уже вендорится. Отдельный Claude Code-п
   <img src="./assets/readme/workflow-ru.svg" width="100%" alt="Шестиэтапный протокол от плана до финального гейта всей ветки">
 </p>
 
-1. **План** — Opus-субагент исследует репозиторий и пишет долговечный план со scope, интерфейсами, глобальными ограничениями, тестами и рисками.
-2. **Критика** — свежее ревью Codex Sol ищет материальные пробелы; разрешённые правки уходят свежему Opus-писателю через ledger.
-3. **Реализация** — Luna реализует одну фазу и пишет отчёт. Terra может продолжить тот же тред, если нужно более глубокое reasoning.
-4. **Верификация** — Sonnet-гейт запускает lint, typecheck и затронутые тесты до начала дорогого ревью.
-5. **Два ревью** — Opus проверяет соответствие плану и качество, затем свежий Sol ищет граничные случаи, гонки, уязвимости и регрессии. Fable забирает основное суждение на фазах SECURITY/DATA_LOSS или с третьего раунда, с явным фолбэком на Opus.
-6. **Гейт ветки** — после всех фаз свежий Opus проверяет всю ветку и полный набор тестов. До финального вердикта разрешена одна объединённая волна фиксов Luna.
+1. **План** — Opus-субагент на `xhigh` исследует репозиторий и пишет долговечный план со scope, интерфейсами, глобальными ограничениями, тестами и рисками.
+2. **Критика** — свежее ревью Codex Astra `xhigh` ищет материальные пробелы; разрешённые правки уходят свежему Opus `high` через ledger.
+3. **Реализация** — Luna `max` реализует одну фазу и пишет отчёт. Sol 6.1 `xhigh` продолжает тот же тред, если диагностика Opus говорит, что нужно более глубокое reasoning.
+4. **Верификация** — Sonnet-гейт на `medium` запускает lint, typecheck и затронутые тесты до начала дорогого ревью.
+5. **Два ревью** — Opus `high` проверяет соответствие плану и качество (`xhigh` на фазах SECURITY/DATA_LOSS и в последнем раунде), затем свежий Codex Astra `high` ищет граничные случаи, гонки, уязвимости и регрессии.
+6. **Гейт ветки** — после всех фаз свежий Opus `xhigh` проверяет всю ветку и полный набор тестов (Astra `xhigh`, если Opus недоступен). До финального вердикта разрешена одна объединённая волна фиксов Luna.
 
 Каждое продолжение Codex адресуется через `--resume-task <task-id>`. Ревьюеры получают сгенерированный пакет со списком коммитов, статистикой и контекстным diff, а не восстанавливают изменения из истории чата.
 
 ## Роли моделей
 
-- **Оркестратор · Claude Sonnet** — триаж, dispatch, polling, переходы состояния и безопасный Git-bookkeeping. Не пишет production-код.
-- **Автор плана · Claude Opus + `ultrathink`** — исследует репозиторий, пишет план и вносит разрешённые правки.
-- **Ревьюер плана · GPT-5.6 Sol `max`** — read-only ревью плана свежей задачей в каждом раунде, блокирует на материальных пробелах.
-- **Имплементер · GPT-5.6 Luna `max`** — реализует нефронтендовые фазы и разрешённые fix-раунды.
-- **Эскалация reasoning · GPT-5.6 Terra `xhigh`** — продолжает заблокированный тред, когда нужно больше reasoning.
-- **Основной ревьюер кода · Claude Opus + `ultrathink`** — проверяет соответствие плану и качество в обычных раундах.
-- **Эскалация суждения · Claude Fable 5 + `ultrathink`** — берёт рисковые/поздние раунды, BLOCKED-диагностику и impasse-summary; явный фолбэк на Opus.
-- **Контрольный ревьюер · GPT-5.6 Sol `xhigh`** — даёт свежую read-only вторую оценку после чистого основного ревью.
-- **Верификация и синтез · Claude Sonnet** — запускает механические гейты и объединяет историю многораундового ревью.
+У каждой роли закреплена пара «модель + effort». Claude-субагенты получают явный `effort` в вызове Agent (без `ultrathink`); задачи Codex — явные `--model` и `--effort`.
 
-`ultra` никогда не выбирается автоматически. Ревьюер плана Sol использует его только по явному запросу пользователя.
+| Роль | Модель · effort |
+|---|---|
+| Оркестратор (главный тред) | Claude Sonnet · `medium` |
+| Автор плана / спеки | Claude Opus · `xhigh` |
+| Ревизия плана и спеки | Claude Opus · `high` |
+| Ревьюер плана и спеки | GPT-6 Astra · `xhigh` |
+| Имплементер, fix-раунды, финальная волна фиксов | GPT-6 Luna · `max` |
+| Эскалация reasoning (BLOCKED) | GPT-6.1 Sol · `xhigh`, тот же тред |
+| Фронтенд-имплементер | Claude Opus · `high` (новый UI) / Claude Sonnet · `medium` (мелкие правки) |
+| Основное ревью кода (4.1) | Claude Opus · `high`; `xhigh` на фазах SECURITY/DATA_LOSS и в раунде 4 |
+| Контрольное ревью (4.2) | GPT-6 Astra · `high` |
+| Финальное ревью ветки | Claude Opus · `xhigh`; GPT-6 Astra · `xhigh`, если Opus недоступен |
+| Диагностика BLOCKED, сводка по тупику (impasse) | Claude Opus · `high` |
+| Гейт верификации, синтез, quickfix, integration check | Claude Sonnet · `medium` |
+
+`max` зарезервирован за Luna (или по явному запросу пользователя); `ultra` никогда не выбирается автоматически — только по явному запросу пользователя.
 
 ## Защитные механизмы
 
@@ -111,7 +118,6 @@ Companion runtime уже вендорится. Отдельный Claude Code-п
 |---|---|
 | `dev-orchestrator` | Полный протокол планирования, реализации, верификации, ревью, коммитов и возобновления |
 | `codex-invocation` | Надёжный фоновый dispatch Codex через вендорный companion runtime |
-| `codex-ask` | Обоснованное read-only второе мнение Codex с отдельным тредом на тему |
 | `architecture-memory` | Компактная персистентная карта архитектуры в `docs/ARCHI.md` |
 | `/dev` | Явная точка входа в полный протокол |
 | `bin/review-package` | Генерирует готовые для ревьюера пакеты коммитов и diff |
@@ -137,7 +143,6 @@ Upstream-скилл `subagent-driven-development` заменён на `dev-orche
 ├── skills/
 │   ├── dev-orchestrator/            # Протокол и шаблоны промптов ролей
 │   ├── codex-invocation/
-│   ├── codex-ask/
 │   ├── architecture-memory/
 │   └── ...                          # Адаптированные скиллы Superpowers
 ├── tests/test-sdd-scripts.sh        # Интеграционные тесты workspace/package
@@ -151,7 +156,7 @@ Upstream-скилл `subagent-driven-development` заменён на `dev-orche
 
 Все вызовы Codex идут через `bin/codex-dispatch`. Обёртка работает из marketplace-установки или локального checkout и изолирует состояние в `~/.claude/plugins/data/superpowers-strigov-ver-codex`.
 
-Upstream-база записана в `vendor/codex-companion/VERSION`. Локальные патчи добавляют адресный resume, reasoning-efforts `max`/`ultra` для GPT-5.6, очистку broker-процессов и необязательные поля авторизации ревью.
+Upstream-база записана в `vendor/codex-companion/VERSION`. Локальные патчи добавляют адресный resume, reasoning-efforts `max`/`ultra` для GPT-6, очистку broker-процессов и необязательные поля авторизации ревью.
 
 </details>
 
@@ -168,7 +173,7 @@ bash tests/test-sdd-scripts.sh
 ## Происхождение
 
 - [Superpowers](https://github.com/obra/superpowers) от Jesse Vincent / obra — MIT. Форк включает адаптированные скиллы v5.0.7 и отдельные, проверенные по исходникам механизмы Superpowers 6 v6.1.1.
-- [TRIP-workflow](https://github.com/PiLastDigit/TRIP-workflow) от PiLastDigit — MIT. Отсюда адаптированы адресный resume, verification gate, синтез ревью, `codex-ask` и концепция architecture memory.
+- [TRIP-workflow](https://github.com/PiLastDigit/TRIP-workflow) от PiLastDigit — MIT. Отсюда адаптированы адресный resume, verification gate, синтез ревью, шаблон разовой консультации и концепция architecture memory.
 - Вендорный Codex companion происходит из `codex-plugin-cc` OpenAI и сохраняет лицензию Apache-2.0.
 
 ## Лицензия

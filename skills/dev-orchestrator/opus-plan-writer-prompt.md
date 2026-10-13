@@ -1,4 +1,4 @@
-# Opus Plan Writer Prompt (Opus subagent, max thinking) — Plan Writing / Revision
+# Opus Plan Writer Prompt (Opus subagent — xhigh writes, high revises) — Plan Writing / Revision
 
 Use when the orchestrator needs a plan written (Step 1) or revised after plan review (Step 2 CHANGES_REQUESTED).
 
@@ -8,19 +8,21 @@ Use when the orchestrator needs a plan written (Step 1) or revised after plan re
 Agent tool:
   subagent_type: "general-purpose"
   model: "opus"
+  effort: "xhigh"                           # Mode A
+  effort: "high"                            # Mode B
   description: "Write plan <slug>"          # Mode A
   description: "Revise plan <slug> (round <k>)"   # Mode B
   prompt: |
     <Mode A or Mode B prompt below>
 ```
 
-**The prompt's literal first line MUST be `ultrathink`** — it runs Opus at max thinking effort. Both templates below already start with it; keep it first.
+**Effort is set on the dispatch, not in the prompt:** Mode A (writing) runs at `xhigh`, Mode B (revision) at `high`. Do not add `ultrathink` to the prompt — it does not change the effort sent to the API and only blurs the role's pinned level.
 
 The subagent writes the plan file itself (a `general-purpose` agent has `Write` / `Edit`) and may read anything in the repository — research inside the subagent is exactly what it is for, and it is the reason planning moved off Codex. It must NOT touch source files and must NOT run state-changing git commands.
 
 **Every dispatch is a FRESH subagent.** There is no Codex-style `--resume-task` here: a Claude subagent carries nothing between dispatches. Mode B therefore re-reads the plan from disk and takes its entire scope from the ledger — it never relies on remembering having written the plan. The plan file on disk is the only continuity, which is also why the orchestrator never lets the plan text live only in a prompt.
 
-The reviewer of this artifact is the Codex plan reviewer, Sol max (`./codex-plan-reviewer-prompt.md`) — writer and reviewer never share a model family.
+The reviewer of this artifact is the Codex plan reviewer, Astra xhigh (`./codex-plan-reviewer-prompt.md`) — writer and reviewer never share a model family.
 
 Both modes are fully self-contained: the subagent sees nothing from the orchestrator's session, so the user's original request, the repo path, and every known constraint must be physically in the prompt.
 
@@ -29,9 +31,7 @@ Both modes are fully self-contained: the subagent sees nothing from the orchestr
 ## Mode A: Write a new plan (Step 1)
 
 ```
-ultrathink
-
-You are the plan-writing stage of dev-orchestrator: a fresh Claude Opus subagent writing an implementation plan for a multi-phase feature. The orchestrator (Sonnet main thread) will send your plan to a Codex (GPT-5.6 Sol, effort max) reviewer, then drive implementation phase by phase from it.
+You are the plan-writing stage of dev-orchestrator: a fresh Claude Opus subagent writing an implementation plan for a multi-phase feature. The orchestrator (Sonnet main thread) will send your plan to a Codex (GPT-6 Astra, effort xhigh) reviewer, then drive implementation phase by phase from it.
 
 You may read anything in the repository, but write ONLY the plan file specified below. Do not modify source code, tests, or any other file. Do NOT run `git commit` / `git push` or any other state-changing git command — the orchestrator handles git.
 
@@ -151,9 +151,7 @@ That's it. Do NOT commit — the orchestrator handles git.
 The orchestrator dispatches Mode B after the Codex plan reviewer returned `CHANGES_REQUESTED` and the orchestrator has triaged the findings into the AUTHORIZED_CHANGE_LEDGER (see `dev-orchestrator/SKILL.md` "## Authorized Change Ledger"). The ledger is the single authoritative input for this dispatch — work only on its open ACCEPTED / PARTIALLY_ACCEPTED items.
 
 ```
-ultrathink
-
-You are the plan-revision stage of dev-orchestrator: a fresh Claude Opus subagent revising an implementation plan after a Codex (GPT-5.6 Sol) plan review returned blocking findings. You did NOT write this plan and you have no memory of it — read it from disk first. Do not rewrite it from scratch: apply only the changes the orchestrator has authorized via the ledger below.
+You are the plan-revision stage of dev-orchestrator: a fresh Claude Opus subagent revising an implementation plan after a Codex (GPT-6 Astra) plan review returned blocking findings. You did NOT write this plan and you have no memory of it — read it from disk first. Do not rewrite it from scratch: apply only the changes the orchestrator has authorized via the ledger below.
 
 You may read anything in the repository, but write ONLY the plan file below. Do not modify source code or tests. Do NOT run `git commit` / `git push` — the orchestrator handles git.
 
