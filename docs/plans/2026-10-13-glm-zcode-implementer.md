@@ -2486,6 +2486,7 @@ need $S '- **Run two write tasks in one working tree across both dispatchers**'
 need $S '- **Switch implementer channels silently**'
 need $S '- **Call `zcode -p` (or `node zcode.cjs`) bypassing the wrapper**'
 need $S '- **Change ZCode settings, plugins or login on the user'
+need $S '**Stale workspace reservation** — `"$ZDISPATCH" task` exits 2 with the stale message'
 none $S 'Full protocol tasks → Codex implementer, Luna max'
 none $S 'No other Codex write task currently running.'
 none $S 'a single Codex Luna max FRESH task'
@@ -2499,6 +2500,9 @@ for h in '## What this is' '## Verified facts (from `docs/zcode-cli-findings.md`
   '## Resume semantics' '## Parallel tasks and worktrees' '## Terminal status handling' '## Sandbox warning' \
   '## Compliance' '## Never do' '## Session paths (for debugging)'; do need $Z "$h"; done
 need $Z 'name: zcode-invocation'
+need $Z '| `release-stale [--cwd <path>]` | Frees a stale workspace reservation (holder runner gone)'
+need $Z 'a stale workspace reservation whose holder runner is gone (the message contains `release-stale`'
+need $Z '- Delete reservation files (`active.lock.*`) by hand while a job might run'
 none $Z '⟨'
 need $C 'see `zcode-invocation`'
 need $C 'counted across both dispatchers'
@@ -3838,7 +3842,7 @@ git commit -m "feat(dev-orchestrator): route non-frontend phases to GLM via ZCod
 - Modify: `assets/readme/workflow-ru.svg`
 
 **Interfaces:**
-- Consumes: the skill `skills/zcode-invocation/SKILL.md` (name `zcode-invocation`); `bin/zcode-dispatch` with the command surface of Contract C1 (verbs `task`, `status`, `result`, `cancel`, `doctor`, `doctor --probe`; start line `ZCode Task started in the background as zt-NNNN`; exit codes 0/1/2), job records per Contract C2 under the layout of Contract C3, errorClass set `timeout | crash | model-not-selected | auth | quota | launch | malformed`; the test suite `tests/test-zcode-dispatch.sh`.
+- Consumes: the skill `skills/zcode-invocation/SKILL.md` (name `zcode-invocation`); `bin/zcode-dispatch` with the command surface of Contract C1 (verbs `task`, `status`, `result`, `cancel`, `release-stale`, `doctor`, `doctor --probe`; start line `ZCode Task started in the background as zt-NNNN`; exit codes 0/1/2), job records per Contract C2 under the layout of Contract C3, errorClass set `timeout | crash | model-not-selected | auth | quota | launch | malformed`; the test suite `tests/test-zcode-dispatch.sh`.
 - Produces: plugin version `0.8.0` (manifest, both READMEs, `PLUGIN_README.md`, hero badges); the README paragraphs Ф5 appends to — `README.md` paragraph starting "`max` is reserved for the implementers GLM and Luna" and `README.ru.md` paragraph starting "`max` зарезервирован за имплементерами GLM и Luna".
 
 - [ ] **Step 1: Write the release check and run it (fails)**
@@ -4074,7 +4078,7 @@ Every implementer continuation is addressed by id with `--resume-task` — `task
 
 ```text
 | `bin/sdd-workspace` | Resolves isolated per-plan scratch workspaces |
-| `bin/zcode-dispatch` | ZCode CLI job wrapper: task/status/result/cancel/doctor with pinned model, mode and client identification |
+| `bin/zcode-dispatch` | ZCode CLI job wrapper: task/status/result/cancel/release-stale/doctor with pinned model, mode and client identification; `release-stale` frees a workspace reservation left by a crashed job, after verifying it is dead |
 ```
 
 **N12.** **Find** in `README.md`:
@@ -4289,7 +4293,7 @@ codex login
 
 ```text
 | `bin/sdd-workspace` | Резолвит изолированные scratch-workspace для каждого плана |
-| `bin/zcode-dispatch` | Обёртка задач ZCode CLI: task/status/result/cancel/doctor с закреплёнными моделью, режимом и идентификацией клиента |
+| `bin/zcode-dispatch` | Обёртка задач ZCode CLI: task/status/result/cancel/release-stale/doctor с закреплёнными моделью, режимом и идентификацией клиента; `release-stale` освобождает резервацию рабочего дерева, оставленную упавшей задачей, после проверки, что та мертва |
 ```
 
 **U12.** **Find** in `README.ru.md`:
@@ -4509,7 +4513,7 @@ git commit -m "chore(release): 0.8.0 — GLM-5.3-Flash via ZCode as default impl
 - Modify: `README.ru.md`
 
 **Interfaces:**
-- Consumes: `bin/zcode-dispatch` with the command surface of Contract C1 (verbs `task`, `status`, `result`, `cancel`, `doctor`, `doctor --probe`; start line `ZCode Task started in the background as zt-NNNN`; exit codes 0/1/2), job records per Contract C2 under the layout of Contract C3, errorClass set `timeout | crash | model-not-selected | auth | quota | launch | malformed`; `docs/zcode-cli-findings.md` with sections `## Go / no-go` (line `VERDICT: GO` | `VERDICT: NO-GO — <reason>`), `## U1 — …` through `## U11 — …`, and `## Inputs for later phases` filled for every key of Contract C7 (`VERDICT`, `MODEL_MECHANISM`, `SELECTION_PATH`, `PERSONAL_CONFIG_BASE`, `PINNED_SELECTION`, `RESUME_KEEPS_MODEL`, `REPORTED_MODEL_FIELD`, `USAGE_INPUT_FIELD`, `USAGE_CACHED_FIELD`, `USAGE_OUTPUT_FIELD`, `USAGE_REASONING_FIELD`, `CACHED_IS_SUBSET_OF_INPUT`, `PROMPT_TRANSPORT`, `MAX_PROMPT_BYTES`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `APP_VERSION_PLIST_KEY`, `DISALLOWED_TOOLS`, `GLM_CONCURRENCY`, `SESSION_SAVED_ON_SIGTERM`, `INTERFERING_PLUGINS`, `PATTERN_MODEL_NOT_SELECTED`, `PATTERN_AUTH`, `PATTERN_QUOTA`, `PATTERN_LAUNCH`); the protocol artifacts of Contract C8 (operations, body / dispatch / sidecar file names, session marker, state-line suffix, `risk_phases`, the `zcode-invocation` "Verified facts" lines including `- Quota bonus (1.5× in ZCode): not measured yet — live acceptance pending.`, gate-stall tokens); the ZCode preamble and channel-switch notice sections in `skills/dev-orchestrator/implementer-prompt.md`; the README paragraphs Ф5 appends to — `README.md` paragraph starting "`max` is reserved for the implementers GLM and Luna" and `README.ru.md` paragraph starting "`max` зарезервирован за имплементерами GLM и Luna".
+- Consumes: `bin/zcode-dispatch` with the command surface of Contract C1 (verbs `task`, `status`, `result`, `cancel`, `release-stale`, `doctor`, `doctor --probe`; start line `ZCode Task started in the background as zt-NNNN`; exit codes 0/1/2), job records per Contract C2 under the layout of Contract C3, errorClass set `timeout | crash | model-not-selected | auth | quota | launch | malformed`; `docs/zcode-cli-findings.md` with sections `## Go / no-go` (line `VERDICT: GO` | `VERDICT: NO-GO — <reason>`), `## U1 — …` through `## U11 — …`, and `## Inputs for later phases` filled for every key of Contract C7 (`VERDICT`, `MODEL_MECHANISM`, `SELECTION_PATH`, `PERSONAL_CONFIG_BASE`, `PINNED_SELECTION`, `RESUME_KEEPS_MODEL`, `REPORTED_MODEL_FIELD`, `USAGE_INPUT_FIELD`, `USAGE_CACHED_FIELD`, `USAGE_OUTPUT_FIELD`, `USAGE_REASONING_FIELD`, `CACHED_IS_SUBSET_OF_INPUT`, `PROMPT_TRANSPORT`, `MAX_PROMPT_BYTES`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `APP_VERSION_PLIST_KEY`, `DISALLOWED_TOOLS`, `GLM_CONCURRENCY`, `SESSION_SAVED_ON_SIGTERM`, `INTERFERING_PLUGINS`, `PATTERN_MODEL_NOT_SELECTED`, `PATTERN_AUTH`, `PATTERN_QUOTA`, `PATTERN_LAUNCH`); the protocol artifacts of Contract C8 (operations, body / dispatch / sidecar file names, session marker, state-line suffix, `risk_phases`, the `zcode-invocation` "Verified facts" lines including `- Quota bonus (1.5× in ZCode): not measured yet — live acceptance pending.`, gate-stall tokens); the ZCode preamble and channel-switch notice sections in `skills/dev-orchestrator/implementer-prompt.md`; the README paragraphs Ф5 appends to — `README.md` paragraph starting "`max` is reserved for the implementers GLM and Luna" and `README.ru.md` paragraph starting "`max` зарезервирован за имплементерами GLM и Luna".
 - Produces: nothing
 
 - [ ] **Step 1: Preconditions and `doctor` (no quota)**
