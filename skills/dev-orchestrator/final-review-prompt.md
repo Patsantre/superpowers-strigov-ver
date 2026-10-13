@@ -23,7 +23,7 @@ Agent tool:
 3. Dispatch `"$DISPATCH" task --background --model gpt-6-astra --effort xhigh --prompt-file <scratch>/final-review-r<k>.md` (no `--write`; poll per `codex-invocation`).
 4. An `INTEGRATION_FAIL` is a BLOCKING item (ledger `FR<k>-B<n>`) whatever Astra's verdict is. Repeat steps 1–3 in round 2.
 
-Tell the user the final review ran on Astra and that it is same-family with the Luna-written code (a declared exception to the family rule) — never a silent substitution. The ledger reviewer id stays `opus-final`.
+Tell the user the final review ran on Astra and — when Codex (Luna or Sol) implemented any phase of the branch — that it is same-family with the implementer's code (a declared exception to the family rule) — never a silent substitution. The ledger reviewer id stays `opus-final`.
 
 Before dispatching, build the whole-branch review package with `bin/review-package` (resolve it the same way as `$DISPATCH` per SKILL.md; only the printed path enters your context, never the diff):
 
@@ -118,4 +118,4 @@ You are a fresh subagent; the orchestrator inlines the fix list from round 1 (BL
 
 ## After the verdict (orchestrator)
 
-`REVIEW_OK` → proceed to plan archival. `REVIEW_BLOCKING` → record the findings in the ledger (ids `FR<round>-B<n>`, reviewer `opus-final`), then dispatch ONE fixer — a single Codex Luna max FRESH task (`--write --model gpt-6-luna --effort max`; no resume — the whole-plan fix wave has no single implementer thread) — with the COMPLETE findings list (all BLOCKING items plus all MUST_FIX_BEFORE_MERGE ledger items; items labeled `plan-mandated` are excluded — those are escalated to the human, never handed to a fixer), not one fixer per finding. Per-finding fixers each rebuild context and re-run suites; a real session's final-review fix wave cost more than all its tasks combined.
+`REVIEW_OK` → proceed to plan archival. `REVIEW_BLOCKING` → record the findings in the ledger (ids `FR<round>-B<n>`, reviewer `opus-final`), then dispatch ONE fixer — a single FRESH implementer task on the channel SKILL.md Step 5 picks (kill switch → Luna max; any risk-marked phase → Sol xhigh; `glm=down` → Luna max; otherwise GLM via `$ZDISPATCH`; no resume — the whole-plan fix wave has no single implementer thread) — with the COMPLETE findings list (all BLOCKING items plus all MUST_FIX_BEFORE_MERGE ledger items; items labeled `plan-mandated` are excluded — those are escalated to the human, never handed to a fixer), not one fixer per finding. Per-finding fixers each rebuild context and re-run suites; a real session's final-review fix wave cost more than all its tasks combined.

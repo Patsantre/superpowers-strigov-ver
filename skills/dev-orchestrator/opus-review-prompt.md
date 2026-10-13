@@ -1,6 +1,6 @@
 # Opus Subagent — Code Review (Step 4.1)
 
-Use when Sonnet orchestrator needs Opus to review the implementer's (Codex Luna) work on a phase. Fresh subagent each round (no bias from previous review rounds).
+Use when Sonnet orchestrator needs Opus to review the implementer's work on a phase (GLM, Codex Luna or Sol, or the Claude frontend implementer — do not assume the family). Fresh subagent each round (no bias from previous review rounds).
 
 ## Invocation
 
@@ -65,7 +65,7 @@ Do BOTH 4a and 4b, every round — 4a findings do NOT stop the review. Your repo
 
 Determine whether the diff implements the current phase **and only the authorized review fixes**.
 
-Do NOT trust Codex's self-report — treat the implementer's report (`[REPORT_FILE]`) as unverified claims about the code. It may be incomplete, inaccurate, or optimistic. Verify the claims against the diff. Design rationales in the report are claims too: "left it per YAGNI," "kept it simple deliberately," or any other justification is the implementer grading its own work. Judge the code on its merits — a stated rationale never downgrades a finding's severity. One exception: the report's test evidence (TDD Evidence sections with commands and output) is accepted as the test record — see "Verification you actually ran".
+Do NOT trust the implementer's self-report — treat the implementer's report (`[REPORT_FILE]`) as unverified claims about the code. It may be incomplete, inaccurate, or optimistic. Verify the claims against the diff. Design rationales in the report are claims too: "left it per YAGNI," "kept it simple deliberately," or any other justification is the implementer grading its own work. Judge the code on its merits — a stated rationale never downgrades a finding's severity. One exception: the report's test evidence (TDD Evidence sections with commands and output) is accepted as the test record — see "Verification you actually ran".
 
 Use this classification:
 

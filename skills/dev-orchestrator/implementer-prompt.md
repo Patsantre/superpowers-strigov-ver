@@ -1,8 +1,18 @@
-# Implementer Prompt (Codex Luna max)
+# Implementer Prompt (GLM-5.3-Flash via ZCode · Codex Luna max · Codex Sol xhigh)
 
-Use when dispatching implementation to the Codex implementer (Luna max). Luna always runs at `max`. Reasoning escalation for BLOCKED phases goes to Sol 6.1 xhigh (`--model gpt-6.1-sol --effort xhigh`) on the same thread.
+Use for every non-frontend implementer dispatch; the channel ladder in SKILL.md Step 3 picks the channel: GLM-5.3-Flash at `max` through Z.ai's ZCode CLI (default), Codex Luna max (availability fallback, kill switch), Codex Sol 6.1 xhigh (risk-marked SECURITY / DATA_LOSS phases, reasoning escalation). Luna always runs at `max`, Sol at `xhigh`. The templates below are the same on every channel; a GLM dispatch file additionally begins with the ZCode preamble, and a retry or channel switch adds the channel-switch notice.
 
 ## Invocation
+
+GLM (default):
+
+```bash
+"$ZDISPATCH" task --background [--cwd <worktree-path>] [--resume-task zt-NNNN | --fresh] --prompt-file "$dir"/prompts/<op>-<phase>-r<N>.<seq>.glm.md
+```
+
+`$ZDISPATCH` is the `zcode-dispatch` wrapper — resolve it once per session per the `zcode-invocation` skill. The wrapper pins the model (GLM-5.3-Flash at `max`); there are no `--model` / `--effort` flags. The dispatch file's first block is the ZCode preamble below. Fix rounds use `--resume-task <this phase's zt-id>`.
+
+Codex — Luna (availability fallback) shown; for Sol (risk-marked phases, reasoning escalation) use `--model gpt-6.1-sol --effort xhigh` instead:
 
 ```bash
 "$DISPATCH" task \
@@ -11,18 +21,46 @@ Use when dispatching implementation to the Codex implementer (Luna max). Luna al
   --model gpt-6-luna \
   --effort max \
   [--cwd <worktree-path>] \
-  --prompt-file <scratch>/implement-<phase-id>.md
+  [--resume-task task-NNNN | --fresh] \
+  --prompt-file "$dir"/prompts/<op>-<phase>-r<N>.<seq>.<luna|sol>.md
 ```
 
-`$DISPATCH` is the `codex-dispatch` wrapper — resolve it once per session per the `codex-invocation` skill. Write the filled prompt to a scratch file first and pass it via `--prompt-file` — do not inline multi-line text. For a parallel-track phase, add `--cwd <worktree-path>` so Codex works in that track's worktree (and use the same `--cwd` on `status`/`result`).
+`$DISPATCH` is the `codex-dispatch` wrapper — resolve it once per session per the `codex-invocation` skill.
+
+**Prompt files** (both dispatchers — SKILL.md Step 3, "Prompt files and the retry / channel-switch rule"): write the filled template once as the operation's body file `$dir/prompts/<op>-<phase>-r<N>.md` (`$dir = $(sdd-workspace <plan-file>)`; operations `implement`, `fix`, `gatefix`, `final-fix`, `repair`); every dispatch goes out as its own dispatch file `<same name>.<seq>.<glm|luna|sol>.md`, composed per operation type and dispatch kind; the dispatched id goes into the sidecar `<same name>.<seq>.<glm|luna|sol>.id`. Never inline multi-line text; prompts no longer live in the session scratchpad. For a parallel-track phase, add `--cwd <worktree-path>` so the implementer works in that track's worktree (and use the same `--cwd` on `status` / `result`), and run `sdd-workspace` inside the worktree.
 
 Both templates take a `[REPORT_FILE]` placeholder — the implementer writes its full report there so the detail never transits your context. Resolve it once per phase as `$(sdd-workspace <plan-file>)/phase-<id>-report.md` and substitute the absolute path (`sdd-workspace` resolves the same way as `$DISPATCH` — see SKILL.md). For a parallel-track phase, run `sdd-workspace` inside the track's worktree so the report lands in that track's workspace. Fix rounds append to the same file — never mint a new report path for round 2+.
 
-For follow-up rounds after the fused review (Step 4), resume the implementer's own thread: same flags plus `--resume-task <this phase's implementer task id>`, with the fix-round template below (it carries the authorized blockers; the thread already knows the plan and the phase). Thread-addressed resume is safe even though the control reviewer ran in between — see `codex-invocation` "Resume semantics". Never `--resume-last`. The same `--resume-task` id also serves `NEEDS_CONTEXT` / effort-upgrade re-dispatches in Step 3.
+For follow-up rounds after the fused review (Step 4) and gate-fix rounds (Step 3.5), resume the implementer's own thread or session on the phase's channel: same flags plus `--resume-task <this phase's id>` (`zt-…` on `$ZDISPATCH`, `task-…` on `$DISPATCH` — ids never cross dispatchers), with the fix-round template below (it carries the authorized blockers; the thread already knows the plan and the phase). Addressed resume is safe even though the control reviewer ran in between — see `codex-invocation` / `zcode-invocation` "Resume semantics". Never `--resume-last`. The same id also serves `NEEDS_CONTEXT` re-dispatches in Step 3 and the Luna → Sol escalation, which resumes the Luna thread. When `zcode-invocation` records `GLM resume: disabled`, GLM follow-ups are FRESH dispatches instead (SKILL.md Step 3).
 
-**Fresh fallback**: if the implementer thread is unavailable (phase implemented by a Claude subagent, task id lost, stale job record forcing `--fresh`), prepend the re-brief block from the template's "fresh fallback" note so the new session has full context.
+**Fresh fallback**: if a fix-type round cannot resume the implementer thread (phase implemented by a Claude subagent, id lost, stale job record forcing `--fresh`, a GLM ↔ Codex channel switch, a GLM → Sol escalation, or a wrapper-refused resume), the fix-round template's opening paragraph is **replaced** by the re-brief block from the template's "fresh fallback" note so the new session has full context; the channel-switch notice follows it whenever an earlier dispatch of the same operation exists. A first-round (`implement`) dispatch never carries the re-brief — it is self-contained; a retry or channel switch of it only adds the channel-switch notice after its opening paragraph.
 
-Poll with Monitor using the terminal-only filter from `codex-invocation`. Fetch via `"$DISPATCH" result task-XXXX`.
+Poll with Monitor using the terminal-only filter from `codex-invocation` (GLM: the same loop from `zcode-invocation`, `zt-` ids). Fetch via `"$DISPATCH" result task-XXXX` or `"$ZDISPATCH" result zt-XXXX`.
+
+## ZCode preamble (GLM dispatches only)
+
+Prepend this block verbatim to **every** GLM dispatch file — first round, fix rounds, gate-fix rounds, `NEEDS_CONTEXT` follow-ups, the Step 5 wave and integration repair. Replace `[REPORT_FILE]` with the same absolute path the template uses. Never send it to Codex or Claude implementers.
+
+```
+## ZCode headless run — read this first
+
+- This is a headless, non-interactive run. Nobody can answer questions. Do not ask. If something is unclear, stop and finish with the status token `NEEDS_CONTEXT` (first round) or `BLOCKED`, with the specific question in your final message.
+- Do not invoke skills, plugins, dynamic workflows, sub-agents, browser or computer-use tools, or goal mode. Use only file reads, file edits and shell commands.
+- No git operations that change history, refs or the index: no `git commit`, `git push`, `git branch`, `git checkout`, `git switch`, `git stash`, `git reset`, `git rebase`, `git add`. Read-only git (`git status`, `git diff`, `git log`, `git show`) is fine.
+- Stay inside the repository root named below. Never read or write `~/.zcode`, `~/.ssh`, `~/.aws`, keychains, or any credential store, and never read `.env` files outside the repository.
+- Network only for package installs the plan explicitly requires (for example an `npm install` / `pip install` of a dependency the plan names). No other downloads, no API calls.
+- Write the full report to [REPORT_FILE] (create parent directories if needed). Your final message is at most 15 lines; line 1 is the bare status token and nothing else.
+```
+
+## Channel-switch notice (retries and channel switches)
+
+Insert this block whenever a phase moves between channels or a channel retries after an infrastructure failure (Luna fallback, Sol escalation, `--fresh` retry). Placement is fixed by SKILL.md Step 3 ("Prompt files and the retry / channel-switch rule"): on an `implement` dispatch it follows the first-round template's opening paragraph and there is **no** re-brief (that block declares a fix round); on a FRESH fix-type dispatch the fresh-fallback re-brief keeps its role — it **replaces** the fix-round template's opening paragraph — and this notice follows it; on a thread resume neither block appears. Fill the angle-bracket choices with the previous attempt's channel, job id and status. For a `--fresh` retry on the same channel, the first sentence names the same model: "A previous run of this implementer (<GLM-5.3-Flash via ZCode | Codex Luna | Codex Sol>, job <zt-NNNN | task-NNNN>, status failed/<errorClass>) worked on this same task before you."
+
+```
+## Previous attempt
+
+A previous run on another implementer (<GLM-5.3-Flash via ZCode | Codex Luna>, job <zt-NNNN | task-NNNN>, status <failed/<errorClass> | BLOCKED | review stall after round 3 | gate stall>) worked on this same task before you. It may have left uncommitted partial changes in the working tree and a report at [REPORT_FILE]. Before anything else: `git status --porcelain` and `git diff <base-sha>`; read [REPORT_FILE] if it exists (including every `## Fix round` section). Your task and its scope are exactly what the sections after this notice say — a fix round stays a fix round: fix only its AUTHORIZED_BLOCKERS and append to the same [REPORT_FILE] under the same `## Fix round <N>` heading. Keep partial work that falls inside that scope and matches the plan, redo what does not, and say in your report what you kept.
+```
 
 ## First-round prompt template
 
@@ -184,7 +222,7 @@ If NEEDS_AUTHORIZATION or BLOCKED, put the specifics in the final message itself
 Re-run the tests that cover the amended code after fixes. Every change in the diff must trace back either to an entry in AUTHORIZED_BLOCKERS or to `unauthorized_changes` (with justification).
 ```
 
-**Fresh fallback re-brief block** — when the fix round cannot resume the implementer thread (Claude-implemented phase, lost task id, stale job record), replace the opening paragraph above with:
+**Fresh fallback re-brief block** — when the fix round cannot resume the implementer thread (phase implemented by a Claude subagent, id lost, stale job record forcing `--fresh`, a GLM ↔ Codex channel switch, a GLM → Sol escalation, or a wrapper-refused resume), replace the opening paragraph above with:
 
 ```
 You are in the fix round of a review loop. A previous run implemented one phase of an approved plan; the fused review (Opus + Astra control) found blocking issues. You are a fresh session with no memory of that run — re-read the context below, then fix ONLY the AUTHORIZED_BLOCKERS, re-test, re-report.
@@ -196,7 +234,7 @@ Path: `<repo-root>/docs/plans/<slug>.md`. Your phase: **`<id>`** (scope: `<one-l
 
 ## Step 5 fix wave (adapting the fix-round template)
 
-When the orchestrator dispatches the final-review fix wave (SKILL.md Step 5), the fix-round template above is reused as a **FRESH task with the fresh-fallback re-brief** (the whole-plan fix wave has no single implementer thread to resume), with these substitutions:
+When the orchestrator dispatches the final-review fix wave (SKILL.md Step 5) — on the channel Step 5 picks (GLM, Luna or Sol; a GLM dispatch file begins with the ZCode preamble) — the fix-round template above is reused as a **FRESH task with the fresh-fallback re-brief** (the whole-plan fix wave has no single implementer thread to resume), with these substitutions:
 
 - **Scope** is the WHOLE plan, not one phase: fill "Your phase" with `the whole plan (Step 5 final-review fix wave)` and drop the phase-scope line.
 - **Base** is MERGE_BASE (the branch start), and the implementation is COMMITTED — inspect it via `git diff <merge-base-sha>..HEAD`, not an uncommitted worktree diff.

@@ -5,6 +5,8 @@ description: How to invoke Codex CLI from Claude Code on this machine. Use when 
 
 # Codex invocation (codex-dispatch wrapper, background-only)
 
+> GLM-5.3-Flash through Z.ai's ZCode CLI — the dev-orchestrator default implementer — has its own wrapper and skill: see `zcode-invocation`. This skill covers Codex only.
+
 The plugin vendors the Codex companion runtime under `vendor/codex-companion/` and exposes it through the `codex-dispatch` shell wrapper in `bin/`. **Do not** call the upstream OpenAI codex plugin — we do not depend on it being installed.
 
 The wrapper handles three things on every call:
@@ -68,11 +70,11 @@ A JSON snapshot (workspaceRoot, sessionRuntime, running, recent) means the wrapp
 | Control review (Step 4.2, requesting-code-review) | `--model gpt-6-astra --effort high` |
 | Implementability check (systematic-debugging, 3+ failed fixes) | `--model gpt-6-astra --effort high` (no `--write`, single shot) |
 | Final-review fallback (Step 5, only when Opus is unavailable) | `--model gpt-6-astra --effort xhigh` (no `--write`) |
-| Implementation + fix rounds (Step 3 / 4 / 5, integration repair) | `--model gpt-6-luna --effort max --write` |
-| Reasoning escalation on BLOCKED | `--model gpt-6.1-sol --effort xhigh --write` (resume the implementer thread) |
+| Availability-fallback implementation (Luna max) — GLM channel down or kill switch; implementation + fix rounds (dev-orchestrator Step 3 / 3.5 / 4 / 5, integration repair) | `--model gpt-6-luna --effort max --write` |
+| Risk-marked phases (SECURITY / DATA_LOSS) and reasoning escalation (Sol xhigh) | `--model gpt-6.1-sol --effort xhigh --write` (GLM phase: FRESH; Luna phase: resume the Luna thread) |
 | Ad-hoc consultation / one-off calls | no `--model` — wrapper default (`gpt-6.1-sol`); `--effort xhigh` (`high` for quick checks) |
 
-Astra is the reviewer model, Luna the implementer, Sol 6.1 the escalation and ad-hoc default. `gpt-6-luna` always runs at `max` (it has no `ultra`); a Luna dispatch at any lower level is a wrong dispatch. `max` on any other role only when the user asks for it by name.
+Astra is the reviewer model, Luna the availability-fallback implementer (GLM via ZCode is the default — `zcode-invocation`), Sol 6.1 the risk-phase implementer, the escalation and the ad-hoc default. `gpt-6-luna` always runs at `max` (it has no `ultra`); a Luna dispatch at any lower level is a wrong dispatch. `max` on any other role only when the user asks for it by name.
 
 **`--effort ultra` is user-initiated ONLY.** Ultra is the parallel-subagent mode of Astra / Sol (~4× tokens). Never offer it, suggest it, or fall back to it on your own — use it exclusively when the user explicitly said "ultra" in their own words. Note: ultra may be rejected on some Codex plans/transport paths; if the dispatch errors on effort, report that to the user rather than silently downgrading.
 
@@ -87,7 +89,7 @@ Expected output: `Codex Task started in the background as task-XXXX`.
 **Flag sanity before submitting** (re-check every dispatch):
 - `--background` — always;
 - `--write` — ONLY when the task must modify files (implementation); never on reviews, and no plan-stage Codex role writes files any more;
-- `--model` + `--effort` match the role table above (plan + spec review = astra/xhigh; control review = astra/high; final-review fallback = astra/xhigh; implementation = luna/max; escalation = sol 6.1/xhigh; implementability check = astra/high); ad-hoc consultations omit `--model` and take the wrapper default; no `ultra` unless the user explicitly asked;
+- `--model` + `--effort` match the role table above (plan + spec review = astra/xhigh; control review = astra/high; final-review fallback = astra/xhigh; fallback implementation = luna/max; risk-phase implementation and escalation = sol 6.1/xhigh; implementability check = astra/high); ad-hoc consultations omit `--model` and take the wrapper default; no `ultra` unless the user explicitly asked;
 - `--resume-task task-XXXX` — the standard way to continue a prior Codex conversation: resumes the thread of exactly that task id, regardless of what ran in between (see "Resume semantics" below). Track the task id of each role's last dispatch and resume by it;
 - `--resume-last` — legacy positional resume ("newest thread in this repo"); only safe when no other Codex task ran in between. Prefer `--resume-task` everywhere; first round of a new loop goes without either.
 
@@ -222,7 +224,7 @@ Each `--background` task is its own detached OS process — there is no serial q
   The companion resolves the workspace from `--cwd` (`git rev-parse --show-toplevel`), so each worktree gets its OWN state directory, broker, job list, and thread history — fully isolated tracks.
 - **`status` / `result` / `cancel` for a worktree task must pass the same `--cwd <worktree-path>`** — without it the wrapper looks in the main repo's workspace and won't find the job.
 - **Resume isolation**: thread history is per-worktree, so parallel tracks never collide on `--resume-last`; the within-track rules from "Resume semantics" still apply unchanged.
-- **Width cap: max 2 concurrent write tasks.** Subscription rate limits and orchestrator attention both degrade beyond that. Do not launch other Codex tasks while 2 write tasks are live.
+- **Width cap: max 2 concurrent write tasks, counted across both dispatchers** — ZCode jobs (`"$ZDISPATCH" status`) count too. Subscription rate limits and orchestrator attention both degrade beyond that. Do not launch other Codex tasks while 2 write tasks are live.
 
 ## Terminal status handling
 
