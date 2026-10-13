@@ -42,7 +42,7 @@
 
     <g transform="translate(418 132)">
       <rect width="158" height="192" rx="18" fill="#131B32" stroke="#475477"/>
-      <text x="20" y="34" fill="#7C8CFF" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17">03 / LUNA</text>
+      <text x="20" y="34" fill="#7C8CFF" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17">03 / GLM</text>
       <text x="20" y="74" fill="#F5F7FF" font-size="25" font-weight="700">Код</text>
       <text x="20" y="105" fill="#AEB7D0" font-size="17">одна фаза</text>
       <text x="20" y="129" fill="#AEB7D0" font-size="17">тесты</text>

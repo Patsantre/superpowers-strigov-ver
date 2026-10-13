@@ -17,10 +17,11 @@ phases:
     commits: "1965798.."
   - id: Ф4
     scope: "Release 0.8.0: plugin.json, README.md, README.ru.md, PLUGIN_README.md, README SVG text"
-    status: in-progress
+    status: done
+    commits: "3b8d331.."
   - id: Ф5
     scope: "[Executor: the user in a fresh plain Claude Code session] live acceptance §8.2 + 1.5x bonus measurement → findings, skill, READMEs"
-    status: pending
+    status: in-progress
 ---
 
 # GLM-5.3-Flash via Z.ai's ZCode CLI as the default implementer — Implementation Plan
