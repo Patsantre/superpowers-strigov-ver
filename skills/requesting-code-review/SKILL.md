@@ -1,9 +1,12 @@
 ---
 name: requesting-code-review
 description: Use when completing tasks, implementing major features, or before merging to verify work meets requirements
+disable-model-invocation: true
 ---
 
 # Requesting Code Review
+
+> **Manual-only pipeline skill (superpowers-strigov-ver).** It starts only from the user (`/dev`, `/superpowers-strigov-ver:<skill>`), from another skill of this plugin, or when resuming an in-progress plan — never on your own initiative. The Skill tool refuses it by design, so this plugin's pipeline skills are loaded with `Read`, never through the Skill tool. This file: `${CLAUDE_SKILL_DIR}/SKILL.md` (if the variable shows unexpanded, it is the path you just read). Another skill named below (`writing-plans`, `codex-invocation`, `zcode-invocation`, `dev-orchestrator`, …) is `../<name>/SKILL.md` relative to this skill's directory — `Read` it there. After a context compaction, re-`Read` this file before your next step.
 
 Dispatch an Opus subagent to review code changes. The reviewer gets precisely crafted context for evaluation — never your session's history. This keeps the reviewer focused on the work product, not your thought process, and preserves your own context for continued work.
 
@@ -31,7 +34,7 @@ HEAD_SHA=$(git rev-parse HEAD)
 
 Never `HEAD~1` as BASE for multi-commit work — it silently drops all but the last commit of a multi-commit task. If you did not record the task's starting SHA, use the merge-base with the mainline, not a fixed number of parents.
 
-**Optionally, pre-build a review package** so the reviewer reads one file instead of re-running git. Resolve the script the same way `codex-invocation` resolves `$DISPATCH`:
+**Optionally, pre-build a review package** so the reviewer reads one file instead of re-running git. First `Read` `../codex-invocation/SKILL.md` (manual-only — never through the Skill tool), then resolve the script as described there:
 
 ```bash
 PKG="$(command -v review-package || true)"
@@ -90,7 +93,7 @@ Reuse the template at `../dev-orchestrator/codex-control-review-prompt.md`. Adap
 - Fill "Implementer report:" with `none — standalone review` and "Verify additionally" with `none`.
 - Ledger references (`AUTHORIZED_CHANGE_LEDGER`, `docs/plans/<slug>.ledger.json`): no ledger exists in standalone use — delete those sentences from the filled prompt.
 
-Invocation is read-only (`--model gpt-6-astra --effort high`, no `--write`). Poll via Monitor per `codex-invocation` skill.
+Invocation is read-only (`--model gpt-6-astra --effort high`, no `--write`). Poll via Monitor per `../codex-invocation/SKILL.md` (`Read` it; manual-only skill).
 
 **Combined verdict handling (same loop as dev-orchestrator Step 4, cap=4):**
 

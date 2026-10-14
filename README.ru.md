@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="Версия 0.8.1" src="https://img.shields.io/badge/version-0.8.1-7c8cff?style=flat-square">
+  <img alt="Версия 0.9.0" src="https://img.shields.io/badge/version-0.9.0-7c8cff?style=flat-square">
   <img alt="Плагин Claude Code" src="https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square">
   <img alt="Лицензия MIT" src="https://img.shields.io/badge/license-MIT-35d6a6?style=flat-square">
 </p>
@@ -55,7 +55,7 @@ Companion runtime уже вендорится. Отдельный Claude Code-п
 /dev Реализуй возобновляемую загрузку файлов с проверкой целостности
 ```
 
-Можно и просто описать задачу обычным текстом. Плагин распознаёт английские и русские запросы и сам выполняет триаж. Тривиальные правки одного файла идут по облегчённому пути Sonnet quickfix.
+Пайплайн не запускается самостоятельно. Запустите его командой `/dev` или сначала вызовите `/superpowers-strigov-ver:brainstorming`, чтобы согласовать дизайн. Чтобы продолжить незавершённый план в новой сессии, запустите `/dev` без задачи или просто попросите продолжить: тихий SessionStart-хук назовёт план. Внутри пайплайна `dev-orchestrator` выполняет триаж, а тривиальные правки одного файла идут по облегчённому пути Sonnet quickfix.
 
 ## Что меняется
 
@@ -105,6 +105,7 @@ Companion runtime уже вендорится. Отдельный Claude Code-п
 
 ## Защитные механизмы
 
+- **Ручной запуск** — у pipeline-скиллов стоит `disable-model-invocation: true`: модель не видит их описания и не загружает их самостоятельно. Пайплайн запускается только по вашей команде, скиллы переходят друг к другу через чтение файлов `SKILL.md`, а незавершённый план возобновляется только по вашей просьбе. Discipline-скиллы (`systematic-debugging`, `test-driven-development`, `verification-before-completion`, `receiving-code-review`) по-прежнему включаются автоматически.
 - **Независимое суждение** — автор и ревьюер артефакта принадлежат разным модельным семействам.
 - **Authorization ledger** — замечания проходят триаж до передачи фиксеру; расширение scope не реализуется молча.
 - **Ограниченные циклы** — ревью плана и фазы ограничено четырьмя раундами, финальное ревью ветки — двумя.
@@ -124,7 +125,8 @@ Companion runtime уже вендорится. Отдельный Claude Code-п
 | `codex-invocation` | Надёжный фоновый dispatch Codex через вендорный companion runtime |
 | `zcode-invocation` | Фоновый dispatch GLM-5.3-Flash через ZCode CLI от Z.ai: настройка, doctor/probe, цикл Monitor, обработка сбоев |
 | `architecture-memory` | Компактная персистентная карта архитектуры в `docs/ARCHI.md` |
-| `/dev` | Явная точка входа в полный протокол |
+| `/dev` | Явная точка входа в полный протокол; без задачи — продолжение незавершённого плана |
+| `bin/pipeline-context` | SessionStart-хук: называет незавершённый план и скилл, который нужно перечитать после компакции; в остальных случаях молчит |
 | `bin/review-package` | Генерирует готовые для ревьюера пакеты коммитов и diff |
 | `bin/sdd-workspace` | Резолвит изолированные scratch-workspace для каждого плана |
 | `bin/zcode-dispatch` | Обёртка задач ZCode CLI: task/status/result/cancel/release-stale/doctor/login с закреплёнными моделью, режимом и идентификацией клиента; `release-stale` освобождает резервацию рабочего дерева, оставленную упавшей задачей, после проверки, что та мертва |
@@ -133,7 +135,7 @@ Companion runtime уже вендорится. Отдельный Claude Code-п
 
 `brainstorming`, `dispatching-parallel-agents`, `executing-plans`, `finishing-a-development-branch`, `receiving-code-review`, `requesting-code-review`, `systematic-debugging`, `test-driven-development`, `using-git-worktrees`, `verification-before-completion`, `writing-plans` и `writing-skills`.
 
-Upstream-скилл `subagent-driven-development` заменён на `dev-orchestrator`. Агрессивная инъекция `using-superpowers` и SessionStart hook намеренно не включены.
+Upstream-скилл `subagent-driven-development` заменён на `dev-orchestrator`. Агрессивная инъекция `using-superpowers` и её SessionStart-хук намеренно не включены; собственный SessionStart-хук плагина подаёт голос только при незавершённом плане или когда после компакции нужно перечитать скилл пайплайна.
 
 <details>
 <summary><strong>Карта репозитория</strong></summary>
@@ -142,8 +144,10 @@ Upstream-скилл `subagent-driven-development` заменён на `dev-orche
 .
 ├── .claude-plugin/plugin.json       # Манифест и версия исходников
 ├── commands/dev.md                  # Точка входа команды /dev
+├── hooks/hooks.json                 # SessionStart → bin/pipeline-context
 ├── bin/
 │   ├── codex-dispatch               # Обёртка вендорного companion
+│   ├── pipeline-context             # Незавершённый план / подсказка перечитать скилл
 │   ├── review-package               # Генератор diff-пакета для ревьюеров
 │   ├── sdd-workspace                # Резолвер scratch-workspace для плана
 │   ├── zcode-dispatch               # Обёртка задач ZCode CLI (shim)
@@ -155,6 +159,7 @@ Upstream-скилл `subagent-driven-development` заменён на `dev-orche
 │   ├── architecture-memory/
 │   └── ...                          # Адаптированные скиллы Superpowers
 ├── tests/test-sdd-scripts.sh        # Интеграционные тесты workspace/package
+├── tests/test-pipeline-context.sh   # SessionStart-хук и проверки manual-only скиллов
 ├── tests/test-zcode-dispatch.sh     # Тесты обёртки ZCode (CLI-заглушка)
 └── vendor/codex-companion/          # Вендорный companion runtime OpenAI
 ```
@@ -176,6 +181,7 @@ Upstream-база записана в `vendor/codex-companion/VERSION`. Лока
 
 ```bash
 bash tests/test-sdd-scripts.sh
+bash tests/test-pipeline-context.sh
 bash tests/test-zcode-dispatch.sh
 ```
 

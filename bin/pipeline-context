@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# SessionStart hook: the bridge that lets the manual-only pipeline skills be
+# resumed without ever auto-triggering on unrelated requests.
+#
+# The pipeline skills carry `disable-model-invocation: true`, so the model
+# neither sees their descriptions nor can load them through the Skill tool.
+# This hook speaks up in exactly two cases, and stays silent otherwise:
+#
+#   1. The repo has an in-progress pipeline plan — a plan file whose YAML
+#      frontmatter has top-level `status: in-progress` and a `phases:` list.
+#      The hook names the plan and the path of dev-orchestrator's SKILL.md, so
+#      "continue" in a fresh session can reach the resume path.
+#   2. The context was compacted (or a session resumed) after a pipeline skill
+#      was loaded in this conversation — detected by the skills' header marker
+#      in the transcript. The hook points at the skills directory so the model
+#      re-Reads the skill it was following.
+#
+# Plain stdout of a SessionStart hook is added to the model's context.
+# Always exits 0: a hook failure must never block a session.
+#
+# Input: the hook's JSON on stdin (cwd, source, transcript_path).
+# Plugin root: $CLAUDE_PLUGIN_ROOT, or this script's parent directory.
+
+set -u
+
+MARKER='Manual-only pipeline skill (superpowers-strigov-ver)'
+PLAN_DIRS='docs/plans docs/architecture/plans docs/rfc .claude/plans plans'
+MAX_PLANS=5
+
+input="$(cat 2>/dev/null || true)"
+
+# Extract a top-level string field from the (single-line) hook JSON.
+json_field() {
+  printf '%s' "$input" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n 1
+}
+
+# Repo files are untrusted: a cloned repo controls plan file names and phase
+# ids, and this hook's output lands in the model's context with more authority
+# than file content. So only short, inert tokens are echoed — a file name of
+# ASCII [A-Za-z0-9._-] (≤ 80 bytes) and a phase id of at most 16 bytes made of
+# ASCII [A-Za-z0-9._-] or non-ASCII bytes (Cyrillic ids like Ф2), no spaces or
+# punctuation. Anything else is replaced by a neutral placeholder.
+safe_token() { # safe_token <string> <max-bytes> <allow-non-ascii: 0|1>
+  local s=$1 max=$2 extra='' bytes
+  [ "$3" = 1 ] && extra='\200-\377'
+  [ -n "$s" ] || return 1
+  bytes=$(printf '%s' "$s" | wc -c)
+  [ $((bytes)) -le "$max" ] || return 1
+  [ -z "$(printf '%s' "$s" | LC_ALL=C tr -d "A-Za-z0-9._$extra-")" ]
+}
+
+# Print "<kind>\t<phase-id>" if the file is an in-progress pipeline plan, else
+# nothing. kind: current | next | done.
+plan_progress() {
+  awk '
+    { sub(/\r$/, "") }
+    NR == 1 { if ($0 != "---") exit; next }
+    $0 == "---" { closed = 1; exit }
+    /^status:[[:space:]]*in-progress[[:space:]]*(#.*)?$/ { top = 1; next }
+    /^phases:/ { inph = 1; hasph = 1; next }
+    /^[^[:space:]#-]/ { inph = 0 }
+    inph && /^[[:space:]]*-[[:space:]]*id:/ {
+      id = $0
+      sub(/^[[:space:]]*-[[:space:]]*id:[[:space:]]*/, "", id)
+      sub(/[[:space:]]*(#.*)?$/, "", id)
+      gsub(/["\047]/, "", id)
+      next
+    }
+    inph && cur == "" && /^[[:space:]]+status:[[:space:]]*in-progress/ { cur = id }
+    inph && nxt == "" && /^[[:space:]]+status:[[:space:]]*pending/ { nxt = id }
+    END {
+      if (!closed || !top || !hasph) exit
+      if (cur != "") print "current\t" cur
+      else if (nxt != "") print "next\t" nxt
+      else print "done\t"
+    }
+  ' "$1" 2>/dev/null
+}
+
+plugin_root="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)}"
+skills_dir="$plugin_root/skills"
+
+cwd="$(json_field cwd)"
+[ -n "$cwd" ] || cwd="${CLAUDE_PROJECT_DIR:-$PWD}"
+root="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$cwd")"
+
+plans=""
+count=0
+for d in $PLAN_DIRS; do
+  for f in "$root/$d"/*.md; do
+    [ -f "$f" ] || continue
+    progress="$(plan_progress "$f")"
+    [ -n "$progress" ] || continue
+    count=$((count + 1))
+    [ "$count" -le "$MAX_PLANS" ] || continue
+    kind=${progress%%$'\t'*}
+    id=${progress#*$'\t'}
+    safe_token "$id" 16 1 || id="(id not shown)"
+    case "$kind" in
+      current) progress="current phase: $id" ;;
+      next) progress="next phase: $id" ;;
+      *) progress="all phases done, final review pending" ;;
+    esac
+    name=$(basename "$f")
+    safe_token "$name" 80 0 || name="(plan with a non-standard file name)"
+    plans="$plans
+- $d/$name — $progress"
+  done
+done
+
+if [ "$count" -gt 0 ]; then
+  [ "$count" -le "$MAX_PLANS" ] || plans="$plans
+- … and $((count - MAX_PLANS)) more"
+  cat <<EOF
+[superpowers-strigov-ver] In-progress dev pipeline plan(s) in this repo:$plans
+This plugin's pipeline skills are manual-only: do not start them for unrelated requests. Only when the user asks to continue this work (or you were in the middle of it before this context reset), Read $skills_dir/dev-orchestrator/SKILL.md and follow its resume path — name the plan and wait for the user's confirmation before dispatching anything. Load these skills with the Read tool; the Skill tool refuses them.
+EOF
+fi
+
+source_kind="$(json_field source)"
+transcript="$(json_field transcript_path)"
+case "$source_kind" in
+  compact|resume)
+    if [ -n "$transcript" ] && [ -f "$transcript" ] && grep -qF "$MARKER" "$transcript" 2>/dev/null; then
+      cat <<EOF
+[superpowers-strigov-ver] A pipeline skill of this plugin was loaded earlier in this conversation. If you were in the middle of following one (dev-orchestrator, brainstorming, writing-plans, zcode-invocation, …), re-Read its SKILL.md from $skills_dir/<name>/SKILL.md before your next step. Load it with the Read tool; the Skill tool refuses these skills.
+EOF
+    fi
+    ;;
+esac
+
+exit 0
