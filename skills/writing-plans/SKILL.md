@@ -1,9 +1,12 @@
 ---
 name: writing-plans
 description: Use when you have a spec or requirements for a multi-step task, before touching code
+disable-model-invocation: true
 ---
 
 # Writing Plans
+
+> **Manual-only pipeline skill (superpowers-strigov-ver).** It starts only from the user (`/dev`, `/superpowers-strigov-ver:<skill>`), from another skill of this plugin, or when resuming an in-progress plan — never on your own initiative. The Skill tool refuses it by design, so this plugin's pipeline skills are loaded with `Read`, never through the Skill tool. This file: `${CLAUDE_SKILL_DIR}/SKILL.md` (if the variable shows unexpanded, it is the path you just read). Another skill named below (`writing-plans`, `codex-invocation`, `zcode-invocation`, `dev-orchestrator`, …) is `../<name>/SKILL.md` relative to this skill's directory — `Read` it there. After a context compaction, re-`Read` this file before your next step.
 
 ## Overview
 
@@ -118,7 +121,7 @@ phases:
 
 # [Feature Name] Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use dev-orchestrator to implement this plan phase-by-phase. Steps inside each phase use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: implement this plan phase-by-phase with the `dev-orchestrator` skill of the superpowers-strigov-ver plugin (`/dev`; manual-only — `Read` its SKILL.md, the Skill tool refuses it). Steps inside each phase use checkbox (`- [ ]`) syntax for tracking.
 
 ---
 ````
@@ -244,6 +247,6 @@ After the Codex review returns APPROVED and the plan is committed, hand off to t
 
 **"Plan complete (written by Opus xhigh, reviewed by Astra xhigh), saved to `docs/plans/<filename>.md`. Ready to execute via `dev-orchestrator` — one phase at a time, with auto-commit per phase and fused Opus + Codex review on each diff. Start now?"**
 
-- **REQUIRED SUB-SKILL:** Use `dev-orchestrator` (it reads the YAML frontmatter, picks up the first `status: in-progress` phase, and dispatches the implementer).
+- **REQUIRED SUB-SKILL:** `Read` `../dev-orchestrator/SKILL.md` and follow it (manual-only — never through the Skill tool; it reads the YAML frontmatter, picks up the first `status: in-progress` phase, and dispatches the implementer).
 
 **No inline-execution fallback for phased plans.** `executing-plans` is reserved for legacy flat `Task 1..N` plans without YAML frontmatter — period. Phased plans produced by this skill MUST go through `dev-orchestrator`; there is no supported inline path, because per-phase auto-commit, route-by-phase (BE/FE), and resume-check have no equivalent in `executing-plans` and running a phased plan through it would silently drop those guarantees. If the user lacks subagent support, the answer is to upgrade the environment or write a flat plan in upstream `superpowers`, not to coerce `executing-plans` into running a phased one.

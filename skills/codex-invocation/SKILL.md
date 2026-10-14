@@ -1,11 +1,14 @@
 ---
 name: codex-invocation
 description: How to invoke Codex CLI from Claude Code on this machine. Use when any workflow needs to dispatch a Codex task — codex-dispatch wrapper + --background + Monitor polling. Contains the exact wrapper, flags, polling loop, and stale-lock workaround. Read this before the first Codex call in a session, including from dev-orchestrator.
+disable-model-invocation: true
 ---
 
 # Codex invocation (codex-dispatch wrapper, background-only)
 
-> GLM-5.3-Flash through Z.ai's ZCode CLI — the dev-orchestrator default implementer — has its own wrapper and skill: see `zcode-invocation`. This skill covers Codex only.
+> **Manual-only pipeline skill (superpowers-strigov-ver).** It starts only from the user (`/dev`, `/superpowers-strigov-ver:<skill>`), from another skill of this plugin, or when resuming an in-progress plan — never on your own initiative. The Skill tool refuses it by design, so this plugin's pipeline skills are loaded with `Read`, never through the Skill tool. This file: `${CLAUDE_SKILL_DIR}/SKILL.md` (if the variable shows unexpanded, it is the path you just read). Another skill named below (`writing-plans`, `codex-invocation`, `zcode-invocation`, `dev-orchestrator`, …) is `../<name>/SKILL.md` relative to this skill's directory — `Read` it there. After a context compaction, re-`Read` this file before your next step.
+
+> GLM-5.3-Flash through Z.ai's ZCode CLI — the dev-orchestrator default implementer — has its own wrapper and skill: `Read` `../zcode-invocation/SKILL.md` (manual-only; never through the Skill tool). This skill covers Codex only.
 
 The plugin vendors the Codex companion runtime under `vendor/codex-companion/` and exposes it through the `codex-dispatch` shell wrapper in `bin/`. **Do not** call the upstream OpenAI codex plugin — we do not depend on it being installed.
 

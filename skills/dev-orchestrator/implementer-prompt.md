@@ -10,7 +10,7 @@ GLM (default):
 "$ZDISPATCH" task --background [--cwd <worktree-path>] [--resume-task zt-NNNN | --fresh] --prompt-file "$dir"/prompts/<op>-<phase>-r<N>.<seq>.glm.md
 ```
 
-`$ZDISPATCH` is the `zcode-dispatch` wrapper — resolve it once per session per the `zcode-invocation` skill. The wrapper pins the model (GLM-5.3-Flash at `max`); there are no `--model` / `--effort` flags. The dispatch file's first block is the ZCode preamble below. Fix rounds use `--resume-task <this phase's zt-id>`.
+`$ZDISPATCH` is the `zcode-dispatch` wrapper — first `Read` `../zcode-invocation/SKILL.md` (manual-only; never through the Skill tool), then resolve it once per session. The wrapper pins the model (GLM-5.3-Flash at `max`); there are no `--model` / `--effort` flags. The dispatch file's first block is the ZCode preamble below. Fix rounds use `--resume-task <this phase's zt-id>`.
 
 Codex — Luna (availability fallback) shown; for Sol (risk-marked phases, reasoning escalation) use `--model gpt-6.1-sol --effort xhigh` instead:
 
@@ -25,17 +25,17 @@ Codex — Luna (availability fallback) shown; for Sol (risk-marked phases, reaso
   --prompt-file "$dir"/prompts/<op>-<phase>-r<N>.<seq>.<luna|sol>.md
 ```
 
-`$DISPATCH` is the `codex-dispatch` wrapper — resolve it once per session per the `codex-invocation` skill.
+`$DISPATCH` is the `codex-dispatch` wrapper — first `Read` `../codex-invocation/SKILL.md` (manual-only; never through the Skill tool), then resolve it once per session.
 
 **Prompt files** (both dispatchers — SKILL.md Step 3, "Prompt files and the retry / channel-switch rule"): write the filled template once as the operation's body file `$dir/prompts/<op>-<phase>-r<N>.md` (`$dir = $(sdd-workspace <plan-file>)`; operations `implement`, `fix`, `gatefix`, `final-fix`, `repair`); every dispatch goes out as its own dispatch file `<same name>.<seq>.<glm|luna|sol>.md`, composed per operation type and dispatch kind; the dispatched id goes into the sidecar `<same name>.<seq>.<glm|luna|sol>.id`. Never inline multi-line text; prompts no longer live in the session scratchpad. For a parallel-track phase, add `--cwd <worktree-path>` so the implementer works in that track's worktree (and use the same `--cwd` on `status` / `result`), and run `sdd-workspace` inside the worktree.
 
 Both templates take a `[REPORT_FILE]` placeholder — the implementer writes its full report there so the detail never transits your context. Resolve it once per phase as `$(sdd-workspace <plan-file>)/phase-<id>-report.md` and substitute the absolute path (`sdd-workspace` resolves the same way as `$DISPATCH` — see SKILL.md). For a parallel-track phase, run `sdd-workspace` inside the track's worktree so the report lands in that track's workspace. Fix rounds append to the same file — never mint a new report path for round 2+.
 
-For follow-up rounds after the fused review (Step 4) and gate-fix rounds (Step 3.5), resume the implementer's own thread or session on the phase's channel: same flags plus `--resume-task <this phase's id>` (`zt-…` on `$ZDISPATCH`, `task-…` on `$DISPATCH` — ids never cross dispatchers), with the fix-round template below (it carries the authorized blockers; the thread already knows the plan and the phase). Addressed resume is safe even though the control reviewer ran in between — see `codex-invocation` / `zcode-invocation` "Resume semantics". Never `--resume-last`. The same id also serves `NEEDS_CONTEXT` re-dispatches in Step 3 and the Luna → Sol escalation, which resumes the Luna thread. When `zcode-invocation` records `GLM resume: disabled`, GLM follow-ups are FRESH dispatches instead (SKILL.md Step 3).
+For follow-up rounds after the fused review (Step 4) and gate-fix rounds (Step 3.5), resume the implementer's own thread or session on the phase's channel: same flags plus `--resume-task <this phase's id>` (`zt-…` on `$ZDISPATCH`, `task-…` on `$DISPATCH` — ids never cross dispatchers), with the fix-round template below (it carries the authorized blockers; the thread already knows the plan and the phase). Addressed resume is safe even though the control reviewer ran in between — see `../codex-invocation/SKILL.md` / `../zcode-invocation/SKILL.md` "Resume semantics"; `Read` the relevant manual-only skill. Never `--resume-last`. The same id also serves `NEEDS_CONTEXT` re-dispatches in Step 3 and the Luna → Sol escalation, which resumes the Luna thread. When `zcode-invocation` records `GLM resume: disabled`, GLM follow-ups are FRESH dispatches instead (SKILL.md Step 3).
 
 **Fresh fallback**: if a fix-type round cannot resume the implementer thread (phase implemented by a Claude subagent, id lost, stale job record forcing `--fresh`, a GLM ↔ Codex channel switch, a GLM → Sol escalation, or a wrapper-refused resume), the fix-round template's opening paragraph is **replaced** by the re-brief block from the template's "fresh fallback" note so the new session has full context; the channel-switch notice follows it whenever an earlier dispatch of the same operation exists. A first-round (`implement`) dispatch never carries the re-brief — it is self-contained; a retry or channel switch of it only adds the channel-switch notice after its opening paragraph.
 
-Poll with Monitor using the terminal-only filter from `codex-invocation` (GLM: the same loop from `zcode-invocation`, `zt-` ids). Fetch via `"$DISPATCH" result task-XXXX` or `"$ZDISPATCH" result zt-XXXX`.
+Poll with Monitor using the terminal-only filter from `../codex-invocation/SKILL.md` (GLM: the same loop from `../zcode-invocation/SKILL.md`, `zt-` ids); `Read` the relevant manual-only skill. Fetch via `"$DISPATCH" result task-XXXX` or `"$ZDISPATCH" result zt-XXXX`.
 
 ## ZCode preamble (GLM dispatches only)
 

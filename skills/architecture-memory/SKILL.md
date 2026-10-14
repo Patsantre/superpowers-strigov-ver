@@ -1,9 +1,12 @@
 ---
 name: architecture-memory
 description: Maintain docs/ARCHI.md — a persistent, tool-agnostic architecture memory of the repository. Use when the user asks to create, update, or compact an architecture overview / ARCHI.md, or when repeated Explore passes keep re-mapping the same codebase. Covers creation, the update discipline, the token budget (~10-20k tokens), and the compaction procedure with a bundled token-count script.
+disable-model-invocation: true
 ---
 
 # Architecture Memory (ARCHI.md)
+
+> **Manual-only pipeline skill (superpowers-strigov-ver).** It starts only from the user (`/dev`, `/superpowers-strigov-ver:<skill>`), from another skill of this plugin, or when resuming an in-progress plan — never on your own initiative. The Skill tool refuses it by design, so this plugin's pipeline skills are loaded with `Read`, never through the Skill tool. This file: `${CLAUDE_SKILL_DIR}/SKILL.md` (if the variable shows unexpanded, it is the path you just read). Another skill named below (`writing-plans`, `codex-invocation`, `zcode-invocation`, `dev-orchestrator`, …) is `../<name>/SKILL.md` relative to this skill's directory — `Read` it there. After a context compaction, re-`Read` this file before your next step.
 
 `docs/ARCHI.md` is a curated, always-current snapshot of the repository's architecture — the agent's long-term memory of the codebase. Concept borrowed from [TRIP-workflow](https://github.com/PiLastDigit/TRIP-workflow) (MIT).
 
@@ -38,7 +41,7 @@ Target **10–20k tokens** (roughly ≤10% of a working context). Measure with t
 bash <plugin-root>/skills/architecture-memory/count-tokens.sh docs/ARCHI.md
 ```
 
-(±5% on markdown. Resolve `<plugin-root>` the same way `codex-invocation` resolves the wrapper: marketplace cache or local dev tree.)
+(±5% on markdown. First `Read` `../codex-invocation/SKILL.md` (manual-only — never through the Skill tool), then resolve `<plugin-root>` using the same marketplace-cache or local-dev-tree method.)
 
 ## Creating it
 

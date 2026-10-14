@@ -1,0 +1,16 @@
+{
+  "description": "Name an in-progress dev pipeline plan (and the skill to re-read after compaction) so the manual-only pipeline skills can be resumed without auto-triggering.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/pipeline-context\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

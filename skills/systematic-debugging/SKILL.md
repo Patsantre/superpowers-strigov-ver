@@ -275,7 +275,7 @@ Main thread picks which hypothesis to test first (typically highest likelihood w
 
    **Then: single-shot Codex Astra high implementability check** — NOT a review loop, just one cross-opinion pass. Opus reasoned from patterns; Codex reads the code to verify each alternative is actually feasible.
 
-   Invocation per `codex-invocation` skill (read-only, `--model gpt-6-astra --effort high`, no `--write`, no `--resume-last`, cap=1):
+   Invocation per `../codex-invocation/SKILL.md`, relative to this skill's directory (`Read` it — that skill is manual-only and the Skill tool refuses it) (read-only, `--model gpt-6-astra --effort high`, no `--write`, no `--resume-last`, cap=1):
 
    ```
    IMPLEMENTABILITY CHECK — read-only, do not modify code.
