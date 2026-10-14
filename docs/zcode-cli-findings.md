@@ -147,7 +147,7 @@ VERDICT: GO
   - Both resolve the store as `<ZCODE_DATA_BASE_DIR, else $HOME>/.zcode/v2/credentials.json`, and both use the key `oauth:zai:access_token`.
   - The desktop app exchanges its OAuth token for a business token (`exchangeToken`) and stores the exchanged token in that key.
   - The CLI's `zcode login zai` stores its OAuth token there. Before every model request (`refreshBeforeModelRequest`) the CLI exchanges the stored token via `POST https://api.z.ai/api/auth/z/login`. With the desktop app's token in the key, that exchange fails with `project_token_login_failed`, so every CLI run fails. With the CLI's token in the key, the desktop app rejects it and asks the user to sign in again.
-  - The CLI login stores no refresh token, so it also expires on its own; the CLI then fails the same way until the user logs in again.
+  - The CLI login stores no refresh token, so it also expires on its own; the CLI then fails the same way until the user logs in again (see "CLI login lifetime" below, which also covers the API-key mode that avoids the exchange).
   - `ZCODE_DATA_BASE_DIR` moves only the credential store. The headless path (`runPrompt` → `INn`) resolves its other state separately; each resolver and its override (bundle 3.15.1, env names exact):
 
     | State | Resolver | Default location | Override |
@@ -170,6 +170,129 @@ VERDICT: GO
   - Every wrapper CLI run (task runner, `doctor --probe`, `login`) sets `ZCODE_DATA_BASE_DIR=<ZCODE_STATE_DIR>/cli-home` (a directory the wrapper creates with mode 0700), `ZCODE_STORAGE_DIR=<cli-home>/.zcode`, `ZCODE_SESSION_DB_PATH=<cli-home>/.zcode/cli/db/db.sqlite` and `ZCODE_LOG_DIR=<cli-home>/.zcode/cli/log`, and drops an inherited `ZCODE_SESSION_DB`. The wrapper never edits the user's `~/.zcode` or the desktop app's files; the CLI's own read (and one-time migration) of `~/.zcode/cli/config.json` remains, because no override exists for it.
   - The user logs the CLI in with `zcode-dispatch login`, which runs `zcode login zai` with the same allowlisted environment as task runs and re-pins the model afterwards. That is needed once per machine, and again whenever the login expires: `doctor --probe` FAIL(auth) or FAIL(model-not-selected) prints the hint `run: zcode-dispatch login`.
   - Sessions of CLI runs made before the change live in `~/.zcode/cli/db/db.sqlite` and cannot be resumed from the new session database. The CLI seeds the bundled official plugins into the new storage root itself (`Drc`, error code `ZCODE_PLUGIN_SEED_INCOMPLETE`); which plugins are enabled still comes from the merged config, including the shared user config. The U8 plugin list was read with the old storage root and is not re-verified for the new one.
+
+## CLI login lifetime — why OAuth runs stop working, and the API-key mode (2026-10-14)
+- Answer: The CLI's Z.ai OAuth login lives about one hour: measured on 2026-10-14, the server accepted it 59 min after the login and rejected it at 74 min, on an unchanged network with the desktop app closed. It cannot be renewed: the CLI keeps no refresh token, and it trades the stored login for a short-lived business token before every model request. Once the login is no longer accepted, every run fails before any model call, until the user logs in again. ZCode's own "Z.ai Coding Plan" provider template takes a Coding Plan API key instead and skips that exchange. The wrapper's `api-key` verb uses it.
+  - **Observed** (cli-home of the wrapper; only file times, the CLI's log and the desktop app's log were read):
+    - The user's `zcode-dispatch login` wrote `credentials.json` at 10:49:46 +07.
+    - Successful model requests followed until 10:52:57 (probe, zt-0001, zt-0002).
+    - Two `doctor --probe` runs at 12:05:43 and 12:06:00 failed. The CLI log shows `RuntimeHeadersRefreshError: project_token_login_failed` 4.5 s and 1.9 s after `model.request.started`, `retryable: false`, with no model call.
+    - The CLI never rewrote `credentials.json` after the login.
+  - **What the login stores.** `zcode login zai` (`loginZCodeCli`) polls `…/oauth/cli/poll/<flow>` (parser `Ota`). For Z.ai it saves only the raw OAuth access token, the ZCode JWT and the user info (`saveZaiLoginCredentials`). `Ota` reads an optional `refresh_token`, but only the BigModel branch stores it (`oauth:bigmodel:refresh_token`). The CLI parses no expiry for the login.
+  - **No refresh path.** Nothing writes or reads `oauth:zai:refresh_token`; the key appears only in logout (`clearZaiLoginCredentials`). Nothing renews `oauth:zai:access_token`.
+  - **The per-request exchange.** For a provider with `access.type === "zhipu-account"`, `refreshBeforeModelRequest` (`Coi`) runs before each model request:
+    - it sends the stored token in `POST https://api.z.ai/api/auth/z/login {token}` (`fpt` with `ZaiBusinessTokenCache`);
+    - then it resolves a project token.
+    - The business token's expiry (JWT `exp` / `expires_in`) is cached in memory only, so every new CLI process exchanges again.
+  - **One code for every exchange failure.** The resolver turns all of these into `project_token_login_failed`:
+    - a non-zero `code` in the response, a missing token, or an already expired result;
+    - HTTP 404;
+    - network errors, the 15 s timeout, 429 and 5xx, whenever no cached business token exists — always true in a fresh CLI process.
+
+    The code alone therefore cannot tell an expired login from a network failure.
+  - **The desktop app cannot refresh a Z.ai login either.** Its `ZaiProviderAdapter` (app.asar) exchanges the OAuth token once at login and stores the resulting business token, with `expiresAt` from `expires_in`. Its `refreshToken` path throws `Z.AI OAuth 暂未提供 refresh token 交换接口，请重新登录` for adapters without a refresh method.
+  - **Correlation with the desktop app on 2026-10-14.**
+    - The app ran without interruption from 09:10:42 to 12:29:41 (one pid, then `app-quit`).
+    - Its credential store `~/.zcode/v2/credentials.json` was last written at 09:10:59, before the CLI login (file time only).
+    - Its log has no login, logout, token exchange or auth error between 10:40 and 12:10.
+    - Its network worked at 12:04 and 12:06 (update checks through the system proxy). The last network trouble was 11:15–11:18 (`net::ERR_TUNNEL_CONNECTION_FAILED`, relay TLS errors).
+    - So no desktop sign-in or refresh lines up with the 12:05 failure. The failures took 4.5 s and 1.9 s, not the 15 s timeout, which fits an HTTP answer better than a dropped connection.
+  - **Network switches (the user's account).** The Mac's uplink moved:
+    - from the iPhone hotspot to Wi-Fi shortly after 12:00, close to the first failure at 12:05:43;
+    - back to the iPhone at about 13:30;
+    - the iPhone link dropped at about 14:00.
+
+    All requests went through the local proxy client's TUN interface (default route `utun7`; `api.z.ai` resolves to a 198.18.x fake IP).
+  - **The 10:49 login is still rejected later.** On 14:24:57, with working internet (a neutral HTTPS host answered 200, uplink the iPhone hotspot at `172.20.10.x`), one probe on the unchanged 10:49 login failed with `project_token_login_failed` (4.4 s). A control probe through the HTTP proxy (`ZCODE_HTTP_PROXY=http://127.0.0.1:1082`) failed the same way (1.8 s). Neither cost credits.
+    - So the token is not just hit by a transient network fault: the server stopped accepting it.
+    - Two explanations remained. H1: a short lifetime, between 3 and 76 min. H4: the token is bound to the network or IP it was issued on, and the switch after 12:00 invalidated it. The third series decided for H1.
+    - The desktop-revocation hypothesis has no supporting event.
+  - **The network path matters for the OAuth mode (fresh login at 21:53:26, home Wi-Fi `192.168.1.x`, desktop app closed).**
+    - 2 min after the login, a probe over the TUN path, without `ZCODE_HTTP_PROXY` as dev-orchestrator runs it, failed in 2.7 s with `project_token_invalid_response` (wrapper class `crash`). The exchange `/api/auth/z/login` had succeeded; the next step, the project token, returned a body the CLI's schema rejects.
+    - The same probe through the HTTP proxy (`ZCODE_HTTP_PROXY=http://127.0.0.1:1082`) passed (20 s).
+    - The desktop app logged the same code at 09:10:37, when the CLI's token sat in its store.
+    - So on this network the two paths of the local proxy client reach Z.ai differently. The project-token API answers one of them with something other than its JSON contract.
+    - The API-key mode is unaffected: it makes no project-token request, and its probe passed over the TUN path at 21:46.
+    - The wrapper now classifies `project_token_*` as `auth` (it was `crash`), so the channel goes down at once with the remedy hint instead of one useless retry.
+  - **The CLI rewrites its credential store on the first successful run after a login.** The store was written at 21:53:26 by the login and again at 21:55:38, during the first successful probe (presumably the project token it keeps in that store). The morning's `credentials.json` time 10:49:46 is likewise the first probe, not the login itself. The file time therefore marks the login only up to the first run.
+  - **Lifetime measurement.** Method:
+    - After the user's next `zcode-dispatch login`, a frozen copy of the v0.8.1 wrapper runs `doctor --probe` 2, 14, 29, 44, 59, 74, 89, 104 and 119 min after the `credentials.json` write, and stops at the first failure.
+    - At each probe it records whether the desktop app runs, the desktop store's file time, the desktop log's auth lines, the local proxy port, the DNS answer for `api.z.ai`, the default interface, every interface's IPv4 and en0's router (`172.20.10.1` = the iPhone hotspot), so a network switch shows between probes.
+    - The uplink stays unchanged during the series. A failure at a stable network and a repeatable time supports H1. A series that survives 119 min supports H4, which a deliberate switch followed by one probe then tests.
+    - After a failure, one control probe runs with `ZCODE_HTTP_PROXY`.
+    - The ZCode desktop app stays closed, so a revocation by the desktop app cannot occur.
+    - First series (OAuth login of 10:49): not run; the login was already dead at 14:24 (see above).
+    - Second series (login 21:53:26): the TUN-path probe failed at +2 min with `project_token_invalid_response`; the proxy-path control passed.
+    - Third series (login 21:53:26): probes through the proxy path at +14, 29, 44, 59, 74, 89, 104 and 119 min, each preceded by a free TUN-path probe while that one kept failing. The uplink stayed on home Wi-Fi (`192.168.1.x`). The desktop app was not running, and its log had no auth line.
+      - +14 min: the TUN-path probe passed, so the TUN path no longer failed and was not probed again.
+      - +14, +29, +44, +59 min: the proxy-path probes passed (usage `input=14262`).
+      - +74.1 min (23:07:29): the proxy-path probe failed with `project_token_login_failed` (3.3 s).
+      - At 23:08 a TUN-path probe and a proxy-path probe both failed the same way. No probe after the failure cost credits.
+    - **Result.** The OAuth login lasts more than 59.3 and at most 74.1 min, most likely one hour; the morning's failure at 76 min fits. Expiry, not the network switch or the desktop app, ends it. The project-token failure at +2 min was a separate path effect that did not recur.
+    - Side effect, as predicted under "Design consequence": the frozen 0.8.1 copy re-pinned the OAuth selection and left the personal config at 0644, inside the 0700 state root. The next `doctor` of the new wrapper restored 0600 and the `zai-api` selection.
+  - **API-key mode (the fix).**
+    - ZCode's built-in config (`zcode-builtin.json` revision 31) declares the provider template `zai-api`, "Z.ai Coding Plan":
+      - access `zhipu-coding-plan-api-key`, with `apiKeyManagementUrl` `https://z.ai/manage-apikey/apikey-list`;
+      - API `anthropic-messages` at `https://api.z.ai/api/anthropic`;
+      - `builtinModelIds` GLM-5.3 and GLM-5.3-Flash, both enabled in `templateModelRules`.
+    - GLM-5.3-Flash takes the reasoning levels `low|high|max` from the model rule `.*glm-5\.3(?:-flash)?…`, whatever the provider.
+    - A personal rule `{"providerId":"zai-api","templateId":"zai-api","config":{"group":"standard-personal","access":{"type":"zhipu-coding-plan-api-key","apiKey":"<key>"}}}` matches the personal schema (`GHi`): personal-only providers use the group `standard-personal`, and `account:` ids may not carry access.
+    - ZCode's own provider creation derives the id `zai-api` from the template id (`aGi`). The CLI's legacy importer maps a `builtin:zai` API key to the same provider id and template.
+    - The key order is the CLI's canonical one (`providers.toJSON`), so the CLI does not rewrite the file.
+    - Such a provider skips the exchange: `createModel` attaches `refreshRuntimeHeadersBeforeAttempt` only for `access.type === "zhipu-account"`; otherwise the static `apiKey` is the request credential. The key is valid until the user revokes it on the key page.
+    - The CLI keeps personal-provider API keys as plain text in the personal config and writes that file privately (`atomicWritePrivateTextFile`, mode 0600). There is no environment-variable indirection for a provider `apiKey`.
+  - **The CLI's own manual API-key login is unreachable headless.**
+    - It exists: `configureCodingPlanApiKey` stores the key encrypted under `account-provider:coding-plan:<provider>:account:<id>:api-key` with `auth-source` `manual`, and `refreshBeforeModelRequest` then uses that key directly.
+    - It is wired only to the TUI command `/login zai-coding-plan-api-key <key>` (`configureApiKeyForTui`).
+    - Headless `zcode login` accepts only `[zai|bigmodel] [--no-browser]`.
+    - The embedded CLI ships without its TUI.
+    - The bundle is an entry point that runs `main`, not a library.
+  - `zcode doctor` prints version and runtime facts only; no CLI verb checks the login without a model request. A failed exchange happens before the model request and costs no quota.
+  - **Verified live at 21:46–21:47 +07.** The user ran `api-key set` with the hidden prompt. Then `doctor --probe` through the new wrapper (released as 0.10.0), without `ZCODE_HTTP_PROXY`, gave:
+    - `ok personal-config … pins GLM-5.3-Flash$max via zai-api`, `ok auth: Coding Plan API key …`, `doctor: ok`;
+    - `model-selected: ok`, `answers: ok`, `usage: input=14256 cached=0 output=5`, `probe: ok`.
+
+    The CLI log shows `providerId: zai-api`, `modelId: GLM-5.3-Flash`, `baseURL: https://api.z.ai/api/anthropic`, provider kind `anthropic`, one attempt, and no runtime-header refresh or project-token event, so no exchange took place. The personal config was 0600 and the state root 0700. The requested reasoning level does not appear in the CLI's JSONL log; the pin carries `max`. It was not confirmed separately for `zai-api` (U1 confirmed it for the account provider from a stream run).
+  - **Open:** whether Coding Plan quota accounting, including the ZCode bonus (U9), differs between API-key and account requests. The CLI classifies `zhipu-coding-plan-api-key` as a Coding Plan access (`TUs`).
+- How verified:
+  - Read-only greps of the bundle `zcode.cjs` (3.15.1), byte offsets approximate:
+
+    | Function | Offset |
+    |---|---|
+    | `ZaiBusinessTokenCache` | 4380492 |
+    | the exchange `fpt` with `/api/auth/z/login` | 4383406 |
+    | `Ota` | 4387138 |
+    | `saveZaiLoginCredentials` | 4393655 |
+    | the account-only `refreshRuntimeHeadersBeforeAttempt` in `createModel` | ~4150775 |
+    | `Coi` / `refreshBeforeModelRequest` | 14361940 |
+    | `persistStandaloneCodingPlanConnection` | 14364876 |
+    | `loginZCodeCli` | 14367675 |
+    | `configureCodingPlanApiKey` | 14369927 |
+    | the `zcode login` usage | 15003098 |
+    | `/login …-api-key` | 15041890 |
+    | `configureApiKeyForTui` | 15092849 |
+    | the personal schema `GHi` | ~547171 |
+    | `aGi` | 570503 |
+    | `atomicWritePrivateTextFile` | 522789 |
+
+  - The app's `zcode-builtin.json`: the templates `zai-api`, `zai-standard-api`, `bigmodel-api`, plus `templateModelRules` and `modelRules`.
+  - Desktop `app.asar`: `ZaiProviderAdapter` (around 280732192) and the OAuth service's `refreshToken`.
+  - The CLI log `<cli-home>/.zcode/cli/log/zcode-2026-10-14.jsonl` (event names, timestamps and error messages; long token-like strings masked).
+  - The desktop log `~/.zcode/v2/logs/2026-10-14.log` (auth-related lines, masked).
+  - File times of both credential stores. No credential file was opened, no token decoded, no login or logout run, no Z.ai API call made.
+- Holds for: ZCode 3.15.1 (zcode 0.16.9)
+- Design consequence (wrapper 0.10.0):
+  - `zcode-dispatch api-key set` reads the user's key from stdin only, never from an argument or a variable. It refuses when the app's built-in config lacks the `zai-api` template (`apiKeyTemplateProblem`). It writes the rule above into the wrapper's personal provider config with mode 0600 and pins `API_KEY_SELECTION`: `zai-api` / GLM-5.3-Flash / `max`. `api-key clear` removes the rule and pins `PINNED_SELECTION` again. Neither verb prints the key.
+  - The pin follows the auth mode on every run (`selectionFor`). A later OAuth `login` keeps the key rule: the CLI's `saveConfiguredDefault` only replaces the default, and the wrapper re-pins to the key.
+  - `doctor` gains the check `auth`: `ok` for the API key, `WARN` for the expiring OAuth login, `FAIL` for a configured key whose template is missing. The probe's auth hint names the mode-specific remedy, and the job log records `auth: api-key|oauth`.
+  - Every installed wrapper copy must be at least 0.10.0 before a key is stored (observed on 2026-10-14; see "Lifetime measurement"). An older wrapper, 0.9.0 included, keeps the key rule but pins `PINNED_SELECTION` (OAuth) again and rewrites the file with the default mode (0644 under umask 022). A 0.10.0 wrapper restores 0600 and the key selection on its next pin.
+  - GLM runs unsandboxed: its shell can read the personal config, whose path is in the CLI's environment, just as it can read the OAuth credential in cli-home. The preamble's no-credentials rule is the only guard in both modes. The wrapper scrubs the key from everything it keeps or prints (`keyRedactor`: raw and JSON-escaped forms in stdout, the response, line-buffered stderr, the job log and the probe's stderr tail). It cannot catch a transformed key, for example an encoded one.
+  - Hardening after review:
+    - The state root, which holds the personal config, is made 0700 on every write.
+    - Read-modify-write of the personal config takes a wrapper lock (`<file>.wrapper-lock`; 5 s wait; a lock older than 30 s counts as stale).
+    - An unreadable or unparseable personal config is reported, never reset.
+    - `task` refuses (exit 2) when a key is configured but the provider config lacks the template.
+    - On a terminal, only Enter accepts the hidden input; Ctrl-C and Ctrl-D cancel it.
 
 ## Environment — what the CLI and its tools read (added after Ф2)
 - Answer:
@@ -196,6 +319,10 @@ VERDICT: GO
 | SELECTION_PATH | config.defaultModelSelection | U1 |
 | PERSONAL_CONFIG_BASE | {"schemaVersion":1,"config":{"providerConfigRules":{"providerRules":[]},"modelConfigRules":{"providerModelRules":[],"manualProviderModelRules":[]}}} | U1 |
 | PINNED_SELECTION | {"providerId":"account:zai-individual-coding-plan","modelId":"GLM-5.3-Flash","options":{"reasoningLevel":"max"}} | U1 |
+| API_KEY_TEMPLATE_ID | zai-api | CLI login lifetime |
+| API_KEY_PROVIDER_ID | zai-api | CLI login lifetime |
+| API_KEY_ACCESS_TYPE | zhipu-coding-plan-api-key | CLI login lifetime |
+| API_KEY_SELECTION | {"providerId":"zai-api","modelId":"GLM-5.3-Flash","options":{"reasoningLevel":"max"}} | CLI login lifetime |
 | RESUME_KEEPS_MODEL | yes | U2 |
 | REPORTED_MODEL_FIELD | none | U3 |
 | USAGE_INPUT_FIELD | inputTokens | U3 |
@@ -213,7 +340,7 @@ VERDICT: GO
 | SESSION_SAVED_ON_SIGTERM | yes | U7 |
 | INTERFERING_PLUGINS | none | U8 |
 | PATTERN_MODEL_NOT_SELECTED | Select a model before continuing;Model creation failed | U4 |
-| PATTERN_AUTH | 401;unauthorized;not logged in;login;token expired;credential;authentication failed | U4 |
+| PATTERN_AUTH | 401;unauthorized;not logged in;login;token expired;credential;authentication failed;project_token_ | U4; CLI login lifetime |
 | PATTERN_QUOTA | 429;quota;rate limit;usage limit;insufficient;balance;usage_limit_exceeded;spend_limit_exceeded;coding_plan_required | U4 |
 | PATTERN_LAUNCH | ZCODE_BUILTIN_PROVIDER;provider config;Cannot find module;Cannot find package;Failed to load environment file;ZCode app factory is unavailable;Provider Registry runtime is unavailable | U4 |
 

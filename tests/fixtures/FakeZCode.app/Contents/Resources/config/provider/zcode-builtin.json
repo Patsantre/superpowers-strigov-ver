@@ -1,1 +1,21 @@
-{}
+{
+  "schemaVersion": 1,
+  "revision": 0,
+  "config": {
+    "providerConfigRules": {
+      "templateRules": [
+        {
+          "templateId": "zai-api",
+          "templateNameMap": { "zh-CN": "Z.ai Coding Plan", "en-US": "Z.ai Coding Plan" },
+          "config": {
+            "access": { "type": "zhipu-coding-plan-api-key", "apiKeyManagementUrl": "https://z.ai/manage-apikey/apikey-list" },
+            "api": { "type": "anthropic-messages", "baseUrl": "https://api.z.ai/api/anthropic" },
+            "builtinModelIds": ["GLM-5.3", "GLM-5.3-Flash"]
+          }
+        }
+      ],
+      "providerRules": []
+    },
+    "modelConfigRules": {}
+  }
+}
