@@ -35,7 +35,7 @@ npm install -g @openai/codex
 codex login
 ```
 
-Необязательно — имплементер по умолчанию, **GLM-5.3-Flash через ZCode от Z.ai**: установите [ZCode.app](https://github.com/zai-org/ZCode) в `/Applications` и один раз войдите в его CLI под аккаунтом GLM Coding Plan через `zcode login zai` (точная команда — в скилле `zcode-invocation`, раздел «One-time setup»). Без этого `zcode-dispatch doctor` не проходит, и пайплайн реализует фазы на Codex Luna `max` — с объявлением, никогда молча.
+Необязательно — имплементер по умолчанию, **GLM-5.3-Flash через ZCode от Z.ai**: установите [ZCode.app](https://github.com/zai-org/ZCode) в `/Applications` и один раз войдите в его CLI под аккаунтом GLM Coding Plan через `zcode-dispatch login` — команда запускает собственный `zcode login zai` от ZCode в отдельном каталоге данных CLI, принадлежащем обёртке, поэтому вход в десктопном приложении ZCode не затрагивается; повторите вход, когда логин CLI истечёт (подробности — в скилле `zcode-invocation`, раздел «One-time setup»). Без этого `zcode-dispatch doctor` не проходит, и пайплайн реализует фазы на Codex Luna `max` — с объявлением, никогда молча.
 
 ### 2. Установите плагин
 
@@ -127,7 +127,7 @@ Companion runtime уже вендорится. Отдельный Claude Code-п
 | `/dev` | Явная точка входа в полный протокол |
 | `bin/review-package` | Генерирует готовые для ревьюера пакеты коммитов и diff |
 | `bin/sdd-workspace` | Резолвит изолированные scratch-workspace для каждого плана |
-| `bin/zcode-dispatch` | Обёртка задач ZCode CLI: task/status/result/cancel/release-stale/doctor с закреплёнными моделью, режимом и идентификацией клиента; `release-stale` освобождает резервацию рабочего дерева, оставленную упавшей задачей, после проверки, что та мертва |
+| `bin/zcode-dispatch` | Обёртка задач ZCode CLI: task/status/result/cancel/release-stale/doctor/login с закреплёнными моделью, режимом и идентификацией клиента; `release-stale` освобождает резервацию рабочего дерева, оставленную упавшей задачей, после проверки, что та мертва |
 
 ### Адаптированные скиллы Superpowers
 

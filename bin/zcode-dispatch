@@ -7,7 +7,7 @@
 # execs node. The .mjs drives Z.ai's own ZCode CLI (embedded in
 # /Applications/ZCode.app) headless — never the Z.ai API directly.
 #
-# Usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor> [args...]
+# Usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor|login> [args...]
 set -eu
 
 resolve_mjs() {

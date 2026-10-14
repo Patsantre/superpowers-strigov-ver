@@ -139,8 +139,31 @@ main() {
     export ZCODE_APP="$FIX/FakeZCode.app"
     export ZCODE_BIN="$FIX/zcode-stub.cjs"
     export ZCODE_STATE_DIR="$TEST_ROOT/state"
-    unset ZCODE_NODE ZCODE_TASK_TIMEOUT_MIN SP_IMPLEMENTER ZCODE_DATA_BASE_DIR
-    unset ZCODE_STUB_MODE ZCODE_STUB_RECORD ZCODE_STUB_DELAY_MS ZCODE_STUB_MESSAGE
+    unset ZCODE_NODE ZCODE_TASK_TIMEOUT_MIN SP_IMPLEMENTER ZCODE_DATA_BASE_DIR ZCODE_HTTP_PROXY
+    unset ZCODE_STORAGE_DIR ZCODE_SESSION_DB_PATH ZCODE_SESSION_DB ZCODE_LOG_DIR
+    unset ZCODE_STUB_MODE ZCODE_STUB_RECORD ZCODE_STUB_DELAY_MS ZCODE_STUB_MESSAGE ZCODE_STUB_EXIT
+    # The CLI's own state (Ф4a): every CLI run gets ZCODE_DATA_BASE_DIR=<state root>/cli-home plus the
+    # storage-root, session-database and log overrides under it, and no inherited ZCODE_SESSION_DB alias.
+    local cli_home="$ZCODE_STATE_DIR/cli-home"
+    # cli_home_env_ok <record> — the recorded CLI run got the cli-home environment, so the stub's model of
+    # the CLI's resolvers (record field `resolved`) puts the credential store, storage root, session
+    # database and logs under cli-home. The user config ~/.zcode/cli/config.json has no override (C3).
+    cli_home_env_ok() {
+        REC="$1" CLI_HOME="$cli_home" node -e '
+const fs = require("node:fs");
+const r = JSON.parse(fs.readFileSync(process.env.REC, "utf8"));
+const h = process.env.CLI_HOME;
+const ok = r.env.ZCODE_DATA_BASE_DIR === h
+  && r.env.ZCODE_STORAGE_DIR === `${h}/.zcode`
+  && r.env.ZCODE_SESSION_DB_PATH === `${h}/.zcode/cli/db/db.sqlite`
+  && r.env.ZCODE_LOG_DIR === `${h}/.zcode/cli/log`
+  && r.env.ZCODE_SESSION_DB === null
+  && r.resolved.credentials === `${h}/.zcode/v2/credentials.json`
+  && r.resolved.storageDir === `${h}/.zcode`
+  && r.resolved.sessionDb === `${h}/.zcode/cli/db/db.sqlite`
+  && r.resolved.logDir === `${h}/.zcode/cli/log`;
+process.exit(ok ? 0 : 1);'
+    }
 
     git init -q -b main "$TEST_ROOT/repo"
     local repo
@@ -182,7 +205,10 @@ main() {
 
     # --- 2. pinned argv and environment ---
     export ZCODE_STUB_MODE=record ZCODE_STUB_RECORD="$TEST_ROOT/record.json"
-    id="$(start_task --prompt-file "$prompt")"
+    # Inherited values (e.g. the user's own) must be overridden with the cli-home ones; the alias is dropped.
+    id="$(ZCODE_DATA_BASE_DIR="$TEST_ROOT/foreign-data-home" ZCODE_STORAGE_DIR="$TEST_ROOT/foreign-storage" \
+        ZCODE_SESSION_DB_PATH="$TEST_ROOT/foreign.sqlite" ZCODE_SESSION_DB="$TEST_ROOT/foreign-alias.sqlite" \
+        ZCODE_LOG_DIR="$TEST_ROOT/foreign-log" start_task --prompt-file "$prompt")"
     st="$(wait_status "$id" 'completed|failed|cancelled' 20)"
     local transport plist_key want_version cfg
     transport="$(const_of PROMPT_TRANSPORT)"
@@ -190,7 +216,7 @@ main() {
     want_version="$(plutil -extract "$plist_key" raw -o - "$ZCODE_APP/Contents/Info.plist")"
     cfg="$ZCODE_APP/Contents/Resources/config/provider/zcode-builtin.json"
     if [[ "$st" == completed ]] && REC="$TEST_ROOT/record.json" PROMPT="$prompt" ROOT="$repo" \
-        TRANSPORT="$transport" CFG="$cfg" VER="$want_version" \
+        TRANSPORT="$transport" CFG="$cfg" VER="$want_version" CLI_HOME="$cli_home" \
         MODEL_ARGS="$(const_of MODEL_ARGS)" DISALLOWED="$(const_of DISALLOWED_TOOLS)" node -e '
 const fs = require("node:fs");
 const r = JSON.parse(fs.readFileSync(process.env.REC, "utf8"));
@@ -210,11 +236,11 @@ const ok = pair("--output-format", "json") && pair("--mode", "yolo") && pair("--
   && r.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE === process.env.CFG
   && r.env.ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE === process.env.CFG
   && r.env.ZCODE_APP_VERSION === process.env.VER
-  && r.env.ZCODE_DATA_BASE_DIR === null;
-process.exit(ok ? 0 : 1);'; then
-        pass "2 CLI argv pins json/yolo/terminal/workflow-disabled/--cwd root, prompt per PROMPT_TRANSPORT, env = provider config x2 + app version, no ZCODE_DATA_BASE_DIR"
+  && (fs.statSync(process.env.CLI_HOME).mode & 0o777) === 0o700;
+process.exit(ok ? 0 : 1);' && cli_home_env_ok "$TEST_ROOT/record.json"; then
+        pass "2 CLI argv pins json/yolo/terminal/workflow-disabled/--cwd root, prompt per PROMPT_TRANSPORT, env = provider config x2 + app version + the cli-home env (credentials, storage, session db, logs under <state root>/cli-home, mode 0700; inherited values overridden)"
     else
-        fail "2 CLI argv pins json/yolo/terminal/workflow-disabled/--cwd root, prompt per PROMPT_TRANSPORT, env = provider config x2 + app version, no ZCODE_DATA_BASE_DIR"
+        fail "2 CLI argv pins json/yolo/terminal/workflow-disabled/--cwd root, prompt per PROMPT_TRANSPORT, env = provider config x2 + app version + the cli-home env (credentials, storage, session db, logs under <state root>/cli-home, mode 0700; inherited values overridden)"
         echo "    status: $st record: $(cat "$TEST_ROOT/record.json" 2>/dev/null | head -c 600)"
     fi
 
@@ -757,13 +783,14 @@ process.exit(injected && runner.status === "cancelled" && m.readRecord(file).sta
     rc=0
     out="$("$ZD" doctor)" || rc=$?
     local checks=0 c
-    for c in app cli provider-config node app-version git state-dir personal-config kill-switch; do
+    for c in app cli provider-config node app-version git state-dir cli-home personal-config kill-switch; do
         if grep -Eq "^(ok|WARN) $c: " <<<"$out"; then checks=$((checks + 1)); fi
     done
-    if [[ "$rc" -eq 0 && "$checks" -eq 9 && "$(tail -1 <<<"$out")" == "doctor: ok" ]] && ! grep -q '^FAIL' <<<"$out"; then
-        pass "11 doctor against the fixtures: 9 checks ok/WARN, 'doctor: ok', exit 0"
+    if [[ "$rc" -eq 0 && "$checks" -eq 10 && "$(tail -1 <<<"$out")" == "doctor: ok" ]] && ! grep -q '^FAIL' <<<"$out" \
+        && grep -Fqx "ok cli-home: $cli_home" <<<"$out"; then
+        pass "11 doctor against the fixtures: 10 checks ok/WARN ('ok cli-home: <state root>/cli-home'), 'doctor: ok', exit 0"
     else
-        fail "11 doctor against the fixtures: 9 checks ok/WARN, 'doctor: ok', exit 0"
+        fail "11 doctor against the fixtures: 10 checks ok/WARN ('ok cli-home: <state root>/cli-home'), 'doctor: ok', exit 0"
         echo "    exit: $rc"
         echo "$out" | sed 's/^/    /'
     fi
@@ -814,6 +841,75 @@ process.exit(injected && runner.status === "cancelled" && m.readRecord(file).sta
         echo "    exit: $rc"
         echo "$out" | sed 's/^/    /'
     fi
+
+    rc=0
+    ZCODE_STUB_MODE=record ZCODE_STUB_RECORD="$TEST_ROOT/probe-record.json" "$ZD" doctor --probe >/dev/null 2>&1 || rc=$?
+    if [[ -f "$TEST_ROOT/probe-record.json" ]] && cli_home_env_ok "$TEST_ROOT/probe-record.json"; then
+        pass "12 doctor --probe runs the CLI with the cli-home env (credentials, storage, session db, logs under <state root>/cli-home)"
+    else
+        fail "12 doctor --probe runs the CLI with the cli-home env (credentials, storage, session db, logs under <state root>/cli-home)"
+        echo "    exit: $rc record: $(head -c 400 "$TEST_ROOT/probe-record.json" 2>/dev/null)"
+    fi
+    rc=0
+    out="$(ZCODE_STUB_MODE=auth ZCODE_STUB_MESSAGE="$(first_pattern auth)" "$ZD" doctor --probe 2>"$TEST_ROOT/probe-auth.err")" || rc=$?
+    if [[ "$rc" -eq 1 && "$out" == *"model-selected: FAIL(auth)"* && "$(tail -1 <<<"$out")" == "probe: FAIL" ]] \
+        && grep -Fq "run: zcode-dispatch login" "$TEST_ROOT/probe-auth.err"; then
+        pass "12 doctor --probe with auth: FAIL(auth), exit 1, stderr hint 'run: zcode-dispatch login'"
+    else
+        fail "12 doctor --probe with auth: FAIL(auth), exit 1, stderr hint 'run: zcode-dispatch login'"
+        echo "    exit: $rc stderr: $(tail -3 "$TEST_ROOT/probe-auth.err")"
+        echo "$out" | sed 's/^/    /'
+    fi
+    rc=0
+    out="$(ZCODE_STUB_MODE=quota ZCODE_STUB_MESSAGE="$(first_pattern quota)" "$ZD" doctor --probe 2>"$TEST_ROOT/probe-quota.err")" || rc=$?
+    if [[ "$rc" -eq 1 && "$out" == *"model-selected: FAIL(quota)"* ]] && ! grep -Fq "zcode-dispatch login" "$TEST_ROOT/probe-quota.err"; then
+        pass "12 doctor --probe with quota: FAIL(quota), no login hint"
+    else
+        fail "12 doctor --probe with quota: FAIL(quota), no login hint"
+        echo "    exit: $rc stderr: $(tail -3 "$TEST_ROOT/probe-quota.err")"
+    fi
+
+    # --- 14. login: the CLI's own `zcode login zai` in the wrapper's cli-home (Ф4a) ---
+    local login_out
+    rc=0
+    login_out="$(ZCODE_STUB_MODE=login ZCODE_STUB_RECORD="$TEST_ROOT/login-record.json" ZCODE_HTTP_PROXY=http://127.0.0.1:9 \
+        ZCODE_DATA_BASE_DIR="$TEST_ROOT/foreign-data-home" "$ZD" login 2>&1)" || rc=$?
+    if [[ "$rc" -eq 0 && "$login_out" == *"https://example.invalid/stub-login"* && "$login_out" == *"login: ok"* \
+        && "$login_out" != *"stub-secret-token"* && -f "$cli_home/.zcode/v2/credentials.json" \
+        && ! -e "$HOME/.zcode" && ! -e "$TEST_ROOT/foreign-data-home" ]] \
+        && REC="$TEST_ROOT/login-record.json" CFG="$cfg" VER="$want_version" PCFG="$pcfg" CLI_HOME="$cli_home" \
+        SEL_PATH="$sel_path" PINNED="$pinned" node -e '
+const fs = require("node:fs");
+const r = JSON.parse(fs.readFileSync(process.env.REC, "utf8"));
+const after = JSON.parse(fs.readFileSync(process.env.PCFG, "utf8"));
+const at = (o) => process.env.SEL_PATH.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
+const ok = JSON.stringify(r.argv) === JSON.stringify(["login", "zai"])
+  && r.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE === process.env.CFG
+  && r.env.ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE === process.env.CFG
+  && r.env.ZCODE_APP_VERSION === process.env.VER
+  && r.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE === process.env.PCFG
+  && r.env.ZCODE_HTTP_PROXY === "http://127.0.0.1:9"
+  && after.config?.loginWrote === true
+  && JSON.stringify(at(after)) === process.env.PINNED;
+process.exit(ok ? 0 : 1);' && cli_home_env_ok "$TEST_ROOT/login-record.json"; then
+        pass "14 login (no argument = zai) runs 'login zai' with the wrapper env (provider config x2, app version, personal config, the cli-home env, inherited ZCODE_HTTP_PROXY), exit 0, then re-pins PINNED_SELECTION; the credential lands only under cli-home and is never printed"
+    else
+        fail "14 login (no argument = zai) runs 'login zai' with the wrapper env (provider config x2, app version, personal config, the cli-home env, inherited ZCODE_HTTP_PROXY), exit 0, then re-pins PINNED_SELECTION; the credential lands only under cli-home and is never printed"
+        echo "    exit: $rc out: $login_out"
+        echo "    record: $(head -c 600 "$TEST_ROOT/login-record.json" 2>/dev/null)"
+    fi
+    rc=0
+    login_out="$(ZCODE_STUB_MODE=login ZCODE_STUB_EXIT=7 "$ZD" login zai 2>&1)" || rc=$?
+    if [[ "$rc" -eq 7 && "$login_out" != *"login: ok"* ]]; then
+        pass "14 login zai returns the CLI's exit code (7) and reports no success"
+    else
+        fail "14 login zai returns the CLI's exit code (7) and reports no success"
+        echo "    exit: $rc out: $login_out"
+    fi
+    expect_exit 2 "14 login with a provider other than zai is refused (exit 2)" "$ZD" login bigmodel
+    expect_exit 2 "14 login with an extra argument is refused (exit 2)" "$ZD" login zai extra
+    expect_exit 2 "14 login with an unknown flag is refused (exit 2)" "$ZD" login --bogus
+    expect_exit 2 "14 login with ZCODE_APP without a readable Info.plist is refused (exit 2)" env ZCODE_APP="$TEST_ROOT/NoPlist.app" "$ZD" login
 
     echo ""
     if [[ "$FAILURES" -ne 0 ]]; then

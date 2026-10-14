@@ -142,6 +142,35 @@ VERDICT: GO
 - Holds for: ZCode 3.15.1 (zcode 0.16.9)
 - Design consequence: `APP_VERSION_PLIST_KEY = CFBundleShortVersionString`, `VERIFIED_APP_VERSION = 3.15.1`.
 
+## CLI data home — why the wrapper's CLI keeps its credentials and state out of `~/.zcode` (2026-10-14)
+- Answer: The CLI's standalone login and the ZCode desktop app keep their Z.ai login in one credential store under one key, but store different token kinds there, so each login invalidates the other. The wrapper therefore gives the CLI its own credential store, and its own state directories wherever the CLI offers an override.
+  - Both resolve the store as `<ZCODE_DATA_BASE_DIR, else $HOME>/.zcode/v2/credentials.json`, and both use the key `oauth:zai:access_token`.
+  - The desktop app exchanges its OAuth token for a business token (`exchangeToken`) and stores the exchanged token in that key.
+  - The CLI's `zcode login zai` stores its OAuth token there. Before every model request (`refreshBeforeModelRequest`) the CLI exchanges the stored token via `POST https://api.z.ai/api/auth/z/login`. With the desktop app's token in the key, that exchange fails with `project_token_login_failed`, so every CLI run fails. With the CLI's token in the key, the desktop app rejects it and asks the user to sign in again.
+  - The CLI login stores no refresh token, so it also expires on its own; the CLI then fails the same way until the user logs in again.
+  - `ZCODE_DATA_BASE_DIR` moves only the credential store. The headless path (`runPrompt` → `INn`) resolves its other state separately; each resolver and its override (bundle 3.15.1, env names exact):
+
+    | State | Resolver | Default location | Override |
+    |---|---|---|---|
+    | Credentials | `Vta` | `~/.zcode/v2/credentials.json` | `ZCODE_DATA_BASE_DIR` (→ `<dir>/.zcode/v2/credentials.json`) |
+    | Storage root: plugins, rollouts, memories (`<root>/cli/…`) | `storage.dir` in the merged config (`Fm` default), `K0` → `hU` | `~/.zcode` | `ZCODE_STORAGE_DIR` (env config `egn`, scope Env, above user and project config) |
+    | Session database | `vae` → `LYo` (`storage.sessionDbPath`, `Fm` default; not derived from `storage.dir`) | `~/.zcode/cli/db/db.sqlite` | `ZCODE_SESSION_DB_PATH`, alias `ZCODE_SESSION_DB` (env config `egn`) |
+    | Logs | `JB` → `xGs` | `~/.zcode/cli/log` | `ZCODE_LOG_DIR` (read from the env the headless entry passes) |
+    | User config | `Ig` → `yLe` | `~/.zcode/cli/config.json` | none: only a programmatic `userConfigPath` / `skipUserConfig`; `parseGlobalArgs` has no flag for it, no env name exists, and `HOME` is ruled out |
+
+  - The user config stays the CLI's normal shared file, also used by the desktop app's embedded agent. Every CLI run reads it; when it holds a legacy plugin id, the CLI rewrites it once in place (`cJs` → `lJs`, a temp file and rename). The design neither edits it nor isolates it.
+  - Not covered by the overrides above (defaults seen in the bundle, not verified as used on this path): the workflow store `~/.zcode/cli/workflows` (the wrapper runs `--workflow-mode disabled`), the session mailbox `~/.zcode/mailbox` (only with `ZCODE_MESSAGE_ENABLED`; override `ZCODE_MAILBOX_ROOT`), and the model-telemetry device id `~/.zcode/v2/telemetry-state.json` (`Wnc`, telemetry only; override `ZCODE_HOME`).
+- How verified:
+  - Bundle `zcode.cjs` (3.15.1): the credential-path resolver `Vta` (`ZCODE_DATA_BASE_DIR`, else the home directory, joined with `.zcode/v2/credentials.json`); the credential key table (`zaiAccessToken: "oauth:zai:access_token"`); `refreshBeforeModelRequest` (around byte offset 14361400); the exchange request to `/api/auth/z/login` and its error code `project_token_login_failed` (around byte offset 4381206).
+  - Bundle `zcode.cjs` (3.15.1), resolver table (read-only greps, ledger PC1-B1): `INn` (around byte offset 14332455) calls `Ig({env, userConfigPath, skipUserConfig, …})` and `JB({env})`, then `K0(config.storage.dir)` → `hU` (`<root>/cli`) and `LYo` → `vae` (`storage.sessionDbPath`); `Fm` (around 1364193) holds the defaults `storage: {dir: "~/.zcode", sessionDbPath: "~/.zcode/cli/db/db.sqlite"}`; `egn` (around 4185159) maps `ZCODE_STORAGE_DIR` / `ZCODE_SESSION_DB_PATH` / `ZCODE_SESSION_DB` into the Env scope (priority 40, above User 10 and Project 20); `JB` (around 4165465) takes `logDir ?? env.ZCODE_LOG_DIR ?? xGs()`; `yLe` (around 4178373) reads `userConfigPath ?? ~/.zcode/cli/config.json` and `lJs` rewrites it after the plugin-id migration; the headless entry takes `userConfigPath` / `skipUserConfig` only from injected deps, and `parseGlobalArgs` (bundle start) has no config-path flag; the CLI's env sanitizer (`C$t`) keeps all four override names.
+  - Desktop app `app.asar`, `out/host/index.js`: `exchangeToken` stores the exchanged business token under the same key.
+  - Live, 2026-10-14 (the Ф5 BLOCKED diagnosis): the desktop app's log `~/.zcode/v2/logs/2026-10-14.log` shows the desktop app rejecting the CLI-written token at 09:10:36; the user signed the desktop app in again at 09:10:59.
+- Holds for: ZCode 3.15.1 (zcode 0.16.9)
+- Design consequence (plan Ф4a):
+  - Every wrapper CLI run (task runner, `doctor --probe`, `login`) sets `ZCODE_DATA_BASE_DIR=<ZCODE_STATE_DIR>/cli-home` (a directory the wrapper creates with mode 0700), `ZCODE_STORAGE_DIR=<cli-home>/.zcode`, `ZCODE_SESSION_DB_PATH=<cli-home>/.zcode/cli/db/db.sqlite` and `ZCODE_LOG_DIR=<cli-home>/.zcode/cli/log`, and drops an inherited `ZCODE_SESSION_DB`. The wrapper never edits the user's `~/.zcode` or the desktop app's files; the CLI's own read (and one-time migration) of `~/.zcode/cli/config.json` remains, because no override exists for it.
+  - The user logs the CLI in with `zcode-dispatch login`, which runs `zcode login zai` with the wrapper's environment and re-pins the model afterwards. That is needed once per machine, and again whenever the login expires: `doctor --probe` FAIL(auth) or FAIL(model-not-selected) prints the hint `run: zcode-dispatch login`.
+  - Sessions of CLI runs made before the change live in `~/.zcode/cli/db/db.sqlite` and cannot be resumed from the new session database. The CLI seeds the bundled official plugins into the new storage root itself (`Drc`, error code `ZCODE_PLUGIN_SEED_INCOMPLETE`); which plugins are enabled still comes from the merged config, including the shared user config. The U8 plugin list was read with the old storage root and is not re-verified for the new one.
+
 ## Inputs for later phases
 
 | Key | Value | Evidence |

@@ -35,7 +35,7 @@ npm install -g @openai/codex
 codex login
 ```
 
-Optional — the default implementer, **GLM-5.3-Flash via Z.ai's ZCode**: install [ZCode.app](https://github.com/zai-org/ZCode) into `/Applications`, then log its CLI in once with your GLM Coding Plan account via `zcode login zai` (the exact command is in the `zcode-invocation` skill, "One-time setup"). Without it, `zcode-dispatch doctor` fails and the pipeline implements on Codex Luna `max` instead — announced, never silent.
+Optional — the default implementer, **GLM-5.3-Flash via Z.ai's ZCode**: install [ZCode.app](https://github.com/zai-org/ZCode) into `/Applications`, then log its CLI in once with your GLM Coding Plan account via `zcode-dispatch login` — it runs ZCode's own `zcode login zai` in the wrapper's separate CLI home, so the ZCode desktop app's login stays untouched; repeat it when the CLI login expires (details in the `zcode-invocation` skill, "One-time setup"). Without it, `zcode-dispatch doctor` fails and the pipeline implements on Codex Luna `max` instead — announced, never silent.
 
 ### 2. Install the plugin
 
@@ -127,7 +127,7 @@ Every role runs on a pinned model + effort pair. Claude subagents receive an exp
 | `/dev` | Explicit entry point for the full delivery protocol |
 | `bin/review-package` | Generates reviewer-ready commit and diff packages |
 | `bin/sdd-workspace` | Resolves isolated per-plan scratch workspaces |
-| `bin/zcode-dispatch` | ZCode CLI job wrapper: task/status/result/cancel/release-stale/doctor with pinned model, mode and client identification; `release-stale` frees a workspace reservation left by a crashed job, after verifying it is dead |
+| `bin/zcode-dispatch` | ZCode CLI job wrapper: task/status/result/cancel/release-stale/doctor/login with pinned model, mode and client identification; `release-stale` frees a workspace reservation left by a crashed job, after verifying it is dead |
 
 ### Adapted Superpowers skills
 

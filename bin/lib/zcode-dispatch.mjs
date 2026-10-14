@@ -3,12 +3,17 @@
 // Codex companion: task / status / result / cancel / doctor.
 //
 // Pure Node ESM, no dependencies, no shell: every child process is spawned with
-// an argv array. Never reads or writes ~/.zcode, never sets ZCODE_DATA_BASE_DIR,
-// never calls the Z.ai API itself — the ZCode CLI is the only channel. The model pin
-// travels in the wrapper's own personal provider config under the state root
-// (ZCODE_PERSONAL_PROVIDER_CONFIG_FILE); the CLI login is the user's `zcode login zai`.
+// an argv array. Never reads or writes the user's ~/.zcode (shared with the desktop
+// app): every CLI run gets the cli-home environment — ZCODE_DATA_BASE_DIR=<state root>/cli-home
+// for the CLI's credentials, plus ZCODE_STORAGE_DIR, ZCODE_SESSION_DB_PATH and ZCODE_LOG_DIR
+// under it for its plugins/rollouts, sessions and logs. The CLI's user config
+// ~/.zcode/cli/config.json has no override and stays the CLI's own shared file. Never reads
+// those credentials and never calls the Z.ai API itself — the ZCode CLI is the only channel.
+// The model pin travels in the wrapper's own personal provider config under the state
+// root (ZCODE_PERSONAL_PROVIDER_CONFIG_FILE); the CLI login is the user's
+// `zcode-dispatch login`, which runs the CLI's own `zcode login zai` in that home.
 //
-// Usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor> [args...]
+// Usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor|login> [args...]
 // Exit codes: 0 success · 1 runtime failure · 2 usage error or guard refusal.
 
 import { spawn, spawnSync } from "node:child_process";
@@ -75,6 +80,32 @@ function stateRoot(env = process.env) {
 }
 
 const personalConfigFile = (env = process.env) => path.join(stateRoot(env), "personal-provider-config.json");
+
+// The CLI's own home for its credentials and state, apart from the user's ~/.zcode, whose credential
+// key the desktop app rewrites with a different token kind (docs/zcode-cli-findings.md, "CLI data home").
+// The CLI resolves each location separately, so cliHomeEnv sets one override per resolver that has one;
+// its user config ~/.zcode/cli/config.json has none (only HOME, which the wrapper never overrides).
+// The wrapper creates the directory (mode 0700) and never reads what the CLI keeps there.
+const cliHome = (env = process.env) => path.join(stateRoot(env), "cli-home");
+
+function cliHomeEnv() {
+  const home = cliHome();
+  const storage = path.join(home, ".zcode");
+  return {
+    ZCODE_DATA_BASE_DIR: home, // credentials: <cli-home>/.zcode/v2/credentials.json
+    ZCODE_STORAGE_DIR: storage, // storage root: plugins, rollouts, memories under <cli-home>/.zcode/cli/
+    ZCODE_SESSION_DB_PATH: path.join(storage, "cli", "db", "db.sqlite"), // not derived from the storage root
+    ZCODE_LOG_DIR: path.join(storage, "cli", "log"),
+  };
+}
+
+function ensureCliHome() {
+  const dir = cliHome();
+  fs.mkdirSync(stateRoot(), { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  return dir;
+}
 
 function readAppVersion(plist) {
   const r = spawnSync("plutil", ["-extract", APP_VERSION_PLIST_KEY, "raw", "-o", "-", plist], { encoding: "utf8" });
@@ -497,14 +528,18 @@ export function buildCliArgv({ bin, prompt, workspaceRoot, sessionId }) {
 }
 
 function buildCliEnv(paths, appVersion) {
-  return {
+  const env = {
     ...process.env,
     ...MODEL_ENV,
     ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: paths.providerConfig,
     ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: paths.providerConfig,
     ZCODE_APP_VERSION: appVersion,
     ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: personalConfigFile(),
+    ...cliHomeEnv(),
   };
+  // The CLI also reads ZCODE_SESSION_DB as an alias of ZCODE_SESSION_DB_PATH; an inherited one could win.
+  delete env.ZCODE_SESSION_DB;
+  return env;
 }
 
 function summarizeArgv(argv) {
@@ -781,6 +816,12 @@ async function runJob(id, jobsDir, token) {
       finalizeRecord(file, { status: "failed", errorClass: "launch", note: `cannot write the personal provider config: ${error.message}` });
       return 1;
     }
+    try {
+      ensureCliHome();
+    } catch (error) {
+      finalizeRecord(file, { status: "failed", errorClass: "launch", note: `cannot create the CLI home: ${error.message}` });
+      return 1;
+    }
     const paths = zcodePaths();
     const argv = buildCliArgv({ bin: paths.bin, prompt, workspaceRoot: record.workspaceRoot, sessionId: record.resumeOf ? record.sessionId : null });
     appendLog(log, `start ${id}: ${JSON.stringify(paths.node)} ${summarizeArgv(argv)}`);
@@ -921,6 +962,11 @@ async function cmdDoctor(args) {
     report("FAIL", "state-dir", `${stateRoot()} is not writable: ${error.message}`);
   }
   try {
+    report("ok", "cli-home", ensureCliHome());
+  } catch (error) {
+    report("FAIL", "cli-home", `cannot create ${cliHome()}: ${error.message}`);
+  }
+  try {
     pinPersonalConfig(personalConfigFile());
     const selection = pick(readJson(personalConfigFile()) ?? {}, SELECTION_PATH);
     if (JSON.stringify(selection) === JSON.stringify(PINNED_SELECTION)) report("ok", "personal-config", `${personalConfigFile()} pins ${PINNED_MODEL}`);
@@ -940,6 +986,7 @@ async function cmdDoctor(args) {
 // One synchronous PONG request: the only diagnostic that spends quota.
 async function runProbe(paths, appVersion, root) {
   pinPersonalConfig(personalConfigFile());
+  ensureCliHome();
   const argv = buildCliArgv({ bin: paths.bin, prompt: PROBE_PROMPT, workspaceRoot: root, sessionId: null });
   const result = await runCli({
     node: paths.node,
@@ -972,7 +1019,37 @@ async function runProbe(paths, appVersion, root) {
     ].join("\n") + "\n",
   );
   if (!modelSelected && result.stderrTail.trim()) process.stderr.write(`${result.stderrTail.split("\n").slice(-20).join("\n")}\n`);
+  if (verdict.errorClass === "auth" || verdict.errorClass === "model-not-selected") {
+    process.stderr.write(
+      `hint: the ZCode CLI is not logged in (or its login expired) in ${cliHome()}; run: zcode-dispatch login (prefix ZCODE_HTTP_PROXY=<proxy url> if the CLI needs a proxy on this machine)\n`,
+    );
+  }
   return ok ? 0 : 1;
+}
+
+// `login [zai]` — the user's CLI login, in the foreground: the CLI's own `zcode login zai` with exactly
+// the environment of every wrapper run (buildCliEnv: provider config, real app version, the wrapper's
+// personal config, the cli-home environment, inherited ZCODE_HTTP_PROXY), stdio inherited so the
+// user sees the browser URL. The login rewrites the personal config's default selection, so a successful
+// login is followed by a re-pin. Exit code = the CLI's. Never reads or prints a credential.
+function cmdLogin(args) {
+  const { positionals } = parse(args, {}, 1);
+  if (positionals.length === 1 && positionals[0] !== "zai") throw new UsageError(`login supports only the zai provider, got "${positionals[0]}"`);
+  const paths = zcodePaths();
+  const appVersion = readAppVersion(paths.plist);
+  if (!appVersion) throw new UsageError(`cannot read ${APP_VERSION_PLIST_KEY} from ${paths.plist}; refusing to run with an unknown client version`);
+  if (!fs.existsSync(paths.bin)) throw new UsageError(`ZCode CLI not found: ${paths.bin}`);
+  if (!fs.existsSync(paths.providerConfig)) throw new UsageError(`ZCode provider config not found: ${paths.providerConfig}`);
+  const home = ensureCliHome();
+  const run = spawnSync(paths.node, [paths.bin, "login", "zai"], { env: buildCliEnv(paths, appVersion), stdio: "inherit" });
+  if (run.error) throw new Error(`cannot run ${paths.node} ${paths.bin} login zai: ${run.error.message}`);
+  if (run.status !== 0) {
+    process.stderr.write(`zcode-dispatch: login failed (CLI ${run.status === null ? `signal ${run.signal}` : `exit ${run.status}`}); nothing re-pinned\n`);
+    return run.status ?? 1;
+  }
+  pinPersonalConfig(personalConfigFile());
+  process.stdout.write(`login: ok — ZCode CLI login stored in ${home}; ${personalConfigFile()} re-pinned to ${PINNED_MODEL}\n`);
+  return 0;
 }
 
 export async function main(argv) {
@@ -991,10 +1068,12 @@ export async function main(argv) {
         return cmdReleaseStale(rest);
       case "doctor":
         return await cmdDoctor(rest);
+      case "login":
+        return cmdLogin(rest);
       case "__run":
         return await runJob(rest[0], rest[1], rest[2]);
       default:
-        throw new UsageError(`usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor> [args...]${verb ? ` (unknown verb: ${verb})` : ""}`);
+        throw new UsageError(`usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor|login> [args...]${verb ? ` (unknown verb: ${verb})` : ""}`);
     }
   } catch (error) {
     process.stderr.write(`zcode-dispatch: ${error.message}\n`);

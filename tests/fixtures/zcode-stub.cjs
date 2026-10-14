@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 // Test stand-in for ZCode's zcode.cjs, selected via ZCODE_BIN. Never calls a model.
-// ZCODE_STUB_MODE: ok | pong | resume | record | model-not-selected | auth | quota |
+// ZCODE_STUB_MODE: ok | pong | resume | record | login | model-not-selected | auth | quota |
 //                  launch | hang | ignore-term | split-utf8 | crash | malformed
-// ZCODE_STUB_RECORD: file the `record` mode writes; ZCODE_STUB_DELAY_MS: wait before
-// acting; ZCODE_STUB_MESSAGE: stderr text for the four error modes; ZCODE_STUB_TERM_DELAY_MS:
-// how long ignore-term waits after SIGTERM before exiting.
+// ZCODE_STUB_RECORD: file the `record` mode (and `login`, when set) writes, including `resolved`,
+// the stub's model of where the CLI keeps its state; ZCODE_STUB_DELAY_MS: wait before acting;
+// ZCODE_STUB_MESSAGE: stderr text for the four error modes; ZCODE_STUB_TERM_DELAY_MS: how long ignore-term waits after SIGTERM before exiting;
+// ZCODE_STUB_EXIT: the exit code of the `login` mode (default 0).
 "use strict";
 const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 const argv = process.argv.slice(2);
 const mode = process.env.ZCODE_STUB_MODE || "ok";
@@ -46,6 +49,56 @@ function readStdin() {
   });
 }
 
+// Where the real CLI (zcode.cjs 3.15.1) would put its state with this environment — a model of its
+// resolvers (docs/zcode-cli-findings.md, "CLI data home"): the credential store (Vta: ZCODE_DATA_BASE_DIR,
+// else HOME), the storage root (storage.dir: ZCODE_STORAGE_DIR, else ~/.zcode), the session database
+// (storage.sessionDbPath: ZCODE_SESSION_DB_PATH or its alias ZCODE_SESSION_DB, else
+// ~/.zcode/cli/db/db.sqlite) and the logs (JB: ZCODE_LOG_DIR, else ~/.zcode/cli/log).
+function resolvedPaths() {
+  const env = process.env;
+  const home = os.homedir();
+  return {
+    credentials: path.join(env.ZCODE_DATA_BASE_DIR || home, ".zcode", "v2", "credentials.json"),
+    storageDir: env.ZCODE_STORAGE_DIR || path.join(home, ".zcode"),
+    sessionDb: env.ZCODE_SESSION_DB_PATH || env.ZCODE_SESSION_DB || path.join(home, ".zcode", "cli", "db", "db.sqlite"),
+    logDir: env.ZCODE_LOG_DIR || path.join(home, ".zcode", "cli", "log"),
+  };
+}
+
+// Writes $ZCODE_STUB_RECORD: argv, stdin, cwd, the environment the wrapper sets, where the CLI
+// would resolve its state (resolvedPaths), and the personal provider config as the wrapper left
+// it for this run (null when missing).
+function writeStubRecord(stdin) {
+  let personalConfig = null;
+  try {
+    personalConfig = JSON.parse(fs.readFileSync(process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, "utf8"));
+  } catch {
+    personalConfig = null;
+  }
+  fs.writeFileSync(
+    process.env.ZCODE_STUB_RECORD,
+    JSON.stringify({
+      argv,
+      stdin,
+      cwd: process.cwd(),
+      env: {
+        ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE ?? null,
+        ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: process.env.ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE ?? null,
+        ZCODE_APP_VERSION: process.env.ZCODE_APP_VERSION ?? null,
+        ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE ?? null,
+        ZCODE_DATA_BASE_DIR: process.env.ZCODE_DATA_BASE_DIR ?? null,
+        ZCODE_STORAGE_DIR: process.env.ZCODE_STORAGE_DIR ?? null,
+        ZCODE_SESSION_DB_PATH: process.env.ZCODE_SESSION_DB_PATH ?? null,
+        ZCODE_SESSION_DB: process.env.ZCODE_SESSION_DB ?? null,
+        ZCODE_LOG_DIR: process.env.ZCODE_LOG_DIR ?? null,
+        ZCODE_HTTP_PROXY: process.env.ZCODE_HTTP_PROXY ?? null,
+      },
+      resolved: resolvedPaths(),
+      personalConfig,
+    }),
+  );
+}
+
 async function run() {
   switch (mode) {
     case "ok":
@@ -55,31 +108,25 @@ async function run() {
     case "resume":
       if (!flag("--resume")) fail("stub resume mode: --resume is missing");
       return emit("DONE\nresumed");
-    case "record": {
-      const stdin = flag("-p") === "-" ? await readStdin() : null;
-      let personalConfig = null; // the personal provider config as the wrapper left it for this run
-      try {
-        personalConfig = JSON.parse(fs.readFileSync(process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, "utf8"));
-      } catch {
-        personalConfig = null;
-      }
-      fs.writeFileSync(
-        process.env.ZCODE_STUB_RECORD,
-        JSON.stringify({
-          argv,
-          stdin,
-          cwd: process.cwd(),
-          env: {
-            ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE ?? null,
-            ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: process.env.ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE ?? null,
-            ZCODE_APP_VERSION: process.env.ZCODE_APP_VERSION ?? null,
-            ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE ?? null,
-            ZCODE_DATA_BASE_DIR: process.env.ZCODE_DATA_BASE_DIR ?? null,
-          },
-          personalConfig,
-        }),
-      );
+    case "record":
+      writeStubRecord(flag("-p") === "-" ? await readStdin() : null);
       return emit("DONE\nrecorded");
+    case "login": {
+      // Stand-in for `zcode login zai`: records the run (when ZCODE_STUB_RECORD is set), then writes
+      // what the real login writes — a credential into the store the CLI resolves (resolvedPaths:
+      // ZCODE_DATA_BASE_DIR, else HOME) and its GLM-5.3 default selection into the personal provider
+      // config — prints a login URL, and exits with ZCODE_STUB_EXIT.
+      if (argv.length !== 2 || argv[0] !== "login" || argv[1] !== "zai") fail(`stub login mode: expected argv "login zai", got ${JSON.stringify(argv)}`);
+      if (process.env.ZCODE_STUB_RECORD) writeStubRecord(null);
+      const store = resolvedPaths().credentials;
+      fs.mkdirSync(path.dirname(store), { recursive: true });
+      fs.writeFileSync(store, JSON.stringify({ "oauth:zai:access_token": "stub-secret-token-0123" }));
+      fs.writeFileSync(
+        process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE,
+        JSON.stringify({ schemaVersion: 1, config: { loginWrote: true, defaultModelSelection: { providerId: "account:zai-individual-coding-plan", modelId: "GLM-5.3" } } }),
+      );
+      process.stdout.write("Open this URL to log in: https://example.invalid/stub-login\nModel: account:zai-individual-coding-plan/GLM-5.3\n");
+      return process.exit(Number(process.env.ZCODE_STUB_EXIT || 0));
     }
     case "split-utf8": {
       const value = {

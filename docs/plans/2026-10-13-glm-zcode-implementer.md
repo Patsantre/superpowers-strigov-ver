@@ -21,10 +21,11 @@ phases:
     commits: "3b8d331.."
   - id: Ф4a
     scope: "Separate CLI credential store and state dirs under <state root>/cli-home (ZCODE_DATA_BASE_DIR, ZCODE_STORAGE_DIR, ZCODE_SESSION_DB_PATH, ZCODE_LOG_DIR; ~/.zcode/cli/config.json has no override and stays the CLI's shared file) + zcode-dispatch login [zai] + doctor --probe login hint; stub tests, skills, READMEs, findings (ledger PF-B5, PC1-B1)"
-    status: in-progress
+    status: done
+    commits: "4fe367a.."
   - id: Ф5
     scope: "[Executor: the user in a fresh plain Claude Code session] live acceptance §8.2 + 1.5x bonus measurement → findings, skill, READMEs"
-    status: pending
+    status: in-progress
 ---
 
 # GLM-5.3-Flash via Z.ai's ZCode CLI as the default implementer — Implementation Plan
