@@ -2,10 +2,11 @@
 // Test stand-in for ZCode's zcode.cjs, selected via ZCODE_BIN. Never calls a model.
 // ZCODE_STUB_MODE: ok | pong | resume | record | login | model-not-selected | auth | quota |
 //                  launch | hang | ignore-term | split-utf8 | crash | malformed
-// ZCODE_STUB_RECORD: file the `record` mode (and `login`, when set) writes, including `resolved`,
-// the stub's model of where the CLI keeps its state; ZCODE_STUB_DELAY_MS: wait before acting;
+// ZCODE_STUB_RECORD: file the `record` mode (and `login`, when set) writes, including envAll and
+// `resolved`, the stub's model of where the CLI keeps its state; ZCODE_STUB_DELAY_MS: wait before acting;
 // ZCODE_STUB_MESSAGE: stderr text for the four error modes; ZCODE_STUB_TERM_DELAY_MS: how long ignore-term waits after SIGTERM before exiting;
 // ZCODE_STUB_EXIT: the exit code of the `login` mode (default 0).
+// Tests explicitly list ZCODE_STUB_* in ZCODE_ENV_PASSTHROUGH because the wrapper filters the CLI env.
 "use strict";
 const fs = require("node:fs");
 const os = require("node:os");
@@ -65,9 +66,8 @@ function resolvedPaths() {
   };
 }
 
-// Writes $ZCODE_STUB_RECORD: argv, stdin, cwd, the environment the wrapper sets, where the CLI
-// would resolve its state (resolvedPaths), and the personal provider config as the wrapper left
-// it for this run (null when missing).
+// Writes $ZCODE_STUB_RECORD: argv, stdin, cwd, selected wrapper env, all variables the CLI received
+// (envAll), where it would resolve its state (resolvedPaths), and the personal provider config.
 function writeStubRecord(stdin) {
   let personalConfig = null;
   try {
@@ -93,6 +93,7 @@ function writeStubRecord(stdin) {
         ZCODE_LOG_DIR: process.env.ZCODE_LOG_DIR ?? null,
         ZCODE_HTTP_PROXY: process.env.ZCODE_HTTP_PROXY ?? null,
       },
+      envAll: { ...process.env },
       resolved: resolvedPaths(),
       personalConfig,
     }),

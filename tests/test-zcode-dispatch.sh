@@ -141,9 +141,12 @@ main() {
     export ZCODE_STATE_DIR="$TEST_ROOT/state"
     unset ZCODE_NODE ZCODE_TASK_TIMEOUT_MIN SP_IMPLEMENTER ZCODE_DATA_BASE_DIR ZCODE_HTTP_PROXY
     unset ZCODE_STORAGE_DIR ZCODE_SESSION_DB_PATH ZCODE_SESSION_DB ZCODE_LOG_DIR
-    unset ZCODE_STUB_MODE ZCODE_STUB_RECORD ZCODE_STUB_DELAY_MS ZCODE_STUB_MESSAGE ZCODE_STUB_EXIT
-    # The CLI's own state (Ф4a): every CLI run gets ZCODE_DATA_BASE_DIR=<state root>/cli-home plus the
-    # storage-root, session-database and log overrides under it, and no inherited ZCODE_SESSION_DB alias.
+    unset ZCODE_STUB_MODE ZCODE_STUB_RECORD ZCODE_STUB_DELAY_MS ZCODE_STUB_MESSAGE ZCODE_STUB_EXIT ZCODE_STUB_TERM_DELAY_MS
+    unset ZCODE_ENV_PASSTHROUGH
+    export ZCODE_ENV_PASSTHROUGH="ZCODE_STUB_MODE,ZCODE_STUB_RECORD,ZCODE_STUB_DELAY_MS,ZCODE_STUB_MESSAGE,ZCODE_STUB_EXIT,ZCODE_STUB_TERM_DELAY_MS,ZCODE_SESSION_DB"
+    export ZCODE_SESSION_DB="$TEST_ROOT/inherited-alias.sqlite"
+    # The CLI's own state (Ф4a): every CLI run gets cli-home overrides, even if the inherited
+    # ZCODE_SESSION_DB alias is explicitly listed in ZCODE_ENV_PASSTHROUGH.
     local cli_home="$ZCODE_STATE_DIR/cli-home"
     # cli_home_env_ok <record> — the recorded CLI run got the cli-home environment, so the stub's model of
     # the CLI's resolvers (record field `resolved`) puts the credential store, storage root, session
@@ -279,6 +282,85 @@ process.exit(r.personalConfig?.keptByWrapper === true && JSON.stringify(at(r.per
         fail "2 a changed selection is re-pinned before the next run; other content of the file is kept"
         echo "    status: $st record: $(head -c 600 "$TEST_ROOT/record.json" 2>/dev/null)"
     fi
+
+    # --- 2. allowlisted CLI environment: drop ambient secrets; honor explicit, safe passthrough ---
+    local env_rec="$TEST_ROOT/record-env.json" env_log
+    rc=0
+    out="$(env ZCODE_STUB_MODE=record ZCODE_STUB_RECORD="$env_rec" \
+        GITHUB_TOKEN=fake-gh-token AWS_SECRET_ACCESS_KEY=fake-aws-secret AWS_PROFILE=fake-profile \
+        ANTHROPIC_API_KEY=fake-anthropic-key OPENAI_API_KEY=fake-openai-key MY_SERVICE_TOKEN=fake-service-token \
+        DB_PASSWORD=fake-db-password CLAUDE_CODE_MESSAGING_TOKEN=fake-claude-token \
+        CLAUDE_CODE_SESSION_ID=fake-session-id CLAUDE_CODE_ENTRYPOINT=fake-entrypoint \
+        SSH_AUTH_SOCK="$TEST_ROOT/fake.sock" XDG_FAKE_TOKEN=fake-xdg-token UNLISTED_VAR=fake-unlisted \
+        ZCODE_TOOL_ENV_PASSTHROUGH_JSON='{"GH_TOKEN":"fake"}' ZCODE_CREDENTIAL_SECRET=fake-credential-key \
+        ZCODE_HTTP_PROXY=http://127.0.0.1:1082 HTTPS_PROXY=http://proxy.example:8080 HTTP_PROXY=http://proxy.example:8081 \
+        NODE_EXTRA_CA_CERTS="$TEST_ROOT/ca.pem" LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 XDG_CACHE_HOME="$TEST_ROOT/xdg" \
+        TERM=xterm-256color TZ=UTC JAVA_HOME=/opt/fake-jdk EXTRA_VAR=extra-value NPM_TOKEN=fake-npm-token \
+        ZCODE_DATA_BASE_DIR="$TEST_ROOT/spoof-data-home" ZCODE_STORAGE_DIR="$TEST_ROOT/spoof-storage" \
+        ZCODE_SESSION_DB_PATH="$TEST_ROOT/spoof-session.sqlite" ZCODE_SESSION_DB="$TEST_ROOT/spoof-alias.sqlite" \
+        ZCODE_LOG_DIR="$TEST_ROOT/spoof-log" ZCODE_APP_VERSION=0.0.0-spoofed \
+        ZCODE_PERSONAL_PROVIDER_CONFIG_FILE="$TEST_ROOT/spoofed-personal.json" \
+        ZCODE_BUILTIN_PROVIDER_CONFIG_FILE="$TEST_ROOT/spoofed-provider.json" \
+        ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE="$TEST_ROOT/spoofed-bundled-provider.json" \
+        ZCODE_ENV_PASSTHROUGH="$ZCODE_ENV_PASSTHROUGH,EXTRA_VAR,NPM_TOKEN,ZCODE_DATA_BASE_DIR,ZCODE_STORAGE_DIR,ZCODE_SESSION_DB_PATH,ZCODE_SESSION_DB,ZCODE_LOG_DIR,ZCODE_APP_VERSION,ZCODE_PERSONAL_PROVIDER_CONFIG_FILE,ZCODE_BUILTIN_PROVIDER_CONFIG_FILE,ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE" \
+        "$ZD" task --background --prompt-file "$prompt")" || rc=$?
+    id="${out##* }"
+    st="$(wait_status "$id" 'completed|failed|cancelled' 20)"
+    if [[ "$rc" -eq 0 && "$st" == completed ]] && REC="$env_rec" VER="$want_version" PCFG="$pcfg" CLI_HOME="$cli_home" T="$TEST_ROOT" CFG="$cfg" \
+        WANT_PATH="$PATH" WANT_HOME="$HOME" node -e '
+const fs = require("node:fs");
+const e = JSON.parse(fs.readFileSync(process.env.REC, "utf8")).envAll;
+const dropped = ["GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+  "MY_SERVICE_TOKEN", "DB_PASSWORD", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT",
+  "SSH_AUTH_SOCK", "XDG_FAKE_TOKEN", "UNLISTED_VAR", "ZCODE_TOOL_ENV_PASSTHROUGH_JSON", "ZCODE_ENV_PASSTHROUGH",
+  "ZCODE_APP", "ZCODE_BIN", "ZCODE_STATE_DIR", "ZCODE_SESSION_DB"];
+const h = process.env.CLI_HOME;
+const want = {
+  PATH: process.env.WANT_PATH, HOME: process.env.WANT_HOME,
+  ZCODE_STUB_MODE: "record", ZCODE_STUB_RECORD: `${process.env.T}/record-env.json`,
+  ZCODE_HTTP_PROXY: "http://127.0.0.1:1082", HTTPS_PROXY: "http://proxy.example:8080", HTTP_PROXY: "http://proxy.example:8081",
+  ZCODE_CREDENTIAL_SECRET: "fake-credential-key", NODE_EXTRA_CA_CERTS: `${process.env.T}/ca.pem`,
+  LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8", XDG_CACHE_HOME: `${process.env.T}/xdg`,
+  TERM: "xterm-256color", TZ: "UTC", JAVA_HOME: "/opt/fake-jdk", EXTRA_VAR: "extra-value", NPM_TOKEN: "fake-npm-token",
+  ZCODE_DATA_BASE_DIR: h, ZCODE_STORAGE_DIR: `${h}/.zcode`,
+  ZCODE_SESSION_DB_PATH: `${h}/.zcode/cli/db/db.sqlite`, ZCODE_LOG_DIR: `${h}/.zcode/cli/log`,
+  ZCODE_APP_VERSION: process.env.VER, ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: process.env.PCFG,
+  ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: process.env.CFG,
+  ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: process.env.CFG,
+};
+for (const name of ["USER", "LOGNAME", "SHELL", "TMPDIR"]) if (process.env[name] !== undefined) want[name] = process.env[name];
+const leaked = dropped.filter((name) => name in e);
+const wrong = Object.entries(want).filter(([name, value]) => e[name] !== value).map(([name]) => name);
+const ok = e.ZCODE_SESSION_DB === undefined && leaked.length === 0 && wrong.length === 0;
+if (!ok) console.error(`    leaked: ${leaked.join(" ")} | missing or wrong: ${wrong.join(" ")} | alias=${e.ZCODE_SESSION_DB}`);
+process.exit(ok ? 0 : 1);'; then
+        pass "2 env allowlist drops fake secrets and Claude Code session variables; basics, proxy/CA, toolchain and explicit passthrough values arrive; wrapper and cli-home values override spoofed values; ZCODE_SESSION_DB is always dropped"
+    else
+        fail "2 env allowlist drops fake secrets and Claude Code session variables; basics, proxy/CA, toolchain and explicit passthrough values arrive; wrapper and cli-home values override spoofed values; ZCODE_SESSION_DB is always dropped"
+        echo "    exit=$rc status=$st out=$out record=$(head -c 800 "$env_rec" 2>/dev/null)"
+    fi
+    env_log="$(find "$ZCODE_STATE_DIR/state" -name "$id.log" | head -1)"
+    if [[ -n "$env_log" ]] && grep -Eq 'env names: (.* )?PATH( |;|$)' "$env_log" \
+        && grep -q 'secret-like by name, passed on request: NPM_TOKEN' "$env_log" \
+        && ! grep -Eq 'fake-(gh-token|npm-token|credential-key|aws-secret|anthropic-key|openai-key|claude-token|service-token|db-password)|extra-value|fake-session-id' "$env_log"; then
+        pass "2 the job log records CLI environment names, flags secret-like passthrough names, and contains no values"
+    else
+        fail "2 the job log records CLI environment names, flags secret-like passthrough names, and contains no values"
+        echo "    log=$env_log: $(grep -E 'env names|fake-|extra-value' "$env_log" 2>/dev/null | head -c 600)"
+    fi
+    if ZD_MJS="$MJS" node --input-type=module -e '
+const { pathToFileURL } = await import("node:url");
+const m = await import(pathToFileURL(process.env.ZD_MJS).href);
+const denied = (name) => m.ENV_DENY.some((pattern) => pattern.test(name));
+const allowedSecrets = m.ENV_ALLOW.filter(denied);
+const samples = ["GITHUB_TOKEN", "GH_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_PROFILE", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
+  "OPENAI_API_KEY", "CLAUDE_CODE_MESSAGING_TOKEN", "NPM_TOKEN", "STRIPE_SECRET", "SIGNING_KEY", "DB_PASSWORD",
+  "GOOGLE_APPLICATION_CREDENTIALS"];
+process.exit(JSON.stringify(allowedSecrets) === JSON.stringify(["ZCODE_CREDENTIAL_SECRET"]) && samples.every(denied) ? 0 : 1);'; then
+        pass "2 ENV_DENY covers secret suffixes and cloud/API/session prefixes; only ZCODE_CREDENTIAL_SECRET is secret-like in ENV_ALLOW"
+    else
+        fail "2 ENV_DENY covers secret suffixes and cloud/API/session prefixes; only ZCODE_CREDENTIAL_SECRET is secret-like in ENV_ALLOW"
+    fi
     unset ZCODE_STUB_RECORD
 
     # --- 3. status running -> completed; result; stored fields; recent cap ---
@@ -310,7 +392,7 @@ process.exit(r.personalConfig?.keptByWrapper === true && JSON.stringify(at(r.per
     local n_recent n_all
     n_recent="$("$ZD" status --json | jfield recent | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).length))')"
     n_all="$("$ZD" status --json --all | jfield recent | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).length))')"
-    if [[ "$n_recent" -eq 10 && "$n_all" -eq 13 ]]; then
+    if [[ "$n_recent" -eq 10 && "$n_all" -eq 14 ]]; then
         pass "3 status without id lists the 10 newest terminal jobs; --all lists every job"
     else
         fail "3 status without id lists the 10 newest terminal jobs; --all lists every job"
@@ -771,6 +853,7 @@ process.exit(injected && runner.status === "cancelled" && m.readRecord(file).sta
         fi
     fi
     expect_exit 2 "10 SP_IMPLEMENTER=luna" env SP_IMPLEMENTER=luna "$ZD" task --background --prompt-file "$prompt"
+    expect_exit 2 "10 an invalid name in ZCODE_ENV_PASSTHROUGH" env ZCODE_ENV_PASSTHROUGH="OK_NAME 1BAD" "$ZD" task --background --prompt-file "$prompt"
     mkdir -p "$TEST_ROOT/NoPlist.app/Contents"
     expect_exit 2 "10 ZCODE_APP without a readable Info.plist" env ZCODE_APP="$TEST_ROOT/NoPlist.app" "$ZD" task --background --prompt-file "$prompt"
     expect_exit 2 "10 missing --background" "$ZD" task --prompt-file "$prompt"
@@ -783,16 +866,33 @@ process.exit(injected && runner.status === "cancelled" && m.readRecord(file).sta
     rc=0
     out="$("$ZD" doctor)" || rc=$?
     local checks=0 c
-    for c in app cli provider-config node app-version git state-dir cli-home personal-config kill-switch; do
+    for c in app cli provider-config node app-version git state-dir cli-home personal-config kill-switch env; do
         if grep -Eq "^(ok|WARN) $c: " <<<"$out"; then checks=$((checks + 1)); fi
     done
-    if [[ "$rc" -eq 0 && "$checks" -eq 10 && "$(tail -1 <<<"$out")" == "doctor: ok" ]] && ! grep -q '^FAIL' <<<"$out" \
+    if [[ "$rc" -eq 0 && "$checks" -eq 11 && "$(tail -1 <<<"$out")" == "doctor: ok" ]] && ! grep -q '^FAIL' <<<"$out" \
         && grep -Fqx "ok cli-home: $cli_home" <<<"$out"; then
-        pass "11 doctor against the fixtures: 10 checks ok/WARN ('ok cli-home: <state root>/cli-home'), 'doctor: ok', exit 0"
+        pass "11 doctor against the fixtures: 11 checks ok/WARN, including env ('ok cli-home: <state root>/cli-home'), 'doctor: ok', exit 0"
     else
-        fail "11 doctor against the fixtures: 10 checks ok/WARN ('ok cli-home: <state root>/cli-home'), 'doctor: ok', exit 0"
+        fail "11 doctor against the fixtures: 11 checks ok/WARN, including env ('ok cli-home: <state root>/cli-home'), 'doctor: ok', exit 0"
         echo "    exit: $rc"
         echo "$out" | sed 's/^/    /'
+    fi
+    rc=0
+    out="$(ZCODE_ENV_PASSTHROUGH="bad-name" "$ZD" doctor)" || rc=$?
+    if [[ "$rc" -eq 1 && "$out" == *"FAIL env: "* && "$(tail -1 <<<"$out")" == "doctor: FAIL" ]]; then
+        pass "11 doctor env: an invalid ZCODE_ENV_PASSTHROUGH name -> FAIL env, exit 1"
+    else
+        fail "11 doctor env: an invalid ZCODE_ENV_PASSTHROUGH name -> FAIL env, exit 1"
+        echo "    exit: $rc"
+    fi
+    local warn_out ok_out
+    warn_out="$(env -u ZCODE_HTTP_PROXY HTTPS_PROXY=http://proxy.example:8080 "$ZD" doctor)" || true
+    ok_out="$(env ZCODE_HTTP_PROXY=http://127.0.0.1:1082 HTTPS_PROXY=http://proxy.example:8080 "$ZD" doctor)" || true
+    if [[ "$warn_out" == *"WARN env: "*"ZCODE_HTTP_PROXY is not"* && "$ok_out" == *"ok env: "* ]]; then
+        pass "11 doctor env: HTTPS_PROXY without ZCODE_HTTP_PROXY -> WARN; with ZCODE_HTTP_PROXY -> ok"
+    else
+        fail "11 doctor env: HTTPS_PROXY without ZCODE_HTTP_PROXY -> WARN; with ZCODE_HTTP_PROXY -> ok"
+        echo "    warn: $(grep ' env: ' <<<"$warn_out") | ok: $(grep ' env: ' <<<"$ok_out")"
     fi
     rc=0
     out="$(ZCODE_BIN=/nonexistent/zcode.cjs "$ZD" doctor)" || rc=$?
@@ -873,14 +973,17 @@ process.exit(injected && runner.status === "cancelled" && m.readRecord(file).sta
     local login_out
     rc=0
     login_out="$(ZCODE_STUB_MODE=login ZCODE_STUB_RECORD="$TEST_ROOT/login-record.json" ZCODE_HTTP_PROXY=http://127.0.0.1:9 \
-        ZCODE_DATA_BASE_DIR="$TEST_ROOT/foreign-data-home" "$ZD" login 2>&1)" || rc=$?
+        ZCODE_DATA_BASE_DIR="$TEST_ROOT/foreign-data-home" ANTHROPIC_API_KEY=fake-login-key GITHUB_TOKEN=fake-login-gh \
+        "$ZD" login 2>&1)" || rc=$?
     if [[ "$rc" -eq 0 && "$login_out" == *"https://example.invalid/stub-login"* && "$login_out" == *"login: ok"* \
         && "$login_out" != *"stub-secret-token"* && -f "$cli_home/.zcode/v2/credentials.json" \
         && ! -e "$HOME/.zcode" && ! -e "$TEST_ROOT/foreign-data-home" ]] \
         && REC="$TEST_ROOT/login-record.json" CFG="$cfg" VER="$want_version" PCFG="$pcfg" CLI_HOME="$cli_home" \
+        WANT_PATH="$PATH" WANT_HOME="$HOME" \
         SEL_PATH="$sel_path" PINNED="$pinned" node -e '
 const fs = require("node:fs");
 const r = JSON.parse(fs.readFileSync(process.env.REC, "utf8"));
+const e = r.envAll;
 const after = JSON.parse(fs.readFileSync(process.env.PCFG, "utf8"));
 const at = (o) => process.env.SEL_PATH.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
 const ok = JSON.stringify(r.argv) === JSON.stringify(["login", "zai"])
@@ -889,12 +992,16 @@ const ok = JSON.stringify(r.argv) === JSON.stringify(["login", "zai"])
   && r.env.ZCODE_APP_VERSION === process.env.VER
   && r.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE === process.env.PCFG
   && r.env.ZCODE_HTTP_PROXY === "http://127.0.0.1:9"
+  && e.PATH === process.env.WANT_PATH && e.HOME === process.env.WANT_HOME
+  && e.ZCODE_HTTP_PROXY === "http://127.0.0.1:9"
+  && !Object.hasOwn(e, "ANTHROPIC_API_KEY") && !Object.hasOwn(e, "GITHUB_TOKEN")
+  && !Object.hasOwn(e, "ZCODE_SESSION_DB") && !Object.hasOwn(e, "ZCODE_ENV_PASSTHROUGH")
   && after.config?.loginWrote === true
   && JSON.stringify(at(after)) === process.env.PINNED;
 process.exit(ok ? 0 : 1);' && cli_home_env_ok "$TEST_ROOT/login-record.json"; then
-        pass "14 login (no argument = zai) runs 'login zai' with the wrapper env (provider config x2, app version, personal config, the cli-home env, inherited ZCODE_HTTP_PROXY), exit 0, then re-pins PINNED_SELECTION; the credential lands only under cli-home and is never printed"
+        pass "14 login (no argument = zai) gets the allowlisted env (PATH, HOME, ZCODE_HTTP_PROXY; no fake secrets or ZCODE_SESSION_DB), prints the browser URL, then re-pins PINNED_SELECTION; credential lands only under cli-home and is never printed"
     else
-        fail "14 login (no argument = zai) runs 'login zai' with the wrapper env (provider config x2, app version, personal config, the cli-home env, inherited ZCODE_HTTP_PROXY), exit 0, then re-pins PINNED_SELECTION; the credential lands only under cli-home and is never printed"
+        fail "14 login (no argument = zai) gets the allowlisted env (PATH, HOME, ZCODE_HTTP_PROXY; no fake secrets or ZCODE_SESSION_DB), prints the browser URL, then re-pins PINNED_SELECTION; credential lands only under cli-home and is never printed"
         echo "    exit: $rc out: $login_out"
         echo "    record: $(head -c 600 "$TEST_ROOT/login-record.json" 2>/dev/null)"
     fi

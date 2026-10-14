@@ -1,7 +1,7 @@
 # superpowers-strigov-ver
 
 Personal Claude Code plugin assembled from:
-Current repo/plugin version: `0.8.0`.
+Current repo/plugin version: `0.8.1`.
 
 - **`dev-orchestrator`** — multi-model subagent-driven workflow with a pinned model + effort per role (Opus xhigh plan + Opus high revisions + GPT-6 Astra xhigh plan-review loop + GLM-5.3-Flash max implement via Z.ai's ZCode CLI (`bin/zcode-dispatch`) with GPT-6 Luna max availability fallback and GPT-6.1 Sol xhigh for SECURITY/DATA_LOSS phases and reasoning escalation (channel ladder per phase, `risk_phases` frontmatter map, gate-stall diagnosis) + Sonnet medium verification gate + per-phase fused review: Opus high spec+quality (xhigh on SECURITY/DATA_LOSS phases and in round 4) and Astra high control, both fed a pre-baked review package via `bin/review-package`; file-based implementer reports; Opus high BLOCKED diagnosis; final whole-branch Opus xhigh review before archival, cap=2, Astra xhigh fallback; review synthesis; plan-marked parallel groups run as 2 concurrent tracks in git worktrees; auto-commit, fused loop cap=4 with anti-pingpong / no-progress guards; thread-addressed Codex resume via `--resume-task`; `ultra` effort strictly user-initiated).
 - **`codex-invocation`** — reference recipe for calling Codex via the `bin/codex-dispatch` wrapper around the vendored `codex-companion.mjs` (background mode + Monitor polling; bypasses the silent auto-reject on standard Agent/`codex exec` paths and pins the default model to `gpt-6.1-sol` to block backend auto-downgrade to spark; per-role GPT-6 routing table included).
@@ -33,6 +33,8 @@ The Codex companion runtime is **vendored** under `vendor/codex-companion/` (Apa
 The only external dependency is the standalone `codex` CLI (`npm install -g @openai/codex`) and a one-time `!codex login` per machine.
 
 The GLM channel assumes `/Applications/ZCode.app` (macOS) with its embedded Agent CLI at `Contents/Resources/glm/zcode.cjs` — there is no `zcode` on `PATH` — run under the system `node` (major version at least `VERIFIED_NODE_MAJOR` in `bin/lib/zcode-dispatch.mjs`), with the CLI logged in by the user via `zcode-dispatch login` (ZCode's own `zcode login zai` in the wrapper's CLI home, repeated when the CLI login expires; see `zcode-invocation`). `bin/zcode-dispatch` keeps its job state, its own personal provider config (the model pin) and the CLI's own credentials and state (`cli-home`, passed as `ZCODE_DATA_BASE_DIR` plus storage, session-database and log overrides under it: the CLI's credentials, plugins, sessions and logs) under `~/.claude/plugins/data/superpowers-strigov-ver-zcode`, and never edits `~/.zcode`, which the ZCode desktop app uses; the CLI itself still reads its user config `~/.zcode/cli/config.json`, which has no override. Without ZCode.app, `zcode-dispatch doctor` fails and dev-orchestrator implements on Codex Luna max (announced).
+
+The wrapper gives the CLI an allowlisted environment, including `PATH`, `HOME` and `ZCODE_HTTP_PROXY`; extra variable names can be opted in with `ZCODE_ENV_PASSTHROUGH="NAME1,NAME2"`. Its cli-home paths always override inherited values, and `ZCODE_SESSION_DB` is dropped.
 
 To bump the vendored runtime, replace the contents of `vendor/codex-companion/{scripts,prompts,schemas}` from a newer `openai/codex-plugin-cc` release and update `vendor/codex-companion/VERSION` — then re-apply the local patches listed in that file (notably the `--resume-task` flag and the `max`/`ultra` reasoning efforts).
 

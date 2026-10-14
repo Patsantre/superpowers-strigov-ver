@@ -49,6 +49,35 @@ export const PATTERNS = {
 };
 // --------------------------------------------------------------------------------------
 
+// ---- Environment of the ZCode CLI: an allowlist (docs/zcode-cli-findings.md "## Environment") ----
+// The CLI's Bash tool inherits the CLI's whole environment, so this is also what GLM's shell
+// commands see. Explicitly passed names opt in even when secret-like; wrapper-owned ZCODE_*
+// settings are applied afterwards. ZCODE_SESSION_DB is always excluded because the CLI treats
+// it as an alias with higher precedence than ZCODE_SESSION_DB_PATH.
+export const ENV_PASSTHROUGH_VAR = "ZCODE_ENV_PASSTHROUGH";
+export const ENV_ALLOW = [
+  // process basics; HOME is needed for the CLI's credential key and browser login
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "TZ", "LANG",
+  // the Node runtime that runs zcode.cjs
+  "NODE_OPTIONS", "NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA",
+  // network for the CLI's tools (the CLI itself uses ZCODE_HTTP_PROXY)
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+  // the CLI's own settings: its only proxy, its CA, its credential key, and selected state defaults
+  "ZCODE_HTTP_PROXY", "ZCODE_NO_PROXY", "ZCODE_AGENT_CA_CERT", "ZCODE_CREDENTIAL_SECRET",
+  "ZCODE_DATA_BASE_DIR", "ZCODE_STORAGE_DIR", "ZCODE_BETA", "ZCODE_ENV",
+  // toolchain locations
+  "JAVA_HOME", "GOPATH", "GOROOT", "GOBIN", "CARGO_HOME", "RUSTUP_HOME", "PYENV_ROOT", "VIRTUAL_ENV",
+  "CONDA_PREFIX", "NVM_DIR", "VOLTA_HOME", "PNPM_HOME", "BUN_INSTALL", "DENO_DIR", "GEM_HOME", "GEM_PATH",
+  "RBENV_ROOT", "ASDF_DIR", "ASDF_DATA_DIR", "HOMEBREW_PREFIX", "HOMEBREW_CELLAR", "HOMEBREW_REPOSITORY",
+  "DEVELOPER_DIR", "ANDROID_HOME", "ANDROID_SDK_ROOT",
+];
+export const ENV_ALLOW_PREFIXES = ["LC_", "XDG_"];
+// ZCODE_CREDENTIAL_SECRET is the one ENV_ALLOW entry that matches the secret suffix rule: the CLI
+// cannot decrypt its own credentials without it when it is set.
+export const ENV_DENY = [/_(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIALS)$/i, /^(AWS|GITHUB|GH|ANTHROPIC|OPENAI|CLAUDE)_/i];
+// --------------------------------------------------------------------------------------
+
 const PROBE_PROMPT = "Reply with exactly one word: PONG";
 const PROBE_TIMEOUT_MS = 120_000;
 const TIMEOUT_KILL_GRACE_MS = 10_000;
@@ -138,6 +167,43 @@ function readTimeoutMin(env = process.env) {
     throw new UsageError(`ZCODE_TASK_TIMEOUT_MIN must be a positive number of minutes, got "${raw}"`);
   }
   return value;
+}
+
+// Variable names listed in ZCODE_ENV_PASSTHROUGH ("A,B" or "A B"). These are explicit
+// user opt-ins and therefore pass even when ENV_DENY matches them, except for the CLI's
+// ZCODE_SESSION_DB alias, which must never reach the CLI.
+export function passthroughNames(source = process.env) {
+  const names = (source[ENV_PASSTHROUGH_VAR] ?? "").split(/[\s,]+/).filter(Boolean);
+  const invalid = names.filter((name) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name));
+  if (invalid.length > 0) throw new UsageError(`${ENV_PASSTHROUGH_VAR} holds invalid variable names: ${invalid.join(" ")}`);
+  return [...new Set(names.filter((name) => name !== "ZCODE_SESSION_DB"))];
+}
+
+const isDenied = (name) => ENV_DENY.some((pattern) => pattern.test(name));
+
+// The caller's variables the CLI may see. CLI-home and other wrapper-owned settings are added
+// after this filter in buildCliEnv so inherited and explicitly passed spoofed values lose.
+export function filterCliEnv(source = process.env) {
+  const passthrough = new Set(passthroughNames(source));
+  const allow = new Set(ENV_ALLOW);
+  const env = {};
+  for (const [name, value] of Object.entries(source)) {
+    if (value === undefined || name === "ZCODE_SESSION_DB") continue;
+    const prefixed = ENV_ALLOW_PREFIXES.some((prefix) => name.startsWith(prefix));
+    if (passthrough.has(name) || allow.has(name) || (prefixed && !isDenied(name))) env[name] = value;
+  }
+  return env;
+}
+
+// Names only, never values: what the job log records about the CLI's environment.
+function describeCliEnv(env) {
+  const passthrough = passthroughNames().filter((name) => name in env);
+  const secretLike = passthrough.filter(isDenied);
+  return [
+    `env names: ${Object.keys(env).sort().join(" ")}`,
+    ...(passthrough.length > 0 ? [`via ${ENV_PASSTHROUGH_VAR}: ${passthrough.join(" ")}`] : []),
+    ...(secretLike.length > 0 ? [`secret-like by name, passed on request: ${secretLike.join(" ")}`] : []),
+  ].join("; ");
 }
 
 // ---------- job records ----------
@@ -529,7 +595,7 @@ export function buildCliArgv({ bin, prompt, workspaceRoot, sessionId }) {
 
 function buildCliEnv(paths, appVersion) {
   const env = {
-    ...process.env,
+    ...filterCliEnv(process.env),
     ...MODEL_ENV,
     ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: paths.providerConfig,
     ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: paths.providerConfig,
@@ -724,6 +790,7 @@ async function cmdTask(args) {
   if (!values.background) throw new UsageError("task requires --background (there is no foreground mode)");
   if (values["resume-task"] !== undefined && values.fresh) throw new UsageError("--resume-task and --fresh are mutually exclusive");
   if (process.env.SP_IMPLEMENTER === "luna") throw new UsageError("SP_IMPLEMENTER=luna is set: the GLM channel is switched off (kill switch)");
+  passthroughNames(); // refuse invalid names before any job or reservation state is written
   const ws = requireWorkspace(values.cwd);
   refuseUnavailableReservation(ws.jobsDir, ws.root);
   const promptFile = checkPromptFile(values["prompt-file"]);
@@ -823,13 +890,21 @@ async function runJob(id, jobsDir, token) {
       return 1;
     }
     const paths = zcodePaths();
+    let env;
+    try {
+      env = buildCliEnv(paths, record.appVersion);
+    } catch (error) {
+      finalizeRecord(file, { status: "failed", errorClass: "launch", note: error.message });
+      return 1;
+    }
     const argv = buildCliArgv({ bin: paths.bin, prompt, workspaceRoot: record.workspaceRoot, sessionId: record.resumeOf ? record.sessionId : null });
     appendLog(log, `start ${id}: ${JSON.stringify(paths.node)} ${summarizeArgv(argv)}`);
+    appendLog(log, describeCliEnv(env));
     const result = await runCli({
       node: paths.node,
       argv,
       cwd: record.workspaceRoot,
-      env: buildCliEnv(paths, record.appVersion),
+      env,
       stdinText: PROMPT_TRANSPORT === "stdin" ? prompt : null,
       timeoutMs: record.timeoutMin * 60_000,
       logPath: log,
@@ -977,6 +1052,17 @@ async function cmdDoctor(args) {
   if (process.env.SP_IMPLEMENTER === "luna") report("WARN", "kill-switch", "SP_IMPLEMENTER=luna is set; task will refuse");
   else report("ok", "kill-switch", "SP_IMPLEMENTER is not luna");
 
+  try {
+    const env = filterCliEnv(process.env);
+    const passthrough = passthroughNames();
+    const detail = `${Object.keys(env).length} caller variables pass the allowlist${passthrough.length > 0 ? `; ${ENV_PASSTHROUGH_VAR}: ${passthrough.join(" ")}` : ""}`;
+    const proxied = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"].some((name) => env[name]);
+    if (proxied && !env.ZCODE_HTTP_PROXY) report("WARN", "env", `${detail}; HTTP(S)_PROXY is set but ZCODE_HTTP_PROXY is not, and the ZCode CLI's own requests use only ZCODE_HTTP_PROXY`);
+    else report("ok", "env", detail);
+  } catch (error) {
+    report("FAIL", "env", error.message);
+  }
+
   process.stdout.write(`${lines.join("\n")}\ndoctor: ${failed ? "FAIL" : "ok"}\n`);
   if (failed) return 1;
   if (!values.probe) return 0;
@@ -1029,7 +1115,7 @@ async function runProbe(paths, appVersion, root) {
 
 // `login [zai]` — the user's CLI login, in the foreground: the CLI's own `zcode login zai` with exactly
 // the environment of every wrapper run (buildCliEnv: provider config, real app version, the wrapper's
-// personal config, the cli-home environment, inherited ZCODE_HTTP_PROXY), stdio inherited so the
+// personal config, the cli-home environment, ZCODE_HTTP_PROXY via the allowlist), stdio inherited so the
 // user sees the browser URL. The login rewrites the personal config's default selection, so a successful
 // login is followed by a re-pin. Exit code = the CLI's. Never reads or prints a credential.
 function cmdLogin(args) {
