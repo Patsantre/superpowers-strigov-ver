@@ -296,6 +296,20 @@ PLAN
         fail "WORKTREE mode: .superpowers excluded from the diff"
     fi
 
+    # An embedded repo with no commit inside a non-ignored .superpowers/ makes
+    # `git add` abort if it walks the workspace — the add must exclude it.
+    git init -q "$repo/.superpowers/empty"
+    local nest_pkg="$TEST_ROOT/nested.diff"
+    rc=0
+    ( cd "$repo" && "$BIN/review-package" HEAD WORKTREE "$nest_pkg" >/dev/null 2>&1 ) || rc=$?
+    if [[ "$rc" -eq 0 ]] && grep -q '^+uncommitted$' "$nest_pkg"; then
+        pass "WORKTREE mode: embedded repo in non-ignored .superpowers/ does not abort"
+    else
+        fail "WORKTREE mode: embedded repo in non-ignored .superpowers/ does not abort"
+        echo "    exit: $rc"
+    fi
+    rm -rf "$repo/.superpowers/empty"
+
     ( cd "$repo" && git add src.txt && git add -f .superpowers/sdd/tracked.txt \
         && git "${git_id[@]}" commit -qm c2 )
     local range_pkg="$TEST_ROOT/range-excl.diff"
@@ -328,6 +342,74 @@ PLAN
     else
         fail "worktree workspace invisible to git status"
         echo "    status: $wt_status"
+    fi
+
+    # --- WORKTREE mode in a repo whose own .gitignore ignores .superpowers/ ---
+    # git refuses explicitly named ignored paths, so an exclude pathspec for an
+    # ignored .superpowers/ must never reach `git add`. Also: a file under an
+    # ignored dir that was registered intent-to-add (`git add -N -f`) must
+    # still show up, while ignored untracked files must not be force-added.
+    git init -q -b main "$TEST_ROOT/ign"
+    local ign
+    ign="$(cd "$TEST_ROOT/ign" && git rev-parse --show-toplevel)"
+    printf '.superpowers/\ngen/\n' > "$ign/.gitignore"
+    printf 'base\n' > "$ign/src.txt"
+    # A force-tracked file inside the ignored workspace must not mask that the
+    # dir itself is ignored.
+    mkdir -p "$ign/.superpowers"
+    printf 'kept v1\n' > "$ign/.superpowers/kept.txt"
+    ( cd "$ign" && git add .gitignore src.txt && git add -f .superpowers/kept.txt \
+        && git "${git_id[@]}" commit -qm i0 )
+    local ign_dir
+    ign_dir="$(cd "$ign" && "$BIN/sdd-workspace")"
+    printf 'workspace scratch\n' > "$ign_dir/notes.md"
+    printf 'kept v2\n' > "$ign/.superpowers/kept.txt"
+    git init -q "$ign/.superpowers/empty"
+    printf 'ign-modified\n' >> "$ign/src.txt"
+    printf 'ign-untracked\n' > "$ign/fresh.txt"
+    mkdir -p "$ign/gen"
+    printf 'ign-registered\n' > "$ign/gen/registered.txt"
+    printf 'ign-junk\n' > "$ign/gen/junk.txt"
+    ( cd "$ign" && git add -N -f gen/registered.txt )
+    local ign_stage_before ign_stage_after
+    ign_stage_before="$(cd "$ign" && git ls-files --stage)"
+
+    local ign_pkg="$TEST_ROOT/ign.diff"
+    local ign_out ign_err="$TEST_ROOT/ign.err"
+    rc=0
+    ign_out="$(cd "$ign" && "$BIN/review-package" HEAD WORKTREE "$ign_pkg" 2>"$ign_err")" || rc=$?
+    if [[ "$rc" -eq 0 && -s "$ign_pkg" \
+        && "$ign_out" =~ ^wrote\ .*:\ 0\ commit\(s\),\ [0-9]+\ bytes$ ]]; then
+        pass "ignored .superpowers/: WORKTREE mode writes the package"
+    else
+        fail "ignored .superpowers/: WORKTREE mode writes the package"
+        echo "    exit: $rc"
+        echo "    got: $ign_out"
+        sed 's/^/    stderr: /' "$ign_err"
+    fi
+
+    if grep -q '^+ign-modified$' "$ign_pkg" 2>/dev/null \
+        && grep -q '^+ign-untracked$' "$ign_pkg" \
+        && ! grep -q 'superpowers' "$ign_pkg"; then
+        pass "ignored .superpowers/: tracked + untracked changes shown, workspace excluded"
+    else
+        fail "ignored .superpowers/: tracked + untracked changes shown, workspace excluded"
+    fi
+
+    if grep -q '^+ign-registered$' "$ign_pkg" 2>/dev/null \
+        && ! grep -q 'ign-junk' "$ign_pkg"; then
+        pass "ignored dir: intent-to-add file shown, ignored untracked file not force-added"
+    else
+        fail "ignored dir: intent-to-add file shown, ignored untracked file not force-added"
+    fi
+
+    ign_stage_after="$(cd "$ign" && git ls-files --stage)"
+    if [[ "$ign_stage_after" == "$ign_stage_before" ]]; then
+        pass "ignored .superpowers/: real index untouched"
+    else
+        fail "ignored .superpowers/: real index untouched"
+        echo "    before: $ign_stage_before"
+        echo "    after:  $ign_stage_after"
     fi
 
     echo ""
