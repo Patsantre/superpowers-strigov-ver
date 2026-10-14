@@ -10,13 +10,13 @@
 // ~/.zcode/cli/config.json has no override and stays the CLI's own shared file. Never reads
 // those credentials and never calls the Z.ai API itself — the ZCode CLI is the only channel.
 // The model pin travels in the wrapper's own personal provider config under the state
-// root (ZCODE_PERSONAL_PROVIDER_CONFIG_FILE). The CLI authenticates in one of two ways, both the
-// user's: `zcode-dispatch login` runs the CLI's own `zcode login zai` (OAuth) in that home — it
-// keeps no refresh token and expires — or `zcode-dispatch api-key set` stores the user's Coding
-// Plan API key in that personal config as a provider of ZCode's own "Z.ai Coding Plan" template,
-// which needs no token exchange and does not expire (docs/zcode-cli-findings.md, "CLI login lifetime").
+// root (ZCODE_PERSONAL_PROVIDER_CONFIG_FILE). The CLI authenticates only with the user's Coding Plan
+// API key: `zcode-dispatch api-key set` stores it in that personal config as a provider of ZCode's own
+// "Z.ai Coding Plan" template, which needs no token exchange and does not expire. The CLI's OAuth login
+// is not used: it keeps no refresh token and expires after about an hour (docs/zcode-cli-findings.md,
+// "CLI login lifetime").
 //
-// Usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor|login|api-key> [args...]
+// Usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor|api-key> [args...]
 // Exit codes: 0 success · 1 runtime failure · 2 usage error or guard refusal.
 
 import { spawn, spawnSync } from "node:child_process";
@@ -40,16 +40,14 @@ export const MODEL_ENV = {}; // MODEL_MECHANISM env:<NAME> → { "<NAME>": PINNE
 // personal provider config before every run; PERSONAL_CONFIG_BASE seeds a missing file.
 export const SELECTION_PATH = "config.defaultModelSelection";
 export const PERSONAL_CONFIG_BASE = {"schemaVersion":1,"config":{"providerConfigRules":{"providerRules":[]},"modelConfigRules":{"providerModelRules":[],"manualProviderModelRules":[]}}};
-export const PINNED_SELECTION = {"providerId":"account:zai-individual-coding-plan","modelId":"GLM-5.3-Flash","options":{"reasoningLevel":"max"}};
-// API-key auth ("CLI login lifetime"): a personal provider rule from ZCode's built-in template "zai-api"
+// The only auth ("CLI login lifetime"): a personal provider rule from ZCode's built-in template "zai-api"
 // ("Z.ai Coding Plan": access zhipu-coding-plan-api-key, https://api.z.ai/api/anthropic, GLM-5.3 and
-// GLM-5.3-Flash), with the provider id ZCode itself derives from that template. With this rule in the
-// personal config the pin selects API_KEY_SELECTION instead of PINNED_SELECTION.
+// GLM-5.3-Flash), with the provider id ZCode itself derives from that template; PINNED_SELECTION selects it.
+export const PINNED_SELECTION = {"providerId":"zai-api","modelId":"GLM-5.3-Flash","options":{"reasoningLevel":"max"}};
 export const API_KEY_TEMPLATE_ID = "zai-api";
 export const API_KEY_PROVIDER_ID = "zai-api";
 export const API_KEY_ACCESS_TYPE = "zhipu-coding-plan-api-key";
 export const API_KEY_MANAGEMENT_URL = "https://z.ai/manage-apikey/apikey-list";
-export const API_KEY_SELECTION = {"providerId":API_KEY_PROVIDER_ID,"modelId":"GLM-5.3-Flash","options":{"reasoningLevel":"max"}};
 export const DISALLOWED_TOOLS = [];
 export const REPORTED_MODEL_PATH = null;
 export const USAGE_FIELDS = {"input":"inputTokens","cached":"cacheReadTokens","output":"outputTokens"};
@@ -68,7 +66,7 @@ export const PATTERNS = {
 // it as an alias with higher precedence than ZCODE_SESSION_DB_PATH.
 export const ENV_PASSTHROUGH_VAR = "ZCODE_ENV_PASSTHROUGH";
 export const ENV_ALLOW = [
-  // process basics; HOME is needed for the CLI's credential key and browser login
+  // process basics; HOME is needed for the CLI's credential key
   "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "TZ", "LANG",
   // the Node runtime that runs zcode.cjs
   "NODE_OPTIONS", "NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA",
@@ -282,9 +280,8 @@ function updateRunning(file, patch) {
 }
 
 // The wrapper-owned personal provider config (ZCODE_PERSONAL_PROVIDER_CONFIG_FILE). Before every CLI
-// run the default selection at SELECTION_PATH is set to the selection of the auth mode (selectionFor);
-// everything else in the file (e.g. what the user's `zcode login zai` wrote there, or the API-key rule)
-// is kept, and a missing or unreadable file starts from PERSONAL_CONFIG_BASE. It lives under the state
+// run the default selection at SELECTION_PATH is set to PINNED_SELECTION; everything else in the file
+// (the API-key rule, other rules) is kept, and only a missing file starts from PERSONAL_CONFIG_BASE. It lives under the state
 // root, never under ~/.zcode. In API-key mode it holds the user's Coding Plan API key, so it is always
 // written with mode 0600, as the CLI writes its own personal config; nothing here prints the key.
 const isObject = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -389,7 +386,8 @@ export function keyRedactor(file, initialConfig = null) {
   return (text) => {
     refresh();
     let out = String(text);
-    for (const form of forms) out = out.split(form).join(REDACTED_KEY);
+    // longest first: a rotated key that extends an older one must not leave its suffix behind
+    for (const form of [...forms].sort((a, b) => b.length - a.length)) out = out.split(form).join(REDACTED_KEY);
     return out;
   };
 }
@@ -406,8 +404,7 @@ function apiKeyRuleOf(config) {
   return rule?.templateId === API_KEY_TEMPLATE_ID && access?.type === API_KEY_ACCESS_TYPE && typeof access.apiKey === "string" && access.apiKey.trim() ? rule : null;
 }
 
-export const authModeOf = (config) => (apiKeyRuleOf(config) ? "api-key" : "oauth");
-export const selectionFor = (config) => (authModeOf(config) === "api-key" ? API_KEY_SELECTION : PINNED_SELECTION);
+export const hasApiKey = (config) => Boolean(apiKeyRuleOf(config));
 
 function writePrivateJson(file, value) {
   ensurePrivateDir(path.dirname(file));
@@ -424,7 +421,7 @@ function writePinned(file, config) {
     if (!isObject(node[key])) node[key] = {};
     node = node[key];
   }
-  node[keys.at(-1)] = structuredClone(selectionFor(config));
+  node[keys.at(-1)] = structuredClone(PINNED_SELECTION);
   writePrivateJson(file, config);
   return config;
 }
@@ -460,7 +457,7 @@ function apiKeyTemplateProblem(providerConfigFile) {
   if (template.config?.access?.type !== API_KEY_ACCESS_TYPE) return `${where}: template "${API_KEY_TEMPLATE_ID}" has access type ${template.config?.access?.type ?? "none"}, not ${API_KEY_ACCESS_TYPE}`;
   if (template.config?.api?.type !== "anthropic-messages") return `${where}: template "${API_KEY_TEMPLATE_ID}" has API type ${template.config?.api?.type ?? "none"}, not anthropic-messages`;
   const models = template.config?.builtinModelIds;
-  if (!Array.isArray(models) || !models.includes(API_KEY_SELECTION.modelId)) return `${where}: template "${API_KEY_TEMPLATE_ID}" does not list ${API_KEY_SELECTION.modelId}`;
+  if (!Array.isArray(models) || !models.includes(PINNED_SELECTION.modelId)) return `${where}: template "${API_KEY_TEMPLATE_ID}" does not list ${PINNED_SELECTION.modelId}`;
   return null;
 }
 
@@ -992,16 +989,15 @@ async function cmdTask(args) {
   if (!appVersion) throw new UsageError(`cannot read ${APP_VERSION_PLIST_KEY} from ${paths.plist}; refusing to run with an unknown client version`);
   if (!fs.existsSync(paths.bin)) throw new UsageError(`ZCode CLI not found: ${paths.bin}`);
   if (!fs.existsSync(paths.providerConfig)) throw new UsageError(`ZCode provider config not found: ${paths.providerConfig}`);
-  let configured = null;
+  let configured;
   try {
     configured = readPersonalConfig(personalConfigFile());
-  } catch {
-    // an unreadable personal config fails the job at pinning time (failed/launch)
+  } catch (error) {
+    throw new UsageError(error.message);
   }
-  if (configured && authModeOf(configured) === "api-key") {
-    const problem = apiKeyTemplateProblem(paths.providerConfig);
-    if (problem) throw new UsageError(`a Coding Plan API key is configured, but ${problem}; zcode-dispatch api-key clear returns to the OAuth login`);
-  }
+  if (!hasApiKey(configured)) throw new UsageError(`no Coding Plan API key is configured in ${personalConfigFile()}; the user stores one: zcode-dispatch api-key set (keys: ${API_KEY_MANAGEMENT_URL})`);
+  const templateProblem = apiKeyTemplateProblem(paths.providerConfig);
+  if (templateProblem) throw new UsageError(`a Coding Plan API key is configured, but ${templateProblem}`);
   const resume = values["resume-task"] !== undefined ? resolveResume(ws.jobsDir, values["resume-task"]) : { resumeOf: null, sessionId: null };
   const timeoutMin = readTimeoutMin();
   const id = nextJobId(ws.jobsDir);
@@ -1087,6 +1083,11 @@ async function runJob(id, jobsDir, token) {
       finalizeRecord(file, { status: "failed", errorClass: "launch", note: `cannot write the personal provider config: ${error.message}` });
       return 1;
     }
+    // Without the key rule the CLI would fall back to another model and provider: never spawn it.
+    if (!hasApiKey(pinned)) {
+      finalizeRecord(file, { status: "failed", errorClass: "auth", note: "no Coding Plan API key in the personal provider config (cleared after the task was queued?); the user stores one: zcode-dispatch api-key set" });
+      return 1;
+    }
     try {
       ensureCliHome();
     } catch (error) {
@@ -1104,7 +1105,6 @@ async function runJob(id, jobsDir, token) {
     const argv = buildCliArgv({ bin: paths.bin, prompt, workspaceRoot: record.workspaceRoot, sessionId: record.resumeOf ? record.sessionId : null });
     appendLog(log, `start ${id}: ${JSON.stringify(paths.node)} ${summarizeArgv(argv)}`);
     appendLog(log, describeCliEnv(env));
-    appendLog(log, `auth: ${authModeOf(pinned)}`); // the mode only, never the key
     const redact = keyRedactor(personalConfigFile(), pinned);
     const result = await runCli({
       node: paths.node,
@@ -1248,24 +1248,23 @@ async function cmdDoctor(args) {
   } catch (error) {
     report("FAIL", "cli-home", `cannot create ${cliHome()}: ${error.message}`);
   }
-  let auth = null;
+  let keyed = null;
   try {
     pinPersonalConfig(personalConfigFile());
     const written = readJson(personalConfigFile()) ?? {};
-    auth = authModeOf(written);
-    const expected = selectionFor(written);
+    keyed = hasApiKey(written);
     const selection = pick(written, SELECTION_PATH);
-    if (JSON.stringify(selection) === JSON.stringify(expected)) report("ok", "personal-config", `${personalConfigFile()} pins ${PINNED_MODEL} via ${expected.providerId}`);
-    else report("FAIL", "personal-config", `${personalConfigFile()}: ${SELECTION_PATH} does not hold the ${auth} selection after pinning`);
+    if (JSON.stringify(selection) === JSON.stringify(PINNED_SELECTION)) report("ok", "personal-config", `${personalConfigFile()} pins ${PINNED_MODEL} via ${PINNED_SELECTION.providerId}`);
+    else report("FAIL", "personal-config", `${personalConfigFile()}: ${SELECTION_PATH} does not hold PINNED_SELECTION after pinning`);
   } catch (error) {
     report("FAIL", "personal-config", `cannot pin ${personalConfigFile()}: ${error.message}`);
   }
-  if (auth === "api-key") {
+  if (keyed === true) {
     const problem = apiKeyTemplateProblem(paths.providerConfig);
-    if (problem) report("FAIL", "auth", `a Coding Plan API key is configured, but ${problem}; zcode-dispatch api-key clear returns to the OAuth login`);
+    if (problem) report("FAIL", "auth", `a Coding Plan API key is configured, but ${problem}`);
     else report("ok", "auth", `Coding Plan API key (personal provider ${API_KEY_PROVIDER_ID} from ZCode's template ${API_KEY_TEMPLATE_ID}): no token exchange, no expiry`);
-  } else if (auth === "oauth") {
-    report("WARN", "auth", "OAuth login (zcode-dispatch login): the CLI keeps no refresh token, so the login expires about an hour after it was made and GLM then falls back to Luna; for unattended runs store a Coding Plan API key: zcode-dispatch api-key set");
+  } else if (keyed === false) {
+    report("FAIL", "auth", `no Coding Plan API key in ${personalConfigFile()}; the user stores one: zcode-dispatch api-key set (keys: ${API_KEY_MANAGEMENT_URL})`);
   }
   if (process.env.SP_IMPLEMENTER === "luna") report("WARN", "kill-switch", "SP_IMPLEMENTER=luna is set; task will refuse");
   else report("ok", "kill-switch", "SP_IMPLEMENTER is not luna");
@@ -1290,7 +1289,6 @@ async function cmdDoctor(args) {
 // One synchronous PONG request: the only diagnostic that spends quota.
 async function runProbe(paths, appVersion, root) {
   const pinned = pinPersonalConfig(personalConfigFile());
-  const auth = authModeOf(pinned);
   ensureCliHome();
   const argv = buildCliArgv({ bin: paths.bin, prompt: PROBE_PROMPT, workspaceRoot: root, sessionId: null });
   const result = await runCli({
@@ -1325,44 +1323,12 @@ async function runProbe(paths, appVersion, root) {
     ].join("\n") + "\n",
   );
   if (!modelSelected && result.stderrTail.trim()) process.stderr.write(`${result.stderrTail.split("\n").slice(-20).join("\n")}\n`);
-  if ((verdict.errorClass === "auth" || verdict.errorClass === "model-not-selected") && auth === "api-key") {
+  if (verdict.errorClass === "auth" || verdict.errorClass === "model-not-selected") {
     process.stderr.write(
       `hint: the ZCode CLI could not use the Coding Plan API key in ${personalConfigFile()} (revoked, mistyped, its plan has no GLM access, or this ZCode version treats the zai-api template differently); store a valid one: zcode-dispatch api-key set (keys: ${API_KEY_MANAGEMENT_URL})\n`,
     );
-  } else if (verdict.errorClass === "auth" || verdict.errorClass === "model-not-selected") {
-    process.stderr.write(
-      `hint: the ZCode CLI is not logged in (or its login expired) in ${cliHome()}; run: zcode-dispatch login (prefix ZCODE_HTTP_PROXY=<proxy url> if the CLI needs a proxy on this machine); a Coding Plan API key does not expire: zcode-dispatch api-key set\n`,
-    );
   }
   return ok ? 0 : 1;
-}
-
-// `login [zai]` — the user's CLI login, in the foreground: the CLI's own `zcode login zai` with exactly
-// the environment of every wrapper run (buildCliEnv: provider config, real app version, the wrapper's
-// personal config, the cli-home environment, ZCODE_HTTP_PROXY via the allowlist), stdio inherited so the
-// user sees the browser URL. The login rewrites the personal config's default selection, so a successful
-// login is followed by a re-pin. Exit code = the CLI's. Never reads or prints a credential.
-function cmdLogin(args) {
-  const { positionals } = parse(args, {}, 1);
-  if (positionals.length === 1 && positionals[0] !== "zai") throw new UsageError(`login supports only the zai provider, got "${positionals[0]}"`);
-  const paths = zcodePaths();
-  const appVersion = readAppVersion(paths.plist);
-  if (!appVersion) throw new UsageError(`cannot read ${APP_VERSION_PLIST_KEY} from ${paths.plist}; refusing to run with an unknown client version`);
-  if (!fs.existsSync(paths.bin)) throw new UsageError(`ZCode CLI not found: ${paths.bin}`);
-  if (!fs.existsSync(paths.providerConfig)) throw new UsageError(`ZCode provider config not found: ${paths.providerConfig}`);
-  const home = ensureCliHome();
-  const run = spawnSync(paths.node, [paths.bin, "login", "zai"], { env: buildCliEnv(paths, appVersion), stdio: "inherit" });
-  if (run.error) throw new Error(`cannot run ${paths.node} ${paths.bin} login zai: ${run.error.message}`);
-  if (run.status !== 0) {
-    process.stderr.write(`zcode-dispatch: login failed (CLI ${run.status === null ? `signal ${run.signal}` : `exit ${run.status}`}); nothing re-pinned\n`);
-    return run.status ?? 1;
-  }
-  const auth = authModeOf(pinPersonalConfig(personalConfigFile()));
-  process.stdout.write(`login: ok — ZCode CLI login stored in ${home}; ${personalConfigFile()} re-pinned to ${PINNED_MODEL}\n`);
-  if (auth === "api-key") {
-    process.stdout.write(`login: note — a Coding Plan API key is configured and runs keep using it; to use this login instead: zcode-dispatch api-key clear\n`);
-  }
-  return 0;
 }
 
 // Reads one secret line: from a pipe until EOF, or from a terminal with echo off. Never echoes it.
@@ -1405,7 +1371,8 @@ async function readSecretLine(promptText) {
 // never an argument (visible in ps and shell history) or a variable (the CLI's tools inherit the CLI's
 // whole environment). Stored only in the wrapper's personal provider config (mode 0600) as a provider of
 // ZCode's own template API_KEY_TEMPLATE_ID; the CLI then sends it itself — no OAuth exchange, no expiry.
-// `api-key clear` removes it; runs fall back to the CLI's OAuth login. Neither verb runs the CLI or prints the key.
+// `api-key clear` removes it, which switches the GLM channel off (task refuses, doctor fails `auth`) until
+// a key is stored again. Neither verb runs the CLI or prints the key.
 async function cmdApiKey(args) {
   // Arguments are never echoed: a key typed as an argument must not reach stderr (parse() would print it).
   const [action, ...rest] = args;
@@ -1413,7 +1380,7 @@ async function cmdApiKey(args) {
   if (action === "clear") {
     if (rest.length > 0) throw new UsageError("usage: zcode-dispatch api-key clear (no arguments)");
     setApiKeyRule(personalConfigFile(), null);
-    process.stdout.write(`api-key: cleared from ${personalConfigFile()}; runs use the CLI's OAuth login again (zcode-dispatch login), pinned to ${PINNED_MODEL}\n`);
+    process.stdout.write(`api-key: cleared from ${personalConfigFile()}; the GLM channel is off until a key is stored again (zcode-dispatch api-key set)\n`);
     return 0;
   }
   if (action !== "set") throw new UsageError("usage: zcode-dispatch api-key <set|clear> (set reads the key on stdin)");
@@ -1454,14 +1421,12 @@ export async function main(argv) {
         return cmdReleaseStale(rest);
       case "doctor":
         return await cmdDoctor(rest);
-      case "login":
-        return cmdLogin(rest);
       case "api-key":
         return await cmdApiKey(rest);
       case "__run":
         return await runJob(rest[0], rest[1], rest[2]);
       default:
-        throw new UsageError(`usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor|login|api-key> [args...]${verb ? ` (unknown verb: ${verb})` : ""}`);
+        throw new UsageError(`usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor|api-key> [args...]${verb ? ` (unknown verb: ${verb})` : ""}`);
     }
   } catch (error) {
     process.stderr.write(`zcode-dispatch: ${error.message}\n`);

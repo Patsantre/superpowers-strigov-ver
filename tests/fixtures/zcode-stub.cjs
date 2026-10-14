@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 // Test stand-in for ZCode's zcode.cjs, selected via ZCODE_BIN. Never calls a model.
-// ZCODE_STUB_MODE: ok | pong | resume | record | login | leak | model-not-selected | auth | quota |
+// ZCODE_STUB_MODE: ok | pong | resume | record | leak | model-not-selected | auth | quota |
 //                  launch | hang | ignore-term | split-utf8 | crash | malformed
-// ZCODE_STUB_RECORD: file the `record` mode (and `login`, when set) writes, including envAll and
+// ZCODE_STUB_RECORD: file the `record` mode writes, including envAll and
 // `resolved`, the stub's model of where the CLI keeps its state; ZCODE_STUB_DELAY_MS: wait before acting;
 // ZCODE_STUB_MESSAGE: stderr text for the four error modes; ZCODE_STUB_TERM_DELAY_MS: how long ignore-term waits after SIGTERM before exiting;
-// ZCODE_STUB_EXIT: the exit code of the `login` and `leak` modes (default 0).
+// ZCODE_STUB_EXIT: the exit code of the `leak` mode (default 0).
 // Tests explicitly list ZCODE_STUB_* in ZCODE_ENV_PASSTHROUGH because the wrapper filters the CLI env.
 "use strict";
 const fs = require("node:fs");
@@ -120,29 +120,6 @@ async function run() {
     case "record":
       writeStubRecord(flag("-p") === "-" ? await readStdin() : null);
       return emit("DONE\nrecorded");
-    case "login": {
-      // Stand-in for `zcode login zai`: records the run (when ZCODE_STUB_RECORD is set), then writes
-      // what the real login writes — a credential into the store the CLI resolves (resolvedPaths:
-      // ZCODE_DATA_BASE_DIR, else HOME) and its GLM-5.3 default selection into the personal provider
-      // config, keeping the file's other content as the real saveConfiguredDefault does
-      // (update(o => ({...o, defaultModelSelection}))) — prints a login URL, and exits with ZCODE_STUB_EXIT.
-      if (argv.length !== 2 || argv[0] !== "login" || argv[1] !== "zai") fail(`stub login mode: expected argv "login zai", got ${JSON.stringify(argv)}`);
-      if (process.env.ZCODE_STUB_RECORD) writeStubRecord(null);
-      const store = resolvedPaths().credentials;
-      fs.mkdirSync(path.dirname(store), { recursive: true });
-      fs.writeFileSync(store, JSON.stringify({ "oauth:zai:access_token": "stub-secret-token-0123" }));
-      let personal = null;
-      try {
-        personal = JSON.parse(fs.readFileSync(process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, "utf8"));
-      } catch {
-        personal = null;
-      }
-      if (!personal || typeof personal !== "object" || Array.isArray(personal)) personal = { schemaVersion: 1 };
-      personal.config = { ...(personal.config ?? {}), loginWrote: true, defaultModelSelection: { providerId: "account:zai-individual-coding-plan", modelId: "GLM-5.3" } };
-      fs.writeFileSync(process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, JSON.stringify(personal));
-      process.stdout.write("Open this URL to log in: https://example.invalid/stub-login\nModel: account:zai-individual-coding-plan/GLM-5.3\n");
-      return process.exit(Number(process.env.ZCODE_STUB_EXIT || 0));
-    }
     case "leak": {
       // Stand-in for GLM's shell printing the personal provider config (in api-key mode it holds the key),
       // now and as read at process start: the text goes to stderr in two chunks split inside the first key

@@ -180,6 +180,8 @@ process.exit(ok ? 0 : 1);'
     local prompt="$TEST_ROOT/prompt.md"
     printf '## ZCode headless run — read this first\n\nImplement the thing.\n' > "$prompt"
     cd "$repo"
+    # The only auth (0.10.0): a Coding Plan API key in the personal config; every CLI run needs one.
+    printf '%s\n' "setup-fake-key-0123456789" | "$ZD" api-key set >/dev/null
 
     local out rc id st ec rec child runner
 
@@ -872,11 +874,11 @@ process.exit(injected && runner.status === "cancelled" && m.readRecord(file).sta
         if grep -Eq "^(ok|WARN) $c: " <<<"$out"; then checks=$((checks + 1)); fi
     done
     if [[ "$rc" -eq 0 && "$checks" -eq 12 && "$(tail -1 <<<"$out")" == "doctor: ok" ]] && ! grep -q '^FAIL' <<<"$out" \
-        && grep -Fqx "ok cli-home: $cli_home" <<<"$out" && grep -Eq '^WARN auth: OAuth login .*zcode-dispatch api-key set$' <<<"$out" \
-        && grep -Fq "pins GLM-5.3-Flash\$max via account:zai-individual-coding-plan" <<<"$out"; then
-        pass "11 doctor against the fixtures: 12 checks ok/WARN, including env ('ok cli-home: <state root>/cli-home') and 'WARN auth' for the expiring OAuth login, 'doctor: ok', exit 0"
+        && grep -Fqx "ok cli-home: $cli_home" <<<"$out" && grep -Fq "ok auth: Coding Plan API key" <<<"$out" \
+        && grep -Fq "pins GLM-5.3-Flash\$max via zai-api" <<<"$out"; then
+        pass "11 doctor against the fixtures: 12 checks ok/WARN, including env ('ok cli-home: <state root>/cli-home') and 'ok auth' for the stored key, 'doctor: ok', exit 0"
     else
-        fail "11 doctor against the fixtures: 12 checks ok/WARN, including env ('ok cli-home: <state root>/cli-home') and 'WARN auth' for the expiring OAuth login, 'doctor: ok', exit 0"
+        fail "11 doctor against the fixtures: 12 checks ok/WARN, including env ('ok cli-home: <state root>/cli-home') and 'ok auth' for the stored key, 'doctor: ok', exit 0"
         echo "    exit: $rc"
         echo "$out" | sed 's/^/    /'
     fi
@@ -956,10 +958,10 @@ process.exit(injected && runner.status === "cancelled" && m.readRecord(file).sta
     rc=0
     out="$(ZCODE_STUB_MODE=auth ZCODE_STUB_MESSAGE="$(first_pattern auth)" "$ZD" doctor --probe 2>"$TEST_ROOT/probe-auth.err")" || rc=$?
     if [[ "$rc" -eq 1 && "$out" == *"model-selected: FAIL(auth)"* && "$(tail -1 <<<"$out")" == "probe: FAIL" ]] \
-        && grep -Fq "run: zcode-dispatch login" "$TEST_ROOT/probe-auth.err"; then
-        pass "12 doctor --probe with auth: FAIL(auth), exit 1, stderr hint 'run: zcode-dispatch login'"
+        && grep -Fq "store a valid one: zcode-dispatch api-key set" "$TEST_ROOT/probe-auth.err"; then
+        pass "12 doctor --probe with auth: FAIL(auth), exit 1, stderr hint 'store a valid one: zcode-dispatch api-key set'"
     else
-        fail "12 doctor --probe with auth: FAIL(auth), exit 1, stderr hint 'run: zcode-dispatch login'"
+        fail "12 doctor --probe with auth: FAIL(auth), exit 1, stderr hint 'store a valid one: zcode-dispatch api-key set'"
         echo "    exit: $rc stderr: $(tail -3 "$TEST_ROOT/probe-auth.err")"
         echo "$out" | sed 's/^/    /'
     fi
@@ -973,65 +975,27 @@ process.exit(injected && runner.status === "cancelled" && m.readRecord(file).sta
     fi
     rc=0
     out="$(ZCODE_STUB_MODE=quota ZCODE_STUB_MESSAGE="$(first_pattern quota)" "$ZD" doctor --probe 2>"$TEST_ROOT/probe-quota.err")" || rc=$?
-    if [[ "$rc" -eq 1 && "$out" == *"model-selected: FAIL(quota)"* ]] && ! grep -Fq "zcode-dispatch login" "$TEST_ROOT/probe-quota.err"; then
-        pass "12 doctor --probe with quota: FAIL(quota), no login hint"
+    if [[ "$rc" -eq 1 && "$out" == *"model-selected: FAIL(quota)"* ]] && ! grep -Fq "hint:" "$TEST_ROOT/probe-quota.err"; then
+        pass "12 doctor --probe with quota: FAIL(quota), no auth hint"
     else
-        fail "12 doctor --probe with quota: FAIL(quota), no login hint"
+        fail "12 doctor --probe with quota: FAIL(quota), no auth hint"
         echo "    exit: $rc stderr: $(tail -3 "$TEST_ROOT/probe-quota.err")"
     fi
 
-    # --- 14. login: the CLI's own `zcode login zai` in the wrapper's cli-home (Ф4a) ---
+    # --- 14. no login verb (0.10.0): the CLI's OAuth login expires after about an hour ---
     local login_out
     rc=0
-    login_out="$(ZCODE_STUB_MODE=login ZCODE_STUB_RECORD="$TEST_ROOT/login-record.json" ZCODE_HTTP_PROXY=http://127.0.0.1:9 \
-        ZCODE_DATA_BASE_DIR="$TEST_ROOT/foreign-data-home" ANTHROPIC_API_KEY=fake-login-key GITHUB_TOKEN=fake-login-gh \
-        "$ZD" login 2>&1)" || rc=$?
-    if [[ "$rc" -eq 0 && "$login_out" == *"https://example.invalid/stub-login"* && "$login_out" == *"login: ok"* \
-        && "$login_out" != *"stub-secret-token"* && -f "$cli_home/.zcode/v2/credentials.json" \
-        && ! -e "$HOME/.zcode" && ! -e "$TEST_ROOT/foreign-data-home" ]] \
-        && REC="$TEST_ROOT/login-record.json" CFG="$cfg" VER="$want_version" PCFG="$pcfg" CLI_HOME="$cli_home" \
-        WANT_PATH="$PATH" WANT_HOME="$HOME" \
-        SEL_PATH="$sel_path" PINNED="$pinned" node -e '
-const fs = require("node:fs");
-const r = JSON.parse(fs.readFileSync(process.env.REC, "utf8"));
-const e = r.envAll;
-const after = JSON.parse(fs.readFileSync(process.env.PCFG, "utf8"));
-const at = (o) => process.env.SEL_PATH.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
-const ok = JSON.stringify(r.argv) === JSON.stringify(["login", "zai"])
-  && r.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE === process.env.CFG
-  && r.env.ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE === process.env.CFG
-  && r.env.ZCODE_APP_VERSION === process.env.VER
-  && r.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE === process.env.PCFG
-  && r.env.ZCODE_HTTP_PROXY === "http://127.0.0.1:9"
-  && e.PATH === process.env.WANT_PATH && e.HOME === process.env.WANT_HOME
-  && e.ZCODE_HTTP_PROXY === "http://127.0.0.1:9"
-  && !Object.hasOwn(e, "ANTHROPIC_API_KEY") && !Object.hasOwn(e, "GITHUB_TOKEN")
-  && !Object.hasOwn(e, "ZCODE_SESSION_DB") && !Object.hasOwn(e, "ZCODE_ENV_PASSTHROUGH")
-  && after.config?.loginWrote === true
-  && JSON.stringify(at(after)) === process.env.PINNED;
-process.exit(ok ? 0 : 1);' && cli_home_env_ok "$TEST_ROOT/login-record.json"; then
-        pass "14 login (no argument = zai) gets the allowlisted env (PATH, HOME, ZCODE_HTTP_PROXY; no fake secrets or ZCODE_SESSION_DB), prints the browser URL, then re-pins PINNED_SELECTION; credential lands only under cli-home and is never printed"
+    login_out="$("$ZD" login 2>&1)" || rc=$?
+    if [[ "$rc" -eq 2 && "$login_out" == *"unknown verb: login"* ]]; then
+        pass "14 there is no login verb: 'zcode-dispatch login' is an unknown verb (exit 2)"
     else
-        fail "14 login (no argument = zai) gets the allowlisted env (PATH, HOME, ZCODE_HTTP_PROXY; no fake secrets or ZCODE_SESSION_DB), prints the browser URL, then re-pins PINNED_SELECTION; credential lands only under cli-home and is never printed"
-        echo "    exit: $rc out: $login_out"
-        echo "    record: $(head -c 600 "$TEST_ROOT/login-record.json" 2>/dev/null)"
-    fi
-    rc=0
-    login_out="$(ZCODE_STUB_MODE=login ZCODE_STUB_EXIT=7 "$ZD" login zai 2>&1)" || rc=$?
-    if [[ "$rc" -eq 7 && "$login_out" != *"login: ok"* ]]; then
-        pass "14 login zai returns the CLI's exit code (7) and reports no success"
-    else
-        fail "14 login zai returns the CLI's exit code (7) and reports no success"
+        fail "14 there is no login verb: 'zcode-dispatch login' is an unknown verb (exit 2)"
         echo "    exit: $rc out: $login_out"
     fi
-    expect_exit 2 "14 login with a provider other than zai is refused (exit 2)" "$ZD" login bigmodel
-    expect_exit 2 "14 login with an extra argument is refused (exit 2)" "$ZD" login zai extra
-    expect_exit 2 "14 login with an unknown flag is refused (exit 2)" "$ZD" login --bogus
-    expect_exit 2 "14 login with ZCODE_APP without a readable Info.plist is refused (exit 2)" env ZCODE_APP="$TEST_ROOT/NoPlist.app" "$ZD" login
 
     # --- 15. api-key: the user's Coding Plan API key as a provider of ZCode's "zai-api" template ---
     local fake_key="fake-zai-key.0123456789abcdef" key_out key_err api_sel mode_of
-    api_sel="$(const_of API_KEY_SELECTION)"
+    api_sel="$pinned"
     mode_of() { F="$1" node -e 'console.log((require("node:fs").statSync(process.env.F).mode & 0o777).toString(8))'; }
     # An unrelated personal rule (as if the user had one) must survive set and clear; a 0644 file becomes 0600.
     PCFG="$pcfg" node -e '
@@ -1053,9 +1017,9 @@ const want = { providerId: "zai-api", templateId: "zai-api", config: { group: "s
 process.exit(rules.length === 2 && rules[0].providerId === "other-provider"
   && JSON.stringify(rules[1]) === JSON.stringify(want)
   && JSON.stringify(at(o)) === process.env.API_SEL ? 0 : 1);'; then
-        pass "15 api-key set (stdin) stores the key only as the zai-api template rule in the personal config (canonical shape, other rules kept), pins API_KEY_SELECTION, makes the file 0600, never prints the key"
+        pass "15 api-key set (stdin) stores the key only as the zai-api template rule in the personal config (canonical shape, other rules kept), pins PINNED_SELECTION, makes the file 0600, never prints the key"
     else
-        fail "15 api-key set (stdin) stores the key only as the zai-api template rule in the personal config (canonical shape, other rules kept), pins API_KEY_SELECTION, makes the file 0600, never prints the key"
+        fail "15 api-key set (stdin) stores the key only as the zai-api template rule in the personal config (canonical shape, other rules kept), pins PINNED_SELECTION, makes the file 0600, never prints the key"
         echo "    exit: $rc out: $key_out mode: $(mode_of "$pcfg")"
     fi
 
@@ -1076,7 +1040,7 @@ process.exit(rules.length === 2 && rules[0].providerId === "other-provider"
     export ZCODE_STUB_MODE=ok
     local key_log
     key_log="$(find "$ZCODE_STATE_DIR/state" -name "$id.log" | head -1)"
-    if [[ "$st" == completed ]] && grep -Fq "auth: api-key" "$key_log" && ! grep -Fq "$fake_key" "$key_log" \
+    if [[ "$st" == completed ]] && ! grep -Fq "$fake_key" "$key_log" \
         && ! grep -Fq "$fake_key" <<<"$("$ZD" status "$id" --json)" \
         && REC="$TEST_ROOT/key-task-record.json" SEL_PATH="$sel_path" API_SEL="$api_sel" KEY="$fake_key" node -e '
 const fs = require("node:fs");
@@ -1087,9 +1051,9 @@ const inArgv = r.argv.some((a) => a.includes(process.env.KEY));
 const rule = r.personalConfig.config.providerConfigRules.providerRules.find((x) => x.providerId === "zai-api");
 process.exit(!inEnv && !inArgv && rule?.config?.access?.apiKey === process.env.KEY
   && JSON.stringify(at(r.personalConfig)) === process.env.API_SEL ? 0 : 1);'; then
-        pass "15 a task in api-key mode: the CLI reads the key from the personal config only (not argv, not env), pinned to API_KEY_SELECTION; the job log says 'auth: api-key' and holds no key"
+        pass "15 a task in api-key mode: the CLI reads the key from the personal config only (not argv, not env), pinned to PINNED_SELECTION; the job log holds no key"
     else
-        fail "15 a task in api-key mode: the CLI reads the key from the personal config only (not argv, not env), pinned to API_KEY_SELECTION; the job log says 'auth: api-key' and holds no key"
+        fail "15 a task in api-key mode: the CLI reads the key from the personal config only (not argv, not env), pinned to PINNED_SELECTION; the job log holds no key"
         echo "    status: $st log: $key_log"
     fi
 
@@ -1152,21 +1116,6 @@ process.exit(!inEnv && !inArgv && rule?.config?.access?.apiKey === process.env.K
         echo "    status: $st child: $child result: $leak_result"
     fi
     printf '%s\n' "$fake_key" | "$ZD" api-key set >/dev/null
-
-    rc=0
-    login_out="$(ZCODE_STUB_MODE=login "$ZD" login 2>&1)" || rc=$?
-    if [[ "$rc" -eq 0 && "$login_out" == *"login: ok"* && "$login_out" == *"api-key clear"* ]] \
-        && PCFG="$pcfg" SEL_PATH="$sel_path" API_SEL="$api_sel" node -e '
-const fs = require("node:fs");
-const o = JSON.parse(fs.readFileSync(process.env.PCFG, "utf8"));
-const at = (x) => process.env.SEL_PATH.split(".").reduce((a, k) => (a == null ? undefined : a[k]), x);
-process.exit(o.config.loginWrote === true && JSON.stringify(at(o)) === process.env.API_SEL ? 0 : 1);' \
-        && [[ "$(mode_of "$pcfg")" == 600 ]]; then
-        pass "15 login while a key is set: the login's default is re-pinned to API_KEY_SELECTION (key kept, file 0600) and the output says how to switch (api-key clear)"
-    else
-        fail "15 login while a key is set: the login's default is re-pinned to API_KEY_SELECTION (key kept, file 0600) and the output says how to switch (api-key clear)"
-        echo "    exit: $rc out: $login_out"
-    fi
 
     # Refusals: nothing is stored, and no argument is echoed (a key typed as an argument must not leak).
     local before_cfg
@@ -1273,10 +1222,29 @@ process.exit(o.config.loginWrote === true && JSON.stringify(at(o)) === process.e
         echo "    exit: $rc state-root mode: $(mode_of "$ZCODE_STATE_DIR")"
     fi
 
+    # A rotated key that extends an older one is redacted whole (longest form first).
+    if ZD_MJS="$MJS" T="$TEST_ROOT" node --input-type=module -e '
+const { pathToFileURL } = await import("node:url");
+const fs = await import("node:fs");
+const m = await import(pathToFileURL(process.env.ZD_MJS).href);
+const f = `${process.env.T}/redact-order.json`;
+const cfg = (k) => ({ schemaVersion: 1, config: { providerConfigRules: { providerRules: [{ providerId: "zai-api", templateId: "zai-api", config: { group: "standard-personal", access: { type: "zhipu-coding-plan-api-key", apiKey: k } } }] } } });
+fs.writeFileSync(f, JSON.stringify(cfg("abcdefgh12")));
+const redact = m.keyRedactor(f);
+fs.writeFileSync(`${f}.tmp`, JSON.stringify(cfg("abcdefgh12SECRET")));
+fs.renameSync(`${f}.tmp`, f);
+const out = redact("x abcdefgh12SECRET y abcdefgh12 z");
+process.exit(!out.includes("SECRET") && !out.includes("abcdefgh12") && out.split("<redacted: Coding Plan API key>").length === 3 ? 0 : 1);'; then
+        pass "15 a rotated key that extends the previous one is redacted whole, with no suffix left behind"
+    else
+        fail "15 a rotated key that extends the previous one is redacted whole, with no suffix left behind"
+    fi
+
     rc=0
     key_out="$("$ZD" api-key clear)" || rc=$?
-    out="$("$ZD" doctor)" || true
-    if [[ "$rc" -eq 0 && "$key_out" == "api-key: cleared from $pcfg"* && "$out" == *"WARN auth: OAuth login"* && "$(mode_of "$pcfg")" == 600 ]] \
+    local doctor_rc=0
+    out="$("$ZD" doctor)" || doctor_rc=$?
+    if [[ "$rc" -eq 0 && "$key_out" == "api-key: cleared from $pcfg"* && "$doctor_rc" -eq 1 && "$out" == *"FAIL auth: no Coding Plan API key"* && "$(mode_of "$pcfg")" == 600 ]] \
         && PCFG="$pcfg" SEL_PATH="$sel_path" PINNED="$pinned" KEY="$fake_key" node -e '
 const fs = require("node:fs");
 const text = fs.readFileSync(process.env.PCFG, "utf8");
@@ -1285,10 +1253,18 @@ const at = (x) => process.env.SEL_PATH.split(".").reduce((a, k) => (a == null ? 
 const rules = o.config.providerConfigRules.providerRules;
 process.exit(!text.includes(process.env.KEY) && rules.length === 1 && rules[0].providerId === "other-provider"
   && JSON.stringify(at(o)) === process.env.PINNED ? 0 : 1);'; then
-        pass "15 api-key clear removes only the key rule (other rules kept), re-pins PINNED_SELECTION; doctor is back to 'WARN auth: OAuth login'"
+        pass "15 api-key clear removes only the key rule (other rules kept), keeps PINNED_SELECTION; doctor then fails 'auth: no Coding Plan API key' (exit 1)"
     else
-        fail "15 api-key clear removes only the key rule (other rules kept), re-pins PINNED_SELECTION; doctor is back to 'WARN auth: OAuth login'"
+        fail "15 api-key clear removes only the key rule (other rules kept), keeps PINNED_SELECTION; doctor then fails 'auth: no Coding Plan API key' (exit 1)"
         echo "    exit: $rc out: $key_out"
+    fi
+    rc=0
+    "$ZD" task --background --prompt-file "$prompt" >"$TEST_ROOT/task-nokey.out" 2>&1 || rc=$?
+    if [[ "$rc" -eq 2 ]] && grep -Fq "no Coding Plan API key is configured" "$TEST_ROOT/task-nokey.out" && grep -Fq "zcode-dispatch api-key set" "$TEST_ROOT/task-nokey.out"; then
+        pass "15 without a key, task is refused (exit 2) with the remedy api-key set; nothing is spawned"
+    else
+        fail "15 without a key, task is refused (exit 2) with the remedy api-key set; nothing is spawned"
+        echo "    exit: $rc out: $(cat "$TEST_ROOT/task-nokey.out")"
     fi
 
     echo ""

@@ -282,11 +282,11 @@ VERDICT: GO
   - File times of both credential stores. No credential file was opened, no token decoded, no login or logout run, no Z.ai API call made.
 - Holds for: ZCode 3.15.1 (zcode 0.16.9)
 - Design consequence (wrapper 0.10.0):
-  - `zcode-dispatch api-key set` reads the user's key from stdin only, never from an argument or a variable. It refuses when the app's built-in config lacks the `zai-api` template (`apiKeyTemplateProblem`). It writes the rule above into the wrapper's personal provider config with mode 0600 and pins `API_KEY_SELECTION`: `zai-api` / GLM-5.3-Flash / `max`. `api-key clear` removes the rule and pins `PINNED_SELECTION` again. Neither verb prints the key.
-  - The pin follows the auth mode on every run (`selectionFor`). A later OAuth `login` keeps the key rule: the CLI's `saveConfiguredDefault` only replaces the default, and the wrapper re-pins to the key.
-  - `doctor` gains the check `auth`: `ok` for the API key, `WARN` for the expiring OAuth login, `FAIL` for a configured key whose template is missing. The probe's auth hint names the mode-specific remedy, and the job log records `auth: api-key|oauth`.
-  - Every installed wrapper copy must be at least 0.10.0 before a key is stored (observed on 2026-10-14; see "Lifetime measurement"). An older wrapper, 0.9.0 included, keeps the key rule but pins `PINNED_SELECTION` (OAuth) again and rewrites the file with the default mode (0644 under umask 022). A 0.10.0 wrapper restores 0600 and the key selection on its next pin.
-  - GLM runs unsandboxed: its shell can read the personal config, whose path is in the CLI's environment, just as it can read the OAuth credential in cli-home. The preamble's no-credentials rule is the only guard in both modes. The wrapper scrubs the key from everything it keeps or prints (`keyRedactor`: raw and JSON-escaped forms in stdout, the response, line-buffered stderr, the job log and the probe's stderr tail). The redactor re-checks the personal config on every call and keeps every key it has seen during the run, so a key stored or rotated by `api-key set` while a job runs is scrubbed too (PR #5 review). It cannot catch a transformed key, for example an encoded one.
+  - `zcode-dispatch api-key set` reads the user's key from stdin only, never from an argument or a variable. It refuses when the app's built-in config lacks the `zai-api` template (`apiKeyTemplateProblem`). It writes the rule above into the wrapper's personal provider config with mode 0600 and pins `PINNED_SELECTION`: `zai-api` / GLM-5.3-Flash / `max`. `api-key clear` removes the rule. Neither verb prints the key.
+  - The OAuth login is dropped: the wrapper has no `login` verb any more, and the Coding Plan API key is the only auth. `PINNED_SELECTION` is now `zai-api` / GLM-5.3-Flash / `max` (it was the account provider of U1). Without a key, `doctor` fails `auth`, `task` refuses (exit 2), and a runner whose key was cleared after queueing finalizes the job as `failed/auth` without spawning the CLI, which would otherwise fall back to another model. `api-key clear` therefore switches the channel off.
+  - `doctor` gains the check `auth`: `ok` for a stored key, `FAIL` without one or when the template is missing. The probe's auth hint names the remedy `api-key set`.
+  - Every installed wrapper copy must be at least 0.10.0 before a key is stored (observed on 2026-10-14; see "Lifetime measurement"). An older wrapper, 0.9.0 included, keeps the key rule but pins the account provider (OAuth) again and rewrites the file with the default mode (0644 under umask 022). A 0.10.0 wrapper restores 0600 and the key selection on its next pin.
+  - GLM runs unsandboxed: its shell can read the personal config, whose path is in the CLI's environment, as it can read any file of the user. The preamble's no-credentials rule is the only guard. The wrapper scrubs the key from everything it keeps or prints (`keyRedactor`: raw and JSON-escaped forms in stdout, the response, line-buffered stderr, the job log and the probe's stderr tail). The redactor re-checks the personal config on every call and keeps every key it has seen during the run, so a key stored or rotated by `api-key set` while a job runs is scrubbed too (PR #5 review). It cannot catch a transformed key, for example an encoded one.
   - Hardening after review:
     - The state root, which holds the personal config, is made 0700 on every write.
     - Read-modify-write of the personal config takes a wrapper lock (`<file>.wrapper-lock`; 5 s wait; a lock older than 30 s counts as stale).
@@ -318,11 +318,10 @@ VERDICT: GO
 | MODEL_MECHANISM | personal-config | U1 |
 | SELECTION_PATH | config.defaultModelSelection | U1 |
 | PERSONAL_CONFIG_BASE | {"schemaVersion":1,"config":{"providerConfigRules":{"providerRules":[]},"modelConfigRules":{"providerModelRules":[],"manualProviderModelRules":[]}}} | U1 |
-| PINNED_SELECTION | {"providerId":"account:zai-individual-coding-plan","modelId":"GLM-5.3-Flash","options":{"reasoningLevel":"max"}} | U1 |
+| PINNED_SELECTION | {"providerId":"zai-api","modelId":"GLM-5.3-Flash","options":{"reasoningLevel":"max"}} (0.10.0; U1 pinned the account provider `account:zai-individual-coding-plan`) | U1; CLI login lifetime |
 | API_KEY_TEMPLATE_ID | zai-api | CLI login lifetime |
 | API_KEY_PROVIDER_ID | zai-api | CLI login lifetime |
 | API_KEY_ACCESS_TYPE | zhipu-coding-plan-api-key | CLI login lifetime |
-| API_KEY_SELECTION | {"providerId":"zai-api","modelId":"GLM-5.3-Flash","options":{"reasoningLevel":"max"}} | CLI login lifetime |
 | RESUME_KEEPS_MODEL | yes | U2 |
 | REPORTED_MODEL_FIELD | none | U3 |
 | USAGE_INPUT_FIELD | inputTokens | U3 |
