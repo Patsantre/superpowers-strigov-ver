@@ -19,9 +19,12 @@ phases:
     scope: "Release 0.8.0: plugin.json, README.md, README.ru.md, PLUGIN_README.md, README SVG text"
     status: done
     commits: "3b8d331.."
+  - id: Ф4a
+    scope: "Separate CLI credential store and state dirs under <state root>/cli-home (ZCODE_DATA_BASE_DIR, ZCODE_STORAGE_DIR, ZCODE_SESSION_DB_PATH, ZCODE_LOG_DIR; ~/.zcode/cli/config.json has no override and stays the CLI's shared file) + zcode-dispatch login [zai] + doctor --probe login hint; stub tests, skills, READMEs, findings (ledger PF-B5, PC1-B1)"
+    status: in-progress
   - id: Ф5
     scope: "[Executor: the user in a fresh plain Claude Code session] live acceptance §8.2 + 1.5x bonus measurement → findings, skill, READMEs"
-    status: in-progress
+    status: pending
 ---
 
 # GLM-5.3-Flash via Z.ai's ZCode CLI as the default implementer — Implementation Plan
@@ -42,7 +45,7 @@ List 3–7 externally observable criteria that define "done" for the whole plan.
 
 1. `docs/zcode-cli-findings.md` exists and resolves spec §10 U1–U8, U10 and U11 — each with the answer, how it was verified and the ZCode version it holds for — plus the `## Inputs for later phases` table (every key of Contract C7 filled) and a `VERDICT: GO | NO-GO` line; on `NO-GO` the plan stops after Ф1 and the user decides.
 2. `bash tests/test-zcode-dispatch.sh` prints `PASS` with zero model calls (the CLI is the stub `tests/fixtures/zcode-stub.cjs`), covering spec §8.1 assertions 1–13; `bash tests/test-sdd-scripts.sh` still prints `PASS`.
-3. `bin/zcode-dispatch` implements `task` / `status` / `result` / `cancel` / `doctor` / `doctor --probe` exactly per Contracts C1–C5 (exit codes 0/1/2, pinned argv and environment, the model pin in its own personal provider config under the state root passed as `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, job records, per-workspace ids, guards); it never sets `ZCODE_DATA_BASE_DIR` and never reads or writes `~/.zcode`.
+3. `bin/zcode-dispatch` implements `task` / `status` / `result` / `cancel` / `doctor` / `doctor --probe` exactly per Contracts C1–C5 (exit codes 0/1/2, pinned argv and environment, the model pin in its own personal provider config under the state root passed as `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, job records, per-workspace ids, guards); since Ф4a (ledger PF-B5, PC1-B1) it also implements `login [zai]` (C1, the one verb that returns the CLI's own exit code) and runs every CLI invocation with the cli-home environment of C5 — `ZCODE_DATA_BASE_DIR` = its own `<state root>/cli-home` (the CLI's credential store) plus `ZCODE_STORAGE_DIR`, `ZCODE_SESSION_DB_PATH` and `ZCODE_LOG_DIR` under it (storage root with plugins, session database, logs) — and it never reads or writes the user's `~/.zcode` itself. The CLI's user config `~/.zcode/cli/config.json` has no override (only `HOME`, which is forbidden): it stays the CLI's normal shared file, read by the CLI on every run, and the design neither edits it nor claims to isolate it.
 4. `skills/dev-orchestrator/SKILL.md`, `skills/dev-orchestrator/implementer-prompt.md`, the new `skills/zcode-invocation/SKILL.md` and `skills/codex-invocation/SKILL.md` encode spec §5–§6.3: the per-phase channel ladder, the `risk_phases` frontmatter map with its guards, the operation / body / dispatch-file / `.id`-sidecar scheme, GLM infrastructure-failure handling, the gate-stall diagnosis, the review-stall Sol escalation, the `impl=` / `glm=` state-line fields with the session marker, the kill switch, the ZCode preamble and channel-switch notice, and the six new Red Flags; frontend phases are routed exactly as before.
 5. Plugin version is `0.8.0` in `.claude-plugin/plugin.json`, `README.md`, `README.ru.md`, `PLUGIN_README.md` and the hero SVG badges; the docs name GLM-5.3-Flash via ZCode as the default implementer, Luna as the fallback and Sol as the risk-phase implementer and escalation, and carry the terms-respecting-GLM-access guardrail.
 6. The live acceptance (spec §8.2) is recorded in `docs/zcode-cli-findings.md`: `doctor` and `doctor --probe` pass, the E2E task ends `DONE` with nothing committed, the fix round appends `## Fix round 1`, and the 1.5× bonus result (active / not active / inconclusive, with raw numbers) also appears in `zcode-invocation` and both READMEs.
@@ -73,8 +76,8 @@ List the spec's project-wide requirements — version floors, dependency limits,
 - Pinned model selection: `PINNED_MODEL = "GLM-5.3-Flash$max"` — one pinned level, no other model or effort (spec §4.9, D2).
 - `bin/lib/zcode-dispatch.mjs` — "pure Node ESM, **no dependencies**, no shell: `child_process.spawn` with argv arrays only." (spec §4.1)
 - No new external dependencies: pure bash + Node built-ins (repo constraint).
-- Exit codes everywhere: "**0** success · **1** runtime failure (failed job on `result`, failed checks on `doctor`, internal error) · **2** usage error or guard refusal." (spec §4.2)
-- "The wrapper never sets `ZCODE_DATA_BASE_DIR`" and "nothing under `~/.zcode` is read or written by the design" (spec §2.1).
+- Exit codes everywhere: "**0** success · **1** runtime failure (failed job on `result`, failed checks on `doctor`, internal error) · **2** usage error or guard refusal." (spec §4.2) Exception since Ф4a: `login` returns the CLI's own exit code (C1); its argument refusals still exit 2.
+- The wrapper sets `ZCODE_DATA_BASE_DIR` to its own `cli-home` under its state root (`<ZCODE_STATE_DIR>/cli-home`), which isolates the CLI's credential store (the cause of the login conflict), and sets `ZCODE_STORAGE_DIR`, `ZCODE_SESSION_DB_PATH` and `ZCODE_LOG_DIR` under it, the CLI's own overrides for its storage root, session database and logs (C5); the wrapper itself reads or writes nothing under the user's `~/.zcode` (shared with the desktop app). The CLI's user config `~/.zcode/cli/config.json` has no override except `HOME` (forbidden): it remains the CLI's normal shared file, which the CLI reads on every run and may migrate in place once; the design does not edit it (ledger PF-B5, PC1-B1; replaces spec §2.1 "The wrapper never sets `ZCODE_DATA_BASE_DIR`").
 - Overrides: "`ZCODE_APP`, `ZCODE_BIN`, `ZCODE_NODE`, `ZCODE_STATE_DIR`, `ZCODE_TASK_TIMEOUT_MIN`. Nothing else is configurable" (spec §4.10).
 - State root default: `~/.claude/plugins/data/superpowers-strigov-ver-zcode` (spec §4.4).
 - Job ids: `zt-NNNN`, "Four digits zero-padded (`zt-0001`), more digits beyond 9999"; "`zt-` ids and Codex `task-` ids never cross dispatchers" (spec §4.4, §4.6).
@@ -112,6 +115,16 @@ List the spec's project-wide requirements — version floors, dependency limits,
 - Modify: `PLUGIN_README.md` — version line, `dev-orchestrator` bullet, `zcode-invocation` bullet, machine-specific assumptions.
 - Modify: `assets/readme/hero-en.svg`, `assets/readme/hero-ru.svg`, `assets/readme/workflow-en.svg`, `assets/readme/workflow-ru.svg` — the builder is named GLM (they name Luna today), badge `v0.8.0`.
 
+**Ф4a**
+- Modify: `bin/lib/zcode-dispatch.mjs` — the cli-home environment (`ZCODE_DATA_BASE_DIR` = `<state root>/cli-home` plus `ZCODE_STORAGE_DIR` / `ZCODE_SESSION_DB_PATH` / `ZCODE_LOG_DIR` under it) on every CLI run, the `cli-home` doctor check, the `doctor --probe` login hint, the `login [zai]` verb.
+- Modify: `bin/zcode-dispatch` — the usage comment names `login`.
+- Modify: `tests/fixtures/zcode-stub.cjs` — stub mode `login`; `record` also records `ZCODE_HTTP_PROXY`.
+- Modify: `tests/test-zcode-dispatch.sh` — cli-home, probe-hint and `login` assertions (55 → 64).
+- Modify: `skills/zcode-invocation/SKILL.md` — "One-time setup" through `"$ZDISPATCH" login`, the `login` row, the environment line, login expiry, session paths.
+- Modify: `skills/dev-orchestrator/SKILL.md` — the auth-failure announcements tell the user to run the login verb; Red Flag wording.
+- Modify: `README.md`, `README.ru.md`, `PLUGIN_README.md` — the setup line names `zcode-dispatch login`; the wrapper's verb list.
+- Modify: `docs/zcode-cli-findings.md` — new section `## CLI data home — …` (the diagnosis behind Ф4a and the table of the CLI's state resolvers and their overrides).
+
 **Ф5**
 - Modify: `docs/zcode-cli-findings.md` — `## Live acceptance` section.
 - Modify: `skills/zcode-invocation/SKILL.md` — the quota-bonus line under "Verified facts".
@@ -141,15 +154,29 @@ zcode-dispatch release-stale [--cwd <path>]
     I/O or internal error → exit 1
 zcode-dispatch doctor [--cwd <path>] [--probe]
     one line per check "<ok|WARN|FAIL> <check>: <detail>" for, in order:
-    app, cli, provider-config, node, app-version, git, state-dir, personal-config, kill-switch
+    app, cli, provider-config, node, app-version, git, state-dir, cli-home, personal-config, kill-switch
+    (cli-home, Ф4a: "ok cli-home: <ZCODE_STATE_DIR>/cli-home" once the directory exists with mode 0700, else FAIL)
     then "doctor: ok" | "doctor: FAIL" (exit 1 on any FAIL; --probe sends no request then)
     --probe, after "doctor: ok":
-      model-selected: ok | FAIL(<errorClass>)   (FAIL(model-not-selected|auth): the CLI is not logged in — the user's one-time `zcode login zai`)
+      model-selected: ok | FAIL(<errorClass>)   (FAIL(model-not-selected|auth): the CLI is not logged in in cli-home's credential store, or its login expired)
       answers: ok | FAIL
       reported-model: <string> | unreported
       usage: input=<n|-> cached=<n|-> output=<n|->
       probe: ok | FAIL                       (exit 0 iff probe: ok)
-exit codes: 0 success · 1 runtime failure · 2 usage error or guard refusal
+      on FAIL(auth) or FAIL(model-not-selected), the last stderr line is (Ф4a):
+      hint: the ZCode CLI is not logged in (or its login expired) in <cli-home>; run: zcode-dispatch login (prefix ZCODE_HTTP_PROXY=<proxy url> if the CLI needs a proxy on this machine)
+zcode-dispatch login [zai]                   (Ф4a, ledger PF-B5 — the user's action, never the orchestrator's)
+    runs <ZCODE_NODE> <ZCODE_BIN> login zai in the foreground, stdio inherited (the CLI shows the browser URL),
+    with exactly the C5 environment (the cli-home environment: ZCODE_DATA_BASE_DIR = cli-home, created with mode 0700,
+    plus ZCODE_STORAGE_DIR / ZCODE_SESSION_DB_PATH / ZCODE_LOG_DIR under it; inherited ZCODE_HTTP_PROXY)
+    CLI exit 0 → pinPersonalConfig, then stdout
+                 "login: ok — ZCode CLI login stored in <cli-home>; <personal config> re-pinned to GLM-5.3-Flash$max", exit 0
+    CLI exit n ≠ 0 → stderr "zcode-dispatch: login failed (CLI exit <n>); nothing re-pinned", exit n
+                     (killed by a signal: "(CLI signal <name>)", exit 1)
+    an argument other than zai, extra arguments, unknown flags, Info.plist unreadable, zcode.cjs or provider config missing → exit 2
+    cli-home cannot be created, the CLI cannot be spawned, or the re-pin fails → "zcode-dispatch: <reason>" on stderr, exit 1
+    never reads or prints a credential
+exit codes: 0 success · 1 runtime failure · 2 usage error or guard refusal (login passes the CLI's own exit code through)
 ```
 
 Guards on `task` (exit 2, nothing spawned): missing `--background`; `--resume-task` with `--fresh`; `SP_IMPLEMENTER=luna`; `--cwd` not in a git work tree; missing / whitespace-only prompt file, or (argv transport) larger than `MAX_PROMPT_BYTES`; `Info.plist` unreadable; `ZCODE_BIN` or provider config missing; bad `--resume-task` (non-`zt-` id, unknown, `running`, `failed`/`cancelled`, no `sessionId`); another `running` job in the workspace, or the workspace write reservation held (holder runner alive → the guard message; holder gone → the stale message, see below); invalid `ZCODE_TASK_TIMEOUT_MIN`; unknown verbs or flags. `status` / `result` / `cancel` with an unknown or non-`zt-` id → exit 2.
@@ -189,7 +216,7 @@ No automatic reclaim (ledger F4-B1-Ф2): `task` never reclaims a stale reservati
 
 ### C3. State layout
 
-`<ZCODE_STATE_DIR>/state/<basename(root)>-<first 8 hex of sha1(root)>/jobs/zt-NNNN.{json,log}` (plus `zt-NNNN.json.terminal` once the job is terminal, C2), the generation-numbered workspace write reservation files of C1 in that same workspace state dir (`active.lock.<gen>`, the highest generation being the current reservation, and `active.lock.<gen>.released` once its holder — or, for a stale reservation, the explicit `release-stale` verb (ledger F4-B1-Ф2) — released it; the generation files and their release records are the only lock, and a stale reservation is never reclaimed automatically, so after a runner crash the workspace stays blocked until `release-stale` runs; ledger F3-B1-Ф2; old generations and release records are never cleaned up, so they accumulate per workspace at a few bytes each), and `<ZCODE_STATE_DIR>/personal-provider-config.json` (the wrapper-owned personal provider config, C5), where `root` = `git rev-parse --show-toplevel` evaluated in `--cwd` (default: process cwd). The log holds the CLI's stderr plus `[zcode-dispatch] <ISO time> …` lines (argv summary with the prompt replaced by `<prompt N bytes>`, start/finish, classification reason, raw stdout on failure).
+`<ZCODE_STATE_DIR>/state/<basename(root)>-<first 8 hex of sha1(root)>/jobs/zt-NNNN.{json,log}` (plus `zt-NNNN.json.terminal` once the job is terminal, C2), the generation-numbered workspace write reservation files of C1 in that same workspace state dir (`active.lock.<gen>`, the highest generation being the current reservation, and `active.lock.<gen>.released` once its holder — or, for a stale reservation, the explicit `release-stale` verb (ledger F4-B1-Ф2) — released it; the generation files and their release records are the only lock, and a stale reservation is never reclaimed automatically, so after a runner crash the workspace stays blocked until `release-stale` runs; ledger F3-B1-Ф2; old generations and release records are never cleaned up, so they accumulate per workspace at a few bytes each), and `<ZCODE_STATE_DIR>/personal-provider-config.json` (the wrapper-owned personal provider config, C5), where `root` = `git rev-parse --show-toplevel` evaluated in `--cwd` (default: process cwd). The log holds the CLI's stderr plus `[zcode-dispatch] <ISO time> …` lines (argv summary with the prompt replaced by `<prompt N bytes>`, start/finish, classification reason, raw stdout on failure). Since Ф4a (ledger PF-B5, PC1-B1): `<ZCODE_STATE_DIR>/cli-home/` (mode 0700) holds the CLI's own credentials and state, through the cli-home environment of C5 — credentials `cli-home/.zcode/v2/credentials.json` (`ZCODE_DATA_BASE_DIR`), storage root `cli-home/.zcode` with plugins, rollouts and memories under `cli-home/.zcode/cli/` (`ZCODE_STORAGE_DIR`), sessions `cli-home/.zcode/cli/db/db.sqlite` (`ZCODE_SESSION_DB_PATH`), logs `cli-home/.zcode/cli/log/` (`ZCODE_LOG_DIR`). The CLI creates these; the wrapper only creates `cli-home` itself and never reads it. Not in the state root: the CLI's user config `~/.zcode/cli/config.json`, which has no override and stays the CLI's normal shared file (also used by the desktop app's embedded agent); the CLI reads it on every run and may migrate it in place once, and the design does not edit it.
 
 ### C4. Module exports of `bin/lib/zcode-dispatch.mjs`
 
@@ -203,11 +230,11 @@ Functions: `main(argv: string[]): Promise<number>`; `readRecord(file: string): o
 <ZCODE_NODE> <ZCODE_BIN> -p <prompt file contents | "-" on the stdin transport> --output-format json --mode yolo --surface terminal --workflow-mode disabled --cwd <workspaceRoot> [...MODEL_ARGS] [--disallowedTools <DISALLOWED_TOOLS joined by ",">] [--resume <sess_…>]
 ```
 
-Spawned with `detached: true` (own process group), cwd = workspaceRoot, stdin `ignore` (or the prompt on the stdin transport), stdout captured, stderr appended to the log. Both streams are decoded as UTF-8 by the stream itself (`setEncoding('utf8')` before the `data` handlers), so a multibyte character split across chunks stays intact (ledger F1-B2-Ф2). Environment = inherited + `MODEL_ENV` + `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` and `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE` (both `<ZCODE_APP>/Contents/Resources/config/provider/zcode-builtin.json`) + `ZCODE_APP_VERSION` (plist key `APP_VERSION_PLIST_KEY`, read at every `task`) + `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` = `<ZCODE_STATE_DIR>/personal-provider-config.json` (a fourth variable beyond spec §4.3: Ф1 U1 found that a headless run takes its model only from the personal provider config this variable names). The wrapper owns that file: before every CLI run (task runner, `doctor`, `doctor --probe`) `pinPersonalConfig` sets its default selection to `PINNED_SELECTION` (C4). It never lives under `~/.zcode` and holds no credentials. The CLI's login identity stays in ZCode's own credential store, written only by the user's one-time `zcode login zai`, and the wrapper never reads it. Never `--target`, `--json`, `-c/--continue`. Defaults: `ZCODE_APP=/Applications/ZCode.app`, `ZCODE_BIN=$ZCODE_APP/Contents/Resources/glm/zcode.cjs`, `ZCODE_NODE=node`, `ZCODE_STATE_DIR=~/.claude/plugins/data/superpowers-strigov-ver-zcode`, `ZCODE_TASK_TIMEOUT_MIN=60`. Timeout → SIGTERM to the group, 10 s, SIGKILL. Probe timeout 120 s.
+Spawned with `detached: true` (own process group), cwd = workspaceRoot, stdin `ignore` (or the prompt on the stdin transport), stdout captured, stderr appended to the log. Both streams are decoded as UTF-8 by the stream itself (`setEncoding('utf8')` before the `data` handlers), so a multibyte character split across chunks stays intact (ledger F1-B2-Ф2). Environment = inherited + `MODEL_ENV` + `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` and `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE` (both `<ZCODE_APP>/Contents/Resources/config/provider/zcode-builtin.json`) + `ZCODE_APP_VERSION` (plist key `APP_VERSION_PLIST_KEY`, read at every `task`) + `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` = `<ZCODE_STATE_DIR>/personal-provider-config.json` (a fourth variable beyond spec §4.3: Ф1 U1 found that a headless run takes its model only from the personal provider config this variable names). The wrapper owns that file: before every CLI run (task runner, `doctor`, `doctor --probe`) `pinPersonalConfig` sets its default selection to `PINNED_SELECTION` (C4). It never lives under `~/.zcode` and holds no credentials. Since Ф4a (ledger PF-B5, PC1-B1) the environment also carries the cli-home environment (`cliHomeEnv`) on every CLI run (task runner, `doctor --probe`, `login`), over any inherited value, after `cli-home` is created with mode 0700: `ZCODE_DATA_BASE_DIR` = `<ZCODE_STATE_DIR>/cli-home` (credential store, resolver `Vta`), `ZCODE_STORAGE_DIR` = `<cli-home>/.zcode` (storage root `storage.dir`: plugins, rollouts, memories), `ZCODE_SESSION_DB_PATH` = `<cli-home>/.zcode/cli/db/db.sqlite` (session database `storage.sessionDbPath`, which the CLI does not derive from the storage root) and `ZCODE_LOG_DIR` = `<cli-home>/.zcode/cli/log` (logs, `JB`); an inherited `ZCODE_SESSION_DB` (the CLI's alias for the session-database key) is removed. These are all the overrides the CLI offers for its state (C3, `docs/zcode-cli-findings.md` "CLI data home"). The CLI's user config `~/.zcode/cli/config.json` (`Ig` → `yLe`) has none other than `HOME`, which the wrapper never sets, so the CLI keeps reading it there. The CLI's login identity is written into the cli-home credential store only by the user's `zcode-dispatch login` (C1), and the wrapper never reads it. `ZCODE_HTTP_PROXY` is inherited, never set by the wrapper. Never `--target`, `--json`, `-c/--continue`. Defaults: `ZCODE_APP=/Applications/ZCode.app`, `ZCODE_BIN=$ZCODE_APP/Contents/Resources/glm/zcode.cjs`, `ZCODE_NODE=node`, `ZCODE_STATE_DIR=~/.claude/plugins/data/superpowers-strigov-ver-zcode`, `ZCODE_TASK_TIMEOUT_MIN=60`. Timeout → SIGTERM to the group, 10 s, SIGKILL. Probe timeout 120 s.
 
 ### C6. Test stub `tests/fixtures/zcode-stub.cjs`
 
-`ZCODE_STUB_MODE`: `ok` (JSON `{sessionId:"sess_stub_<pid>", traceId, turnId, response:"DONE\nstub finished", usage:{inputTokens:100, cacheReadTokens:40, outputTokens:7, reasoningTokens:3}, eventCount:1}`, exit 0) · `pong` (response `PONG`) · `resume` (exit 1 unless `--resume <sess>` is present; echoes that session id) · `record` (writes `{argv, stdin, cwd, env:{the two provider vars, ZCODE_APP_VERSION, ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, ZCODE_DATA_BASE_DIR}, personalConfig:<that file's parsed content at run time, or null>}` to `$ZCODE_STUB_RECORD`, then as `ok`; reads stdin when `-p -`) · `model-not-selected` / `auth` / `quota` / `launch` (stderr `Error: <$ZCODE_STUB_MESSAGE or a default>`, exit 1) · `hang` (600 s) · `crash` (SIGKILLs itself) · `malformed` (`not json`, exit 0). `ZCODE_STUB_DELAY_MS` delays the action.
+`ZCODE_STUB_MODE`: `ok` (JSON `{sessionId:"sess_stub_<pid>", traceId, turnId, response:"DONE\nstub finished", usage:{inputTokens:100, cacheReadTokens:40, outputTokens:7, reasoningTokens:3}, eventCount:1}`, exit 0) · `pong` (response `PONG`) · `resume` (exit 1 unless `--resume <sess>` is present; echoes that session id) · `record` (writes `{argv, stdin, cwd, env:{the two provider vars, ZCODE_APP_VERSION, ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, ZCODE_DATA_BASE_DIR}, personalConfig:<that file's parsed content at run time, or null>}` to `$ZCODE_STUB_RECORD`, then as `ok`; reads stdin when `-p -`) · `model-not-selected` / `auth` / `quota` / `launch` (stderr `Error: <$ZCODE_STUB_MESSAGE or a default>`, exit 1) · `hang` (600 s) · `crash` (SIGKILLs itself) · `malformed` (`not json`, exit 0). `ZCODE_STUB_DELAY_MS` delays the action. Since Ф4a: `record` also records `ZCODE_HTTP_PROXY`, `ZCODE_STORAGE_DIR`, `ZCODE_SESSION_DB_PATH`, `ZCODE_SESSION_DB` and `ZCODE_LOG_DIR`, plus `resolved: {credentials, storageDir, sessionDb, logDir}` — the stub's model of the CLI's resolvers (`docs/zcode-cli-findings.md` "CLI data home"): `<ZCODE_DATA_BASE_DIR, else HOME>/.zcode/v2/credentials.json`, `ZCODE_STORAGE_DIR` else `~/.zcode`, `ZCODE_SESSION_DB_PATH` / `ZCODE_SESSION_DB` else `~/.zcode/cli/db/db.sqlite`, `ZCODE_LOG_DIR` else `~/.zcode/cli/log`; `login` requires argv exactly `login zai` (else exit 1), records like `record` when `ZCODE_STUB_RECORD` is set, writes a fake credential to `resolved.credentials` and `{schemaVersion:1, config:{loginWrote:true, defaultModelSelection:{providerId:"account:zai-individual-coding-plan", modelId:"GLM-5.3"}}}` to the personal provider config, prints a stub login URL, and exits with `ZCODE_STUB_EXIT` (default 0).
 
 ### C7. `docs/zcode-cli-findings.md` — `## Inputs for later phases`
 
@@ -261,6 +288,13 @@ The file also carries a line `VERDICT: GO` or `VERDICT: NO-GO — <reason>` unde
 - **Ф2 (wrapper).** Integration-style bash tests in `tests/test-zcode-dispatch.sh` against the real wrapper with the stub CLI: spec §8.1 assertions 1–13 plus result-on-failure, sticky `finalizeRecord` (including the two cancel-vs-runner interleavings, injected in-process), the `MODEL_ARGS` / `DISALLOWED_TOOLS` wiring, and the personal provider config pin (file created under the state root before the run, selection re-pinned before every run, other content kept, `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` passed), the workspace write reservation (two concurrent `task` → exactly one starts; after `cancel` the next `task` is refused until the cancelled CLI exits; a stale reservation with a dead holder → `task` exits 2 with the stale message and leaves the files untouched; `release-stale` refuses while the holder runner is alive; `release-stale` on a dead holder finalizes a non-terminal job, writes `.released`, and the next `task` is admitted and completes; two concurrent `release-stale` → exactly one release record and one success — ledger F4-B1-Ф2, which removed automatic reclaim and its tests) and UTF-8 decoding of a multibyte character split across two stdout writes (ledger F1-B1-Ф2, F1-B2-Ф2); the tests read exported constants so Ф1's values cannot break them. RED = the suite fails at assertion 13 before the shim exists; GREEN = `PASS`. Regression: `bash tests/test-sdd-scripts.sh`. Not tested: the real ZCode CLI or any model (Ф5 covers it live), Linux, PID reuse.
 - **Ф3 (prose).** A grep-based structural check (Ф3 Step 1 block) proves every required section, rule anchor and Red Flag is present and the stale Luna-as-implementer wording is gone; both test suites still pass. The ladder, stall rules, state-line fields and Red Flags are model-facing prose (spec §8.3): they are verified by the plan review, the fused code review of the skill edits, and the first real `/dev` run on GLM. Not tested: model behaviour under the new prose.
 - **Ф4 (docs).** A grep / `xmllint` / JSON check (Ф4 Step 1 block): version `0.8.0` everywhere, no stale `0.7.0`, new rows and guardrail present in both languages, SVGs well-formed. Not tested: rendering on GitHub.
+- **Ф4a (CLI credential store and state dirs, and `login`).** Stub-driven additions to `tests/test-zcode-dispatch.sh` (55 → 64 assertions):
+  - The task runner, `doctor --probe` and `login` spawns get the cli-home environment (`ZCODE_DATA_BASE_DIR` = `<state root>/cli-home`, mode 0700, plus `ZCODE_STORAGE_DIR` / `ZCODE_SESSION_DB_PATH` / `ZCODE_LOG_DIR` under it), overriding inherited values and dropping an inherited `ZCODE_SESSION_DB`; the stub's `resolved` paths confirm that credential resolution (and the storage root, session database and logs) point under `cli-home` for all three; `doctor` reports `ok cli-home: <path>` (10 checks).
+  - `doctor --probe` with `FAIL(auth)` prints the `run: zcode-dispatch login` hint; with `FAIL(quota)` it does not.
+  - `login` (stub mode `login`) runs `login zai` with the full wrapper environment, including an inherited `ZCODE_HTTP_PROXY`. The fake credential lands only under `cli-home` (nothing under the temp `HOME`) and is never printed. After the stub rewrites the selection to GLM-5.3, the wrapper re-pins `PINNED_SELECTION` and keeps the login's other content.
+  - `login` passes a failing exit code (7) through, and refuses an argument other than `zai`, extra arguments, unknown flags and an unreadable `Info.plist` (exit 2).
+
+  A grep check (Ф4a Step 1) covers the skill, README and findings text, and the Ф3 / Ф4 checks are re-run as regression. Not tested: the real `zcode login zai` browser flow and real token expiry (the user's Ф5 prerequisite and the live runs cover them); that the real CLI honours the four overrides (the stub models the bundle's resolvers; Ф5's live runs exercise the real ones); the CLI's own read of `~/.zcode/cli/config.json`, which has no override and is out of the design's scope.
 - **Ф5 (live acceptance).** End-to-end on the real CLI and the real plan (spec §8.2): `doctor`, `doctor --probe`, an E2E first-round task in a throwaway repo, a fix round, and the quota measurement. The orchestrator then runs the verification gate and the fused review on the resulting doc edits. Not tested: concurrency under load, other app versions.
 
 ## Risks / unknowns / assumptions
@@ -272,19 +306,24 @@ The file also carries a line `VERDICT: GO` or `VERDICT: NO-GO — <reason>` unde
 
   The remaining mechanism is `MODEL_MECHANISM = personal-config`: the user logs the CLI in once, and the wrapper pins GLM-5.3-Flash/max in its own personal provider config. An invalid configured default silently falls back to the first registry model (`registry-fallback` in the bundle), so a PONG alone does not prove the pin. Ф1 Step 6 therefore checks the effective model in the run's own output. If the login fails, the pin is not applied, or the model cannot be confirmed, Ф1 ends `BLOCKED` and the user decides.
 - **R2 — Discovery cannot run in the Codex sandbox.** The Codex implementer's workspace-write sandbox most likely blocks network and writes to `~/.zcode`. Ф1's executor is therefore a Claude subagent (`opus` / `high`), stated in its frontmatter scope and its body; zcode was verified to run from Claude Code's own Bash tool.
-- **R3 — A user step is required.** The one-time `zcode login zai` (Z.ai's own browser OAuth) is a user action (Red Flag 6). It writes the CLI's identity into ZCode's shared credential store under `~/.zcode`; that is the CLI's own write, never ours. Ф1 and `zcode-invocation` give the exact command, with `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` pointing at a file outside `~/.zcode`, so the default model the login writes never touches the desktop app's provider config. The login opens a browser. If Claude Code's `!` prefix cannot host it, the user runs the line in a separate terminal window; `zcode-invocation` documents both forms.
+- **R3 — A user step is required.** The one-time `zcode login zai` (Z.ai's own browser OAuth) is a user action (Red Flag 6). It writes the CLI's identity into ZCode's shared credential store under `~/.zcode`; that is the CLI's own write, never ours. Ф1 and `zcode-invocation` give the exact command, with `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` pointing at a file outside `~/.zcode`, so the default model the login writes never touches the desktop app's provider config. The login opens a browser. If Claude Code's `!` prefix cannot host it, the user runs the line in a separate terminal window; `zcode-invocation` documents both forms. Since Ф4a (ledger PF-B5, R16) the user's login is `zcode-dispatch login`, which writes the identity into the credential store in the wrapper's `cli-home` instead of `~/.zcode`.
 - **R4 — Live probes spend Coding Plan quota.** Ф1: about ten short prompts plus one 150 KB prompt; Ф5: one probe, one small E2E task, one fix round. All other phases make zero model calls.
 - **R5 — Classifier patterns are broad.** Initial patterns (`401`, `login`, `quota`, …) may misclassify; Ф1 records the exact strings (U4) and Ф2 Step 8 replaces the lists. Unknown strings classify as `crash` → one retry, then Luna: never a false success.
 - **R6 — Prompt text the CLI could misparse.** Node's `parseArgs` treats a `-p` value starting with `-` as ambiguous, and the CLI treats a prompt starting with `/` as a slash command. Every GLM dispatch file begins with the ZCode preamble (`## ZCode headless run …`) and the probe prompt is fixed, so neither can occur; `zcode-invocation` says so.
 - **R7 — Record races (accepted).** Records are written by atomic rename; terminal statuses are sticky through the exclusively created `.terminal` claim (C2), which readers prefer — so neither a racing runner finalize nor a stale `running` rename by the runner (`updateRunning`) can overwrite a `cancelled` written by `cancel` before it signals; `updateRunning` re-checks the claim after writing and reports the job as no longer running. A `cancel` issued within the ~100 ms between `task` and the runner's first write can miss the child (both pids still `null`); the orchestrator never cancels that fast. No lock file for job records (Non-goal); the only lock is the per-workspace write reservation (C1, ledger F1-B1-Ф2), which makes the one-write-task guard atomic and keeps the workspace reserved after `cancel` until the cancelled CLI has exited, and is generation-numbered (C3, ledger F3-B1-Ф2): acquire after a normal release advances only by exclusive creation of `active.lock.<n+1>` and release is a separate `.released` record, so the current reservation is never deleted and two concurrent `task`s cannot both take the workspace; the generation files and their release records are the only lock. A stale reservation is never reclaimed automatically (ledger F4-B1-Ф2): `task` refuses with the stale message, and only the explicit single-actor `release-stale` verb (C1; never signals, never unlinks, exclusive `.released` creation so a concurrent second call reports already released) frees it. Residual cost (accepted): after a runner crash the workspace stays blocked for GLM until `release-stale` runs.
 - **R8 — Policy (residual, accepted by the user).** Headless use of the CLI is not addressed by Z.ai's terms either way. Mitigations: official harness only, truthful identification, no credential access, width cap 2, the warning in the skill, the kill switch.
-- **R9 — No sandbox in `yolo` (SECURITY).** GLM runs as the user. Mitigations: git-tree guard, preamble, risk-marked phases on Sol, `--workflow-mode disabled`, no `--target`. Prose, not enforcement. The ZCode CLI also loads a `.env` from its working directory (`loadCliDotenv` in `prompt-command.ts`) — the repository's own `.env`, inside the trust boundary the user already accepts. **Ф2 carries SECURITY materiality** (it is the enforcement point for the guards, the environment pins and process-group signalling) and **Ф3 carries SECURITY materiality** (the routing rules that keep risk-marked phases off the unsandboxed channel).
+- **R9 — No sandbox in `yolo` (SECURITY).** GLM runs as the user. Mitigations: git-tree guard, preamble, risk-marked phases on Sol, `--workflow-mode disabled`, no `--target`. Prose, not enforcement. The ZCode CLI also loads a `.env` from its working directory (`loadCliDotenv` in `prompt-command.ts`) — the repository's own `.env`, inside the trust boundary the user already accepts. **Ф2 carries SECURITY materiality** (it is the enforcement point for the guards, the environment pins and process-group signalling) and **Ф3 carries SECURITY materiality** (the routing rules that keep risk-marked phases off the unsandboxed channel). **Ф4a carries SECURITY materiality** (it changes where the unsandboxed CLI keeps its credentials and state — `ZCODE_DATA_BASE_DIR`, `ZCODE_STORAGE_DIR`, `ZCODE_SESSION_DB_PATH`, `ZCODE_LOG_DIR` — and adds the `login` verb that runs the CLI's own authentication with the wrapper's environment).
 - **R10 — App auto-update.** A new ZCode.app may move `zcode.cjs`, change flags or the JSON shape. `doctor` WARNs on a version mismatch (`VERIFIED_APP_VERSION`); `launch` / `malformed` fall back to Luna; the live acceptance must be re-run per app version.
 - **R11 — The running orchestrator is the installed 0.7.0 plugin.** This plan's own non-frontend phases are implemented by Codex Luna under 0.7.0 rules; the new protocol takes effect only after release and reinstall (Non-goal). The dev-tree wrapper (`$(pwd)/bin/zcode-dispatch`) is what Ф5 exercises.
 - **R12 — Large prose phase (Ф3).** About thirty anchored edits to `SKILL.md` plus a new skill. Mitigation: the plan carries the exact replacement text and a structural check; reviewers check against spec §5–§6.
 - **R13 — Quota measurement noise.** Off-peak and weekend billing halve the deduction (Ф5 records the local time); the `doctor --probe` usage line carries no reasoning count, so when U3 finds reasoning billed as a separate counter the probe's reasoning is a missing required value and Ф5 Step 7 reports the result as inconclusive — it is never estimated or treated as 0; any other missing counter does the same, and a ratio outside both bands is reported as inconclusive.
 - **R14 — Assumption: the Codex sandbox runs the Ф2 suite.** The tests use `mktemp -d`, detached processes, signals, `pkill`, `plutil` and a temporary `HOME`; `tests/test-sdd-scripts.sh` (mktemp + git) already runs there. The suite was prototyped against this exact code at plan time: `PASS` in ~20 s, including with `PROMPT_TRANSPORT = "stdin"`, `APP_VERSION_PLIST_KEY = "CFBundleVersion"`, and non-empty `MODEL_ARGS` / `DISALLOWED_TOOLS`.
 - **R15 — Assumption: usage field names.** `USAGE_FIELDS` starts at `inputTokens` / `cacheReadTokens` / `outputTokens` (names present in the bundled CLI); Ф1 confirms or replaces them (U3).
+- **R16 — The CLI login expires (Ф4a, ledger PF-B5).** The CLI's `zcode login zai` stores no refresh token, so the login in `cli-home` lapses on its own; its lifetime is unknown.
+  - Detection: the CLI then fails, classified `auth` (`project_token_login_failed` matches the `auth` pattern `login`) or `model-not-selected` (`Model creation failed`). `doctor --probe` prints `model-selected: FAIL(auth)` or `FAIL(model-not-selected)` plus the stderr hint `run: zcode-dispatch login`, and a task fails with the same `errorClass`.
+  - Fallback: the ladder is unchanged — `glm=down` and announced Luna max for the rest of the session. The announcement asks the user to run `zcode-dispatch login` themselves; the orchestrator never runs it. GLM returns in a later session.
+  - Residual (accepted): an expiry mid-plan costs the rest of that session on Luna. CLI sessions created in `~/.zcode/cli/db/db.sqlite` before Ф4a cannot be resumed from the session database in `cli-home`; only Ф1's probe sessions exist there.
+  - Scope (ledger PC1-B1): `cli-home` isolates the CLI's credential store (`ZCODE_DATA_BASE_DIR`) and, through the CLI's own overrides, its storage root with plugins, its session database and its logs. The CLI's user config `~/.zcode/cli/config.json` has no override other than `HOME` (forbidden), so it stays shared with the desktop app's embedded agent: the CLI reads it on every run and may migrate it in place once. The design does not edit it and does not claim a fully separate data home; the login conflict lives in the credential store, which is separate.
 
 ## Phases
 
@@ -4516,6 +4555,1043 @@ git add .claude-plugin/plugin.json README.md README.ru.md PLUGIN_README.md \
 git commit -m "chore(release): 0.8.0 — GLM-5.3-Flash via ZCode as default implementer"
 ```
 
+## Ф4a: Separate CLI credential store and state dirs, and `zcode-dispatch login` (ledger PF-B5, PC1-B1)
+
+**Executor:** default non-frontend route (Codex implementer). Zero model calls: every test runs against `tests/fixtures/zcode-stub.cjs`. Never run the real ZCode CLI, `zcode-dispatch login`, `doctor --probe` or a `task` against `/Applications/ZCode.app` in this phase. Materiality: SECURITY (R9: this phase changes where the unsandboxed CLI keeps its credentials and adds the verb that runs the CLI's own authentication).
+
+**Why (plan revision after Ф5 `BLOCKED`, ledger PF-B5).** The CLI's standalone `zcode login zai` and the ZCode desktop app share `~/.zcode/v2/credentials.json` and its key `oauth:zai:access_token`, but they store different token kinds there:
+- The desktop app stores the business token it exchanged.
+- The CLI stores its OAuth token, which it exchanges before every model request.
+
+So each login invalidates the other: the CLI then fails with `project_token_login_failed`, and the desktop app asks the user to sign in again. The CLI login also has no refresh token and expires on its own.
+
+This phase gives the CLI its own credential store and its own state directories under `<ZCODE_STATE_DIR>/cli-home`, and the user logs that store in with the new verb `zcode-dispatch login`. The CLI resolves each location separately (bundle `zcode.cjs` 3.15.1, ledger PC1-B1), so every CLI run of the wrapper gets one override per resolver that has one:
+- `ZCODE_DATA_BASE_DIR=<cli-home>` → credentials at `<cli-home>/.zcode/v2/credentials.json` (`Vta`; the store behind the login conflict).
+- `ZCODE_STORAGE_DIR=<cli-home>/.zcode` → the storage root `storage.dir` (plugins, rollouts, memories under `<cli-home>/.zcode/cli/`).
+- `ZCODE_SESSION_DB_PATH=<cli-home>/.zcode/cli/db/db.sqlite` → the session database (`Fm` default `storage.sessionDbPath`, read by `vae` → `LYo`; not derived from `storage.dir`). The wrapper drops an inherited `ZCODE_SESSION_DB`, the CLI's alias for the same key.
+- `ZCODE_LOG_DIR=<cli-home>/.zcode/cli/log` → the CLI's logs (`JB`; default `xGs` = `~/.zcode/cli/log`).
+
+The CLI's user config `~/.zcode/cli/config.json` (`Ig` → `yLe`) has no override other than `HOME`, which stays forbidden. It remains the CLI's normal shared file, also used by the desktop app's embedded agent: the CLI reads it on every run and may rewrite it once in place (its own legacy plugin-id migration). The design neither edits it nor claims to isolate it. Step 10 records the evidence in `docs/zcode-cli-findings.md`. Ф5's prerequisite becomes the login verb.
+
+All edits below are exact find/replace pairs against the files as committed after Ф4. Each **Find** text occurs exactly once in the named file; replace it with the **Replace with** text verbatim.
+
+Rules for this phase (in addition to the implementer template):
+- Never read, print or create anything under `~/.zcode`; never override `HOME`; change none of the desktop app's files. (The CLI's own read of `~/.zcode/cli/config.json` during a run is the CLI's behaviour, not an edit by this design; tests run with a temp `HOME`.)
+- The wrapper never reads the credential the CLI writes into `cli-home`, and never prints a credential value.
+- No other new verbs, and no app-server broker.
+
+**Files in this phase:**
+- Modify: `bin/lib/zcode-dispatch.mjs`
+- Modify: `bin/zcode-dispatch`
+- Modify: `tests/fixtures/zcode-stub.cjs`
+- Modify: `skills/zcode-invocation/SKILL.md`
+- Modify: `skills/dev-orchestrator/SKILL.md`
+- Modify: `README.md`
+- Modify: `README.ru.md`
+- Modify: `PLUGIN_README.md`
+- Modify: `docs/zcode-cli-findings.md`
+- Test: `tests/test-zcode-dispatch.sh`
+
+**Interfaces:**
+- Consumes: `bin/zcode-dispatch` with the command surface of Contract C1 (verbs `task`, `status`, `result`, `cancel`, `release-stale`, `doctor`, `doctor --probe`; start line `ZCode Task started in the background as zt-NNNN`; exit codes 0/1/2), job records per Contract C2 under the layout of Contract C3, errorClass set `timeout | crash | model-not-selected | auth | quota | launch | malformed`, and `bin/lib/zcode-dispatch.mjs` exports per Contract C4 (`PINNED_MODEL`, `SELECTION_PATH`, `PINNED_SELECTION`, `PATTERNS`, `main`, `pinPersonalConfig`, …); the test suite `tests/test-zcode-dispatch.sh` (55 assertions as built after Ф2); the skill `skills/zcode-invocation/SKILL.md` (name `zcode-invocation`); `docs/zcode-cli-findings.md` with sections `## U1 — …` through `## U11 — …` and `## Inputs for later phases`.
+- Produces: the verb `login [zai]` of Contract C1 (foreground, the C5 environment, exit code = the CLI's, a re-pin after exit 0); on every CLI run (task runner, `doctor --probe`, `login`; C3, C5) the cli-home environment — `ZCODE_DATA_BASE_DIR` = `<ZCODE_STATE_DIR>/cli-home` (mode 0700), `ZCODE_STORAGE_DIR` = `<cli-home>/.zcode`, `ZCODE_SESSION_DB_PATH` = `<cli-home>/.zcode/cli/db/db.sqlite`, `ZCODE_LOG_DIR` = `<cli-home>/.zcode/cli/log`, no inherited `ZCODE_SESSION_DB`; the `doctor` check `cli-home`; the `doctor --probe` stderr hint `run: zcode-dispatch login` on `FAIL(auth)` / `FAIL(model-not-selected)` (C1); stub mode `login`, the extra `record` environment keys and the `record` field `resolved` (C6); the section `## CLI data home — …` in `docs/zcode-cli-findings.md`; the test suite at 64 assertions.
+
+- [ ] **Step 1: Write the phase check and run it (fails)**
+
+Run from the repo root:
+
+```bash
+Z=skills/zcode-invocation/SKILL.md; S=skills/dev-orchestrator/SKILL.md; F=docs/zcode-cli-findings.md; M=bin/lib/zcode-dispatch.mjs
+fails=0
+need() { grep -qF -- "$2" "$1" 2>/dev/null || { echo "MISSING in $1: $2"; fails=$((fails+1)); }; }
+none() { if grep -qF -- "$2" "$1" 2>/dev/null; then echo "STALE in $1: $2"; fails=$((fails+1)); fi; }
+need $M 'ZCODE_DATA_BASE_DIR: home,'
+need $M 'ZCODE_STORAGE_DIR: storage,'
+need $M 'ZCODE_SESSION_DB_PATH: path.join(storage, "cli", "db", "db.sqlite"),'
+need $M 'ZCODE_LOG_DIR: path.join(storage, "cli", "log"),'
+need $M '...cliHomeEnv(),'
+need $M 'delete env.ZCODE_SESSION_DB;'
+need $M 'case "login":'
+need $M 'run: zcode-dispatch login'
+none $M 'never sets ZCODE_DATA_BASE_DIR'
+need bin/zcode-dispatch 'release-stale|doctor|login>'
+need $Z '! "$ZDISPATCH" login'
+need $Z '| `login [zai]` |'
+need $Z 'state-dir, cli-home, personal-config, kill-switch'
+need $Z 'plus `ZCODE_DATA_BASE_DIR` = the wrapper'
+need $Z 'the stderr hint `run: zcode-dispatch login`'
+need $Z '- CLI home (`ZCODE_DATA_BASE_DIR` of every CLI run'
+none $Z '`ZCODE_DATA_BASE_DIR` is never set'
+none $Z 'zcode.cjs login zai'
+none $Z 'Nothing reads `~/.zcode`.'
+need $Z '`ZCODE_STORAGE_DIR` = `<cli-home>/.zcode`'
+need $Z '- CLI user config (no override;'
+need $Z 'The one exception is `login`, which returns the CLI'
+need $S 'gives them the line to run themselves'
+need $S 'the announcement also tells the user to run `"$ZDISPATCH" login` themselves'
+need $S 'logging in (`"$ZDISPATCH" login`, which runs the CLI'
+need README.md 'via `zcode-dispatch login`'
+need README.md 'release-stale/doctor/login'
+need README.ru.md 'через `zcode-dispatch login`'
+need README.ru.md 'release-stale/doctor/login'
+need PLUGIN_README.md 'via `zcode-dispatch login`'
+need PLUGIN_README.md '(`cli-home`, passed as `ZCODE_DATA_BASE_DIR`'
+need PLUGIN_README.md 'the CLI itself still reads its user config `~/.zcode/cli/config.json`'
+none README.md 'via `zcode login zai`'
+none README.ru.md 'через `zcode login zai`'
+none PLUGIN_README.md '(`zcode login zai`, see'
+need $F '## CLI data home — '
+need $F 'project_token_login_failed'
+need $F 'ZCODE_DATA_BASE_DIR=<ZCODE_STATE_DIR>/cli-home'
+need $F '| User config | `Ig` → `yLe` |'
+need $F 'ZCODE_SESSION_DB_PATH=<cli-home>/.zcode/cli/db/db.sqlite'
+none $F 'whole data home'
+[ "$fails" -eq 0 ] && echo "ALL CHECKS PASSED" || echo "FAILED CHECKS: $fails"
+```
+
+Expected now: 40 `MISSING` / `STALE` lines, last line `FAILED CHECKS: 40` (the `none … 'whole data home'` guard already passes).
+
+- [ ] **Step 2: Extend the stub fixture `tests/fixtures/zcode-stub.cjs`**
+
+The new mode `login` stands in for `zcode login zai`; `record` also records `ZCODE_HTTP_PROXY`, the cli-home overrides and `resolved` — where the CLI's resolvers would put its credentials, storage root, session database and logs with the environment it got (Contract C6).
+
+**Z1.** **Find** in `tests/fixtures/zcode-stub.cjs`:
+
+```text
+// ZCODE_STUB_MODE: ok | pong | resume | record | model-not-selected | auth | quota |
+//                  launch | hang | ignore-term | split-utf8 | crash | malformed
+// ZCODE_STUB_RECORD: file the `record` mode writes; ZCODE_STUB_DELAY_MS: wait before
+// acting; ZCODE_STUB_MESSAGE: stderr text for the four error modes; ZCODE_STUB_TERM_DELAY_MS:
+// how long ignore-term waits after SIGTERM before exiting.
+"use strict";
+const fs = require("node:fs");
+```
+
+**Replace with:**
+
+```text
+// ZCODE_STUB_MODE: ok | pong | resume | record | login | model-not-selected | auth | quota |
+//                  launch | hang | ignore-term | split-utf8 | crash | malformed
+// ZCODE_STUB_RECORD: file the `record` mode (and `login`, when set) writes, including `resolved`,
+// the stub's model of where the CLI keeps its state; ZCODE_STUB_DELAY_MS: wait before acting;
+// ZCODE_STUB_MESSAGE: stderr text for the four error modes; ZCODE_STUB_TERM_DELAY_MS: how long ignore-term waits after SIGTERM before exiting;
+// ZCODE_STUB_EXIT: the exit code of the `login` mode (default 0).
+"use strict";
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+```
+
+**Z2.** **Find** in `tests/fixtures/zcode-stub.cjs`:
+
+```text
+    process.stdin.on("end", () => resolve(text));
+  });
+}
+
+async function run() {
+```
+
+**Replace with:**
+
+```text
+    process.stdin.on("end", () => resolve(text));
+  });
+}
+
+// Where the real CLI (zcode.cjs 3.15.1) would put its state with this environment — a model of its
+// resolvers (docs/zcode-cli-findings.md, "CLI data home"): the credential store (Vta: ZCODE_DATA_BASE_DIR,
+// else HOME), the storage root (storage.dir: ZCODE_STORAGE_DIR, else ~/.zcode), the session database
+// (storage.sessionDbPath: ZCODE_SESSION_DB_PATH or its alias ZCODE_SESSION_DB, else
+// ~/.zcode/cli/db/db.sqlite) and the logs (JB: ZCODE_LOG_DIR, else ~/.zcode/cli/log).
+function resolvedPaths() {
+  const env = process.env;
+  const home = os.homedir();
+  return {
+    credentials: path.join(env.ZCODE_DATA_BASE_DIR || home, ".zcode", "v2", "credentials.json"),
+    storageDir: env.ZCODE_STORAGE_DIR || path.join(home, ".zcode"),
+    sessionDb: env.ZCODE_SESSION_DB_PATH || env.ZCODE_SESSION_DB || path.join(home, ".zcode", "cli", "db", "db.sqlite"),
+    logDir: env.ZCODE_LOG_DIR || path.join(home, ".zcode", "cli", "log"),
+  };
+}
+
+// Writes $ZCODE_STUB_RECORD: argv, stdin, cwd, the environment the wrapper sets, where the CLI
+// would resolve its state (resolvedPaths), and the personal provider config as the wrapper left
+// it for this run (null when missing).
+function writeStubRecord(stdin) {
+  let personalConfig = null;
+  try {
+    personalConfig = JSON.parse(fs.readFileSync(process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, "utf8"));
+  } catch {
+    personalConfig = null;
+  }
+  fs.writeFileSync(
+    process.env.ZCODE_STUB_RECORD,
+    JSON.stringify({
+      argv,
+      stdin,
+      cwd: process.cwd(),
+      env: {
+        ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE ?? null,
+        ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: process.env.ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE ?? null,
+        ZCODE_APP_VERSION: process.env.ZCODE_APP_VERSION ?? null,
+        ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE ?? null,
+        ZCODE_DATA_BASE_DIR: process.env.ZCODE_DATA_BASE_DIR ?? null,
+        ZCODE_STORAGE_DIR: process.env.ZCODE_STORAGE_DIR ?? null,
+        ZCODE_SESSION_DB_PATH: process.env.ZCODE_SESSION_DB_PATH ?? null,
+        ZCODE_SESSION_DB: process.env.ZCODE_SESSION_DB ?? null,
+        ZCODE_LOG_DIR: process.env.ZCODE_LOG_DIR ?? null,
+        ZCODE_HTTP_PROXY: process.env.ZCODE_HTTP_PROXY ?? null,
+      },
+      resolved: resolvedPaths(),
+      personalConfig,
+    }),
+  );
+}
+
+async function run() {
+```
+
+**Z3.** **Find** in `tests/fixtures/zcode-stub.cjs`:
+
+```text
+    case "record": {
+      const stdin = flag("-p") === "-" ? await readStdin() : null;
+      let personalConfig = null; // the personal provider config as the wrapper left it for this run
+      try {
+        personalConfig = JSON.parse(fs.readFileSync(process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, "utf8"));
+      } catch {
+        personalConfig = null;
+      }
+      fs.writeFileSync(
+        process.env.ZCODE_STUB_RECORD,
+        JSON.stringify({
+          argv,
+          stdin,
+          cwd: process.cwd(),
+          env: {
+            ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE ?? null,
+            ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: process.env.ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE ?? null,
+            ZCODE_APP_VERSION: process.env.ZCODE_APP_VERSION ?? null,
+            ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE ?? null,
+            ZCODE_DATA_BASE_DIR: process.env.ZCODE_DATA_BASE_DIR ?? null,
+          },
+          personalConfig,
+        }),
+      );
+      return emit("DONE\nrecorded");
+    }
+```
+
+**Replace with:**
+
+```text
+    case "record":
+      writeStubRecord(flag("-p") === "-" ? await readStdin() : null);
+      return emit("DONE\nrecorded");
+    case "login": {
+      // Stand-in for `zcode login zai`: records the run (when ZCODE_STUB_RECORD is set), then writes
+      // what the real login writes — a credential into the store the CLI resolves (resolvedPaths:
+      // ZCODE_DATA_BASE_DIR, else HOME) and its GLM-5.3 default selection into the personal provider
+      // config — prints a login URL, and exits with ZCODE_STUB_EXIT.
+      if (argv.length !== 2 || argv[0] !== "login" || argv[1] !== "zai") fail(`stub login mode: expected argv "login zai", got ${JSON.stringify(argv)}`);
+      if (process.env.ZCODE_STUB_RECORD) writeStubRecord(null);
+      const store = resolvedPaths().credentials;
+      fs.mkdirSync(path.dirname(store), { recursive: true });
+      fs.writeFileSync(store, JSON.stringify({ "oauth:zai:access_token": "stub-secret-token-0123" }));
+      fs.writeFileSync(
+        process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE,
+        JSON.stringify({ schemaVersion: 1, config: { loginWrote: true, defaultModelSelection: { providerId: "account:zai-individual-coding-plan", modelId: "GLM-5.3" } } }),
+      );
+      process.stdout.write("Open this URL to log in: https://example.invalid/stub-login\nModel: account:zai-individual-coding-plan/GLM-5.3\n");
+      return process.exit(Number(process.env.ZCODE_STUB_EXIT || 0));
+    }
+```
+
+- [ ] **Step 3: Extend the test suite `tests/test-zcode-dispatch.sh`**
+
+**T1.** **Find** in `tests/test-zcode-dispatch.sh`:
+
+```text
+    unset ZCODE_NODE ZCODE_TASK_TIMEOUT_MIN SP_IMPLEMENTER ZCODE_DATA_BASE_DIR
+    unset ZCODE_STUB_MODE ZCODE_STUB_RECORD ZCODE_STUB_DELAY_MS ZCODE_STUB_MESSAGE
+```
+
+**Replace with:**
+
+```text
+    unset ZCODE_NODE ZCODE_TASK_TIMEOUT_MIN SP_IMPLEMENTER ZCODE_DATA_BASE_DIR ZCODE_HTTP_PROXY
+    unset ZCODE_STORAGE_DIR ZCODE_SESSION_DB_PATH ZCODE_SESSION_DB ZCODE_LOG_DIR
+    unset ZCODE_STUB_MODE ZCODE_STUB_RECORD ZCODE_STUB_DELAY_MS ZCODE_STUB_MESSAGE ZCODE_STUB_EXIT
+    # The CLI's own state (Ф4a): every CLI run gets ZCODE_DATA_BASE_DIR=<state root>/cli-home plus the
+    # storage-root, session-database and log overrides under it, and no inherited ZCODE_SESSION_DB alias.
+    local cli_home="$ZCODE_STATE_DIR/cli-home"
+    # cli_home_env_ok <record> — the recorded CLI run got the cli-home environment, so the stub's model of
+    # the CLI's resolvers (record field `resolved`) puts the credential store, storage root, session
+    # database and logs under cli-home. The user config ~/.zcode/cli/config.json has no override (C3).
+    cli_home_env_ok() {
+        REC="$1" CLI_HOME="$cli_home" node -e '
+const fs = require("node:fs");
+const r = JSON.parse(fs.readFileSync(process.env.REC, "utf8"));
+const h = process.env.CLI_HOME;
+const ok = r.env.ZCODE_DATA_BASE_DIR === h
+  && r.env.ZCODE_STORAGE_DIR === `${h}/.zcode`
+  && r.env.ZCODE_SESSION_DB_PATH === `${h}/.zcode/cli/db/db.sqlite`
+  && r.env.ZCODE_LOG_DIR === `${h}/.zcode/cli/log`
+  && r.env.ZCODE_SESSION_DB === null
+  && r.resolved.credentials === `${h}/.zcode/v2/credentials.json`
+  && r.resolved.storageDir === `${h}/.zcode`
+  && r.resolved.sessionDb === `${h}/.zcode/cli/db/db.sqlite`
+  && r.resolved.logDir === `${h}/.zcode/cli/log`;
+process.exit(ok ? 0 : 1);'
+    }
+```
+
+**T2.** **Find** in `tests/test-zcode-dispatch.sh`:
+
+```text
+    export ZCODE_STUB_MODE=record ZCODE_STUB_RECORD="$TEST_ROOT/record.json"
+    id="$(start_task --prompt-file "$prompt")"
+```
+
+**Replace with:**
+
+```text
+    export ZCODE_STUB_MODE=record ZCODE_STUB_RECORD="$TEST_ROOT/record.json"
+    # Inherited values (e.g. the user's own) must be overridden with the cli-home ones; the alias is dropped.
+    id="$(ZCODE_DATA_BASE_DIR="$TEST_ROOT/foreign-data-home" ZCODE_STORAGE_DIR="$TEST_ROOT/foreign-storage" \
+        ZCODE_SESSION_DB_PATH="$TEST_ROOT/foreign.sqlite" ZCODE_SESSION_DB="$TEST_ROOT/foreign-alias.sqlite" \
+        ZCODE_LOG_DIR="$TEST_ROOT/foreign-log" start_task --prompt-file "$prompt")"
+```
+
+**T3.** **Find** in `tests/test-zcode-dispatch.sh`:
+
+```text
+    if [[ "$st" == completed ]] && REC="$TEST_ROOT/record.json" PROMPT="$prompt" ROOT="$repo" \
+        TRANSPORT="$transport" CFG="$cfg" VER="$want_version" \
+        MODEL_ARGS="$(const_of MODEL_ARGS)" DISALLOWED="$(const_of DISALLOWED_TOOLS)" node -e '
+```
+
+**Replace with:**
+
+```text
+    if [[ "$st" == completed ]] && REC="$TEST_ROOT/record.json" PROMPT="$prompt" ROOT="$repo" \
+        TRANSPORT="$transport" CFG="$cfg" VER="$want_version" CLI_HOME="$cli_home" \
+        MODEL_ARGS="$(const_of MODEL_ARGS)" DISALLOWED="$(const_of DISALLOWED_TOOLS)" node -e '
+```
+
+**T4.** **Find** in `tests/test-zcode-dispatch.sh`:
+
+```text
+  && r.env.ZCODE_APP_VERSION === process.env.VER
+  && r.env.ZCODE_DATA_BASE_DIR === null;
+process.exit(ok ? 0 : 1);'; then
+        pass "2 CLI argv pins json/yolo/terminal/workflow-disabled/--cwd root, prompt per PROMPT_TRANSPORT, env = provider config x2 + app version, no ZCODE_DATA_BASE_DIR"
+    else
+        fail "2 CLI argv pins json/yolo/terminal/workflow-disabled/--cwd root, prompt per PROMPT_TRANSPORT, env = provider config x2 + app version, no ZCODE_DATA_BASE_DIR"
+```
+
+**Replace with:**
+
+```text
+  && r.env.ZCODE_APP_VERSION === process.env.VER
+  && (fs.statSync(process.env.CLI_HOME).mode & 0o777) === 0o700;
+process.exit(ok ? 0 : 1);' && cli_home_env_ok "$TEST_ROOT/record.json"; then
+        pass "2 CLI argv pins json/yolo/terminal/workflow-disabled/--cwd root, prompt per PROMPT_TRANSPORT, env = provider config x2 + app version + the cli-home env (credentials, storage, session db, logs under <state root>/cli-home, mode 0700; inherited values overridden)"
+    else
+        fail "2 CLI argv pins json/yolo/terminal/workflow-disabled/--cwd root, prompt per PROMPT_TRANSPORT, env = provider config x2 + app version + the cli-home env (credentials, storage, session db, logs under <state root>/cli-home, mode 0700; inherited values overridden)"
+```
+
+**T5.** **Find** in `tests/test-zcode-dispatch.sh`:
+
+```text
+    for c in app cli provider-config node app-version git state-dir personal-config kill-switch; do
+        if grep -Eq "^(ok|WARN) $c: " <<<"$out"; then checks=$((checks + 1)); fi
+    done
+    if [[ "$rc" -eq 0 && "$checks" -eq 9 && "$(tail -1 <<<"$out")" == "doctor: ok" ]] && ! grep -q '^FAIL' <<<"$out"; then
+        pass "11 doctor against the fixtures: 9 checks ok/WARN, 'doctor: ok', exit 0"
+    else
+        fail "11 doctor against the fixtures: 9 checks ok/WARN, 'doctor: ok', exit 0"
+```
+
+**Replace with:**
+
+```text
+    for c in app cli provider-config node app-version git state-dir cli-home personal-config kill-switch; do
+        if grep -Eq "^(ok|WARN) $c: " <<<"$out"; then checks=$((checks + 1)); fi
+    done
+    if [[ "$rc" -eq 0 && "$checks" -eq 10 && "$(tail -1 <<<"$out")" == "doctor: ok" ]] && ! grep -q '^FAIL' <<<"$out" \
+        && grep -Fqx "ok cli-home: $cli_home" <<<"$out"; then
+        pass "11 doctor against the fixtures: 10 checks ok/WARN ('ok cli-home: <state root>/cli-home'), 'doctor: ok', exit 0"
+    else
+        fail "11 doctor against the fixtures: 10 checks ok/WARN ('ok cli-home: <state root>/cli-home'), 'doctor: ok', exit 0"
+```
+
+**T6.** **Find** in `tests/test-zcode-dispatch.sh`:
+
+```text
+    echo ""
+    if [[ "$FAILURES" -ne 0 ]]; then
+```
+
+**Replace with:**
+
+```text
+    rc=0
+    ZCODE_STUB_MODE=record ZCODE_STUB_RECORD="$TEST_ROOT/probe-record.json" "$ZD" doctor --probe >/dev/null 2>&1 || rc=$?
+    if [[ -f "$TEST_ROOT/probe-record.json" ]] && cli_home_env_ok "$TEST_ROOT/probe-record.json"; then
+        pass "12 doctor --probe runs the CLI with the cli-home env (credentials, storage, session db, logs under <state root>/cli-home)"
+    else
+        fail "12 doctor --probe runs the CLI with the cli-home env (credentials, storage, session db, logs under <state root>/cli-home)"
+        echo "    exit: $rc record: $(head -c 400 "$TEST_ROOT/probe-record.json" 2>/dev/null)"
+    fi
+    rc=0
+    out="$(ZCODE_STUB_MODE=auth ZCODE_STUB_MESSAGE="$(first_pattern auth)" "$ZD" doctor --probe 2>"$TEST_ROOT/probe-auth.err")" || rc=$?
+    if [[ "$rc" -eq 1 && "$out" == *"model-selected: FAIL(auth)"* && "$(tail -1 <<<"$out")" == "probe: FAIL" ]] \
+        && grep -Fq "run: zcode-dispatch login" "$TEST_ROOT/probe-auth.err"; then
+        pass "12 doctor --probe with auth: FAIL(auth), exit 1, stderr hint 'run: zcode-dispatch login'"
+    else
+        fail "12 doctor --probe with auth: FAIL(auth), exit 1, stderr hint 'run: zcode-dispatch login'"
+        echo "    exit: $rc stderr: $(tail -3 "$TEST_ROOT/probe-auth.err")"
+        echo "$out" | sed 's/^/    /'
+    fi
+    rc=0
+    out="$(ZCODE_STUB_MODE=quota ZCODE_STUB_MESSAGE="$(first_pattern quota)" "$ZD" doctor --probe 2>"$TEST_ROOT/probe-quota.err")" || rc=$?
+    if [[ "$rc" -eq 1 && "$out" == *"model-selected: FAIL(quota)"* ]] && ! grep -Fq "zcode-dispatch login" "$TEST_ROOT/probe-quota.err"; then
+        pass "12 doctor --probe with quota: FAIL(quota), no login hint"
+    else
+        fail "12 doctor --probe with quota: FAIL(quota), no login hint"
+        echo "    exit: $rc stderr: $(tail -3 "$TEST_ROOT/probe-quota.err")"
+    fi
+
+    # --- 14. login: the CLI's own `zcode login zai` in the wrapper's cli-home (Ф4a) ---
+    local login_out
+    rc=0
+    login_out="$(ZCODE_STUB_MODE=login ZCODE_STUB_RECORD="$TEST_ROOT/login-record.json" ZCODE_HTTP_PROXY=http://127.0.0.1:9 \
+        ZCODE_DATA_BASE_DIR="$TEST_ROOT/foreign-data-home" "$ZD" login 2>&1)" || rc=$?
+    if [[ "$rc" -eq 0 && "$login_out" == *"https://example.invalid/stub-login"* && "$login_out" == *"login: ok"* \
+        && "$login_out" != *"stub-secret-token"* && -f "$cli_home/.zcode/v2/credentials.json" \
+        && ! -e "$HOME/.zcode" && ! -e "$TEST_ROOT/foreign-data-home" ]] \
+        && REC="$TEST_ROOT/login-record.json" CFG="$cfg" VER="$want_version" PCFG="$pcfg" CLI_HOME="$cli_home" \
+        SEL_PATH="$sel_path" PINNED="$pinned" node -e '
+const fs = require("node:fs");
+const r = JSON.parse(fs.readFileSync(process.env.REC, "utf8"));
+const after = JSON.parse(fs.readFileSync(process.env.PCFG, "utf8"));
+const at = (o) => process.env.SEL_PATH.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
+const ok = JSON.stringify(r.argv) === JSON.stringify(["login", "zai"])
+  && r.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE === process.env.CFG
+  && r.env.ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE === process.env.CFG
+  && r.env.ZCODE_APP_VERSION === process.env.VER
+  && r.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE === process.env.PCFG
+  && r.env.ZCODE_HTTP_PROXY === "http://127.0.0.1:9"
+  && after.config?.loginWrote === true
+  && JSON.stringify(at(after)) === process.env.PINNED;
+process.exit(ok ? 0 : 1);' && cli_home_env_ok "$TEST_ROOT/login-record.json"; then
+        pass "14 login (no argument = zai) runs 'login zai' with the wrapper env (provider config x2, app version, personal config, the cli-home env, inherited ZCODE_HTTP_PROXY), exit 0, then re-pins PINNED_SELECTION; the credential lands only under cli-home and is never printed"
+    else
+        fail "14 login (no argument = zai) runs 'login zai' with the wrapper env (provider config x2, app version, personal config, the cli-home env, inherited ZCODE_HTTP_PROXY), exit 0, then re-pins PINNED_SELECTION; the credential lands only under cli-home and is never printed"
+        echo "    exit: $rc out: $login_out"
+        echo "    record: $(head -c 600 "$TEST_ROOT/login-record.json" 2>/dev/null)"
+    fi
+    rc=0
+    login_out="$(ZCODE_STUB_MODE=login ZCODE_STUB_EXIT=7 "$ZD" login zai 2>&1)" || rc=$?
+    if [[ "$rc" -eq 7 && "$login_out" != *"login: ok"* ]]; then
+        pass "14 login zai returns the CLI's exit code (7) and reports no success"
+    else
+        fail "14 login zai returns the CLI's exit code (7) and reports no success"
+        echo "    exit: $rc out: $login_out"
+    fi
+    expect_exit 2 "14 login with a provider other than zai is refused (exit 2)" "$ZD" login bigmodel
+    expect_exit 2 "14 login with an extra argument is refused (exit 2)" "$ZD" login zai extra
+    expect_exit 2 "14 login with an unknown flag is refused (exit 2)" "$ZD" login --bogus
+    expect_exit 2 "14 login with ZCODE_APP without a readable Info.plist is refused (exit 2)" env ZCODE_APP="$TEST_ROOT/NoPlist.app" "$ZD" login
+
+    echo ""
+    if [[ "$FAILURES" -ne 0 ]]; then
+```
+
+- [ ] **Step 4: Run the suite to verify it fails**
+
+Run: `bash tests/test-zcode-dispatch.sh`
+Expected: exit 1, last line `FAILED: 6 assertion(s).`, and exactly these six `[FAIL]` lines:
+- `2 CLI argv pins …`
+- `11 doctor against the fixtures: 10 checks …`
+- `12 doctor --probe runs the CLI with the cli-home env …`
+- `12 doctor --probe with auth: …`
+- `14 login (no argument = zai) …`
+- `14 login zai returns the CLI's exit code (7) …`
+
+The other 58 lines are `[PASS]`. The four `14 login … is refused (exit 2)` assertions and `12 doctor --probe with quota: …, no login hint` already pass, because the unknown verb exits 2 and no hint exists yet. They become real guards in Step 5.
+
+- [ ] **Step 5: Implement the CLI home, the probe hint and the `login` verb**
+
+Edits to `bin/lib/zcode-dispatch.mjs`, then the usage comment of the shim `bin/zcode-dispatch`:
+
+**M1.** **Find** in `bin/lib/zcode-dispatch.mjs`:
+
+```text
+// Pure Node ESM, no dependencies, no shell: every child process is spawned with
+// an argv array. Never reads or writes ~/.zcode, never sets ZCODE_DATA_BASE_DIR,
+// never calls the Z.ai API itself — the ZCode CLI is the only channel. The model pin
+// travels in the wrapper's own personal provider config under the state root
+// (ZCODE_PERSONAL_PROVIDER_CONFIG_FILE); the CLI login is the user's `zcode login zai`.
+//
+// Usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor> [args...]
+```
+
+**Replace with:**
+
+```text
+// Pure Node ESM, no dependencies, no shell: every child process is spawned with
+// an argv array. Never reads or writes the user's ~/.zcode (shared with the desktop
+// app): every CLI run gets the cli-home environment — ZCODE_DATA_BASE_DIR=<state root>/cli-home
+// for the CLI's credentials, plus ZCODE_STORAGE_DIR, ZCODE_SESSION_DB_PATH and ZCODE_LOG_DIR
+// under it for its plugins/rollouts, sessions and logs. The CLI's user config
+// ~/.zcode/cli/config.json has no override and stays the CLI's own shared file. Never reads
+// those credentials and never calls the Z.ai API itself — the ZCode CLI is the only channel.
+// The model pin travels in the wrapper's own personal provider config under the state
+// root (ZCODE_PERSONAL_PROVIDER_CONFIG_FILE); the CLI login is the user's
+// `zcode-dispatch login`, which runs the CLI's own `zcode login zai` in that home.
+//
+// Usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor|login> [args...]
+```
+
+**M2.** **Find** in `bin/lib/zcode-dispatch.mjs`:
+
+```text
+const personalConfigFile = (env = process.env) => path.join(stateRoot(env), "personal-provider-config.json");
+```
+
+**Replace with:**
+
+```text
+const personalConfigFile = (env = process.env) => path.join(stateRoot(env), "personal-provider-config.json");
+
+// The CLI's own home for its credentials and state, apart from the user's ~/.zcode, whose credential
+// key the desktop app rewrites with a different token kind (docs/zcode-cli-findings.md, "CLI data home").
+// The CLI resolves each location separately, so cliHomeEnv sets one override per resolver that has one;
+// its user config ~/.zcode/cli/config.json has none (only HOME, which the wrapper never overrides).
+// The wrapper creates the directory (mode 0700) and never reads what the CLI keeps there.
+const cliHome = (env = process.env) => path.join(stateRoot(env), "cli-home");
+
+function cliHomeEnv() {
+  const home = cliHome();
+  const storage = path.join(home, ".zcode");
+  return {
+    ZCODE_DATA_BASE_DIR: home, // credentials: <cli-home>/.zcode/v2/credentials.json
+    ZCODE_STORAGE_DIR: storage, // storage root: plugins, rollouts, memories under <cli-home>/.zcode/cli/
+    ZCODE_SESSION_DB_PATH: path.join(storage, "cli", "db", "db.sqlite"), // not derived from the storage root
+    ZCODE_LOG_DIR: path.join(storage, "cli", "log"),
+  };
+}
+
+function ensureCliHome() {
+  const dir = cliHome();
+  fs.mkdirSync(stateRoot(), { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  return dir;
+}
+```
+
+**M3.** **Find** in `bin/lib/zcode-dispatch.mjs`:
+
+```text
+function buildCliEnv(paths, appVersion) {
+  return {
+    ...process.env,
+    ...MODEL_ENV,
+    ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: paths.providerConfig,
+    ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: paths.providerConfig,
+    ZCODE_APP_VERSION: appVersion,
+    ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: personalConfigFile(),
+  };
+}
+```
+
+**Replace with:**
+
+```text
+function buildCliEnv(paths, appVersion) {
+  const env = {
+    ...process.env,
+    ...MODEL_ENV,
+    ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: paths.providerConfig,
+    ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: paths.providerConfig,
+    ZCODE_APP_VERSION: appVersion,
+    ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: personalConfigFile(),
+    ...cliHomeEnv(),
+  };
+  // The CLI also reads ZCODE_SESSION_DB as an alias of ZCODE_SESSION_DB_PATH; an inherited one could win.
+  delete env.ZCODE_SESSION_DB;
+  return env;
+}
+```
+
+**M4.** **Find** in `bin/lib/zcode-dispatch.mjs`:
+
+```text
+      finalizeRecord(file, { status: "failed", errorClass: "launch", note: `cannot write the personal provider config: ${error.message}` });
+      return 1;
+    }
+```
+
+**Replace with:**
+
+```text
+      finalizeRecord(file, { status: "failed", errorClass: "launch", note: `cannot write the personal provider config: ${error.message}` });
+      return 1;
+    }
+    try {
+      ensureCliHome();
+    } catch (error) {
+      finalizeRecord(file, { status: "failed", errorClass: "launch", note: `cannot create the CLI home: ${error.message}` });
+      return 1;
+    }
+```
+
+**M5.** **Find** in `bin/lib/zcode-dispatch.mjs`:
+
+```text
+    report("FAIL", "state-dir", `${stateRoot()} is not writable: ${error.message}`);
+  }
+```
+
+**Replace with:**
+
+```text
+    report("FAIL", "state-dir", `${stateRoot()} is not writable: ${error.message}`);
+  }
+  try {
+    report("ok", "cli-home", ensureCliHome());
+  } catch (error) {
+    report("FAIL", "cli-home", `cannot create ${cliHome()}: ${error.message}`);
+  }
+```
+
+**M6.** **Find** in `bin/lib/zcode-dispatch.mjs`:
+
+```text
+async function runProbe(paths, appVersion, root) {
+  pinPersonalConfig(personalConfigFile());
+```
+
+**Replace with:**
+
+```text
+async function runProbe(paths, appVersion, root) {
+  pinPersonalConfig(personalConfigFile());
+  ensureCliHome();
+```
+
+**M7.** **Find** in `bin/lib/zcode-dispatch.mjs`:
+
+```text
+  if (!modelSelected && result.stderrTail.trim()) process.stderr.write(`${result.stderrTail.split("\n").slice(-20).join("\n")}\n`);
+  return ok ? 0 : 1;
+}
+```
+
+**Replace with:**
+
+```text
+  if (!modelSelected && result.stderrTail.trim()) process.stderr.write(`${result.stderrTail.split("\n").slice(-20).join("\n")}\n`);
+  if (verdict.errorClass === "auth" || verdict.errorClass === "model-not-selected") {
+    process.stderr.write(
+      `hint: the ZCode CLI is not logged in (or its login expired) in ${cliHome()}; run: zcode-dispatch login (prefix ZCODE_HTTP_PROXY=<proxy url> if the CLI needs a proxy on this machine)\n`,
+    );
+  }
+  return ok ? 0 : 1;
+}
+
+// `login [zai]` — the user's CLI login, in the foreground: the CLI's own `zcode login zai` with exactly
+// the environment of every wrapper run (buildCliEnv: provider config, real app version, the wrapper's
+// personal config, the cli-home environment, inherited ZCODE_HTTP_PROXY), stdio inherited so the
+// user sees the browser URL. The login rewrites the personal config's default selection, so a successful
+// login is followed by a re-pin. Exit code = the CLI's. Never reads or prints a credential.
+function cmdLogin(args) {
+  const { positionals } = parse(args, {}, 1);
+  if (positionals.length === 1 && positionals[0] !== "zai") throw new UsageError(`login supports only the zai provider, got "${positionals[0]}"`);
+  const paths = zcodePaths();
+  const appVersion = readAppVersion(paths.plist);
+  if (!appVersion) throw new UsageError(`cannot read ${APP_VERSION_PLIST_KEY} from ${paths.plist}; refusing to run with an unknown client version`);
+  if (!fs.existsSync(paths.bin)) throw new UsageError(`ZCode CLI not found: ${paths.bin}`);
+  if (!fs.existsSync(paths.providerConfig)) throw new UsageError(`ZCode provider config not found: ${paths.providerConfig}`);
+  const home = ensureCliHome();
+  const run = spawnSync(paths.node, [paths.bin, "login", "zai"], { env: buildCliEnv(paths, appVersion), stdio: "inherit" });
+  if (run.error) throw new Error(`cannot run ${paths.node} ${paths.bin} login zai: ${run.error.message}`);
+  if (run.status !== 0) {
+    process.stderr.write(`zcode-dispatch: login failed (CLI ${run.status === null ? `signal ${run.signal}` : `exit ${run.status}`}); nothing re-pinned\n`);
+    return run.status ?? 1;
+  }
+  pinPersonalConfig(personalConfigFile());
+  process.stdout.write(`login: ok — ZCode CLI login stored in ${home}; ${personalConfigFile()} re-pinned to ${PINNED_MODEL}\n`);
+  return 0;
+}
+```
+
+**M8.** **Find** in `bin/lib/zcode-dispatch.mjs`:
+
+```text
+      case "doctor":
+        return await cmdDoctor(rest);
+```
+
+**Replace with:**
+
+```text
+      case "doctor":
+        return await cmdDoctor(rest);
+      case "login":
+        return cmdLogin(rest);
+```
+
+**M9.** **Find** in `bin/lib/zcode-dispatch.mjs`:
+
+```text
+        throw new UsageError(`usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor> [args...]${verb ? ` (unknown verb: ${verb})` : ""}`);
+```
+
+**Replace with:**
+
+```text
+        throw new UsageError(`usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor|login> [args...]${verb ? ` (unknown verb: ${verb})` : ""}`);
+```
+
+**H1.** **Find** in `bin/zcode-dispatch`:
+
+```text
+# Usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor> [args...]
+```
+
+**Replace with:**
+
+```text
+# Usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor|login> [args...]
+```
+
+- [ ] **Step 6: Run both suites to verify they pass**
+
+Run: `bash tests/test-zcode-dispatch.sh`
+Expected: 64 `[PASS]` lines, no `[FAIL]`, last line `PASS`, exit 0, about 30 s. Afterwards `pgrep -f zcode-stub.cjs` prints nothing.
+Run: `bash tests/test-sdd-scripts.sh`
+Expected: last line `PASS`.
+
+- [ ] **Step 7: Edit `skills/zcode-invocation/SKILL.md`**
+
+**L1.** **Find** in `skills/zcode-invocation/SKILL.md`:
+
+````text
+2. Log the **CLI** in once with Z.ai's own browser login (GLM Coding Plan account). The embedded CLI ships without its TUI, so there is no `/model` step. The user runs the line below; the `!` prefix makes it a user-shell command. It opens the browser; if the `!` prompt cannot host it, run the same line without `!` in a separate terminal window:
+
+   ```
+   ! mkdir -p ~/.claude/plugins/data/superpowers-strigov-ver-zcode && ZCODE_BUILTIN_PROVIDER_CONFIG_FILE=/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE=/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json ZCODE_APP_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - /Applications/ZCode.app/Contents/Info.plist)" ZCODE_PERSONAL_PROVIDER_CONFIG_FILE="$HOME/.claude/plugins/data/superpowers-strigov-ver-zcode/personal-provider-config.json" node /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs login zai
+   ```
+
+   The login stores the CLI's identity in ZCode's own credential store; the wrapper never reads it. It also writes a default model into the wrapper's personal provider config named above, not into `~/.zcode/v2/provider_config.json`, so the desktop app's selection stays untouched. The model itself needs no user step: the wrapper pins GLM-5.3-Flash at `max` in that file before every run. One login per machine is enough; repeat it only when step 3 applies.
+3. Login missing or expired: `doctor --probe` prints `model-selected: FAIL(model-not-selected)` or `FAIL(auth)`, and a task fails with the same `errorClass`. Then `glm=down` and Luna max for the rest of the session (dev-orchestrator channel ladder, unchanged). Tell the user to run step 2; never run it yourself.
+````
+
+**Replace with:**
+
+````text
+2. Log the **CLI** in with Z.ai's own browser login (GLM Coding Plan account) through the wrapper: `zcode-dispatch login` runs the CLI's own `zcode login zai` with exactly the wrapper's environment. The embedded CLI ships without its TUI, so there is no `/model` step. The user runs the line below, with `$ZDISPATCH` replaced by the absolute path step 1 printed (shell variables do not reach a `!` command — give the user the filled line); the `!` prefix makes it a user-shell command. It prints a URL and opens the browser; if the `!` prompt cannot host it, run the same line without `!` in a separate terminal window. The CLI ignores `HTTPS_PROXY` and the system proxy (`docs/zcode-cli-findings.md` header): if it needs a proxy on this machine, prefix the line with `ZCODE_HTTP_PROXY=<proxy url>`:
+
+   ```
+   ! "$ZDISPATCH" login
+   ```
+
+   Expected: the CLI's own login output, then `login: ok — ZCode CLI login stored in <cli-home>; <personal config> re-pinned to GLM-5.3-Flash$max`, exit 0; on failure the exit code is the CLI's. The login stores the CLI's identity in the wrapper's own CLI home `~/.claude/plugins/data/superpowers-strigov-ver-zcode/cli-home` (passed to every CLI run as `ZCODE_DATA_BASE_DIR`), never in `~/.zcode`: the desktop app and the CLI write the same credential key with different token kinds and would log each other out (`docs/zcode-cli-findings.md`, "CLI data home"). The wrapper never reads that credential. The login also rewrites the default model in the wrapper's personal provider config; the wrapper re-pins GLM-5.3-Flash at `max` right after it and before every run. A plain `zcode login zai` made before this wrapper version went into `~/.zcode` and does not count — run this one once per machine.
+3. Login missing or expired: the CLI login stores no refresh token, so it can expire on its own. `doctor --probe` then prints `model-selected: FAIL(model-not-selected)` or `FAIL(auth)` and the stderr hint `run: zcode-dispatch login`, and a task fails with the same `errorClass`. Then `glm=down` and Luna max for the rest of the session (dev-orchestrator channel ladder, unchanged). Tell the user to run step 2 again; never run it yourself.
+````
+
+**L2.** **Find** in `skills/zcode-invocation/SKILL.md`:
+
+```text
+"$ZDISPATCH" doctor            # offline: app, cli, provider-config, node, app-version, git, state-dir, personal-config, kill-switch
+```
+
+**Replace with:**
+
+```text
+"$ZDISPATCH" doctor            # offline: app, cli, provider-config, node, app-version, git, state-dir, cli-home, personal-config, kill-switch
+```
+
+**L3.** **Find** in `skills/zcode-invocation/SKILL.md`:
+
+```text
+`model-selected: FAIL(model-not-selected)` or `FAIL(auth)` means the CLI login is missing or expired ("One-time setup", step 3).
+```
+
+**Replace with:**
+
+```text
+`model-selected: FAIL(model-not-selected)` or `FAIL(auth)` means the CLI login is missing or expired; the probe then also prints the stderr hint `run: zcode-dispatch login` ("One-time setup", step 3).
+```
+
+**L4.** **Find** in `skills/zcode-invocation/SKILL.md`:
+
+```text
+| `doctor --probe [--cwd <path>]` | Offline checks, then ONE synchronous PONG request (120 s timeout). The only diagnostic that spends quota. |
+```
+
+**Replace with:**
+
+```text
+| `doctor --probe [--cwd <path>]` | Offline checks, then ONE synchronous PONG request (120 s timeout). The only diagnostic that spends quota. |
+| `login [zai]` | The user's CLI login — never run by the orchestrator. Runs the CLI's own `zcode login zai` in the foreground with the wrapper's environment (credential in `cli-home`, never in `~/.zcode`), stdio inherited so the browser URL shows; after exit 0 re-pins the personal provider config and prints `login: ok — …`. Exit code = the CLI's (the one verb outside 0/1/2); exit 2 for an argument other than `zai`, an unreadable `Info.plist`, or a missing `zcode.cjs` / provider config. Never reads or prints a credential. |
+```
+
+**L5.** **Find** in `skills/zcode-invocation/SKILL.md`:
+
+```text
+, where the model pin is written before every run; `ZCODE_DATA_BASE_DIR` is never set.
+```
+
+**Replace with:**
+
+```text
+, where the model pin is written before every run, plus `ZCODE_DATA_BASE_DIR` = the wrapper's own `cli-home` under the state root (the CLI's credential store, `<cli-home>/.zcode/v2/credentials.json`) and, under it, `ZCODE_STORAGE_DIR` = `<cli-home>/.zcode` (plugins, rollouts, memories), `ZCODE_SESSION_DB_PATH` = `<cli-home>/.zcode/cli/db/db.sqlite` (sessions) and `ZCODE_LOG_DIR` = `<cli-home>/.zcode/cli/log` (logs); inherited values are overridden and an inherited `ZCODE_SESSION_DB` alias is dropped. The CLI's user config `~/.zcode/cli/config.json` has no override: the CLI still reads it (and may migrate it in place once), as it does for the desktop app's embedded agent; the wrapper never edits it. `task`, `doctor --probe` and `login` all run the CLI with this environment.
+```
+
+**L6.** **Find** in `skills/zcode-invocation/SKILL.md`:
+
+```text
+On `auth` / `model-not-selected`, also tell the user the CLI login is likely missing ("One-time setup", step 2) |
+```
+
+**Replace with:**
+
+```text
+On `auth` / `model-not-selected`, also tell the user the CLI login is likely missing or expired and that they should run `"$ZDISPATCH" login` themselves ("One-time setup", step 2) |
+```
+
+**L7.** **Find** in `skills/zcode-invocation/SKILL.md`:
+
+```text
+| `doctor --probe` FAIL (before any task) | `glm=down` (state line + marker); announce once; Luna for the session |
+```
+
+**Replace with:**
+
+```text
+| `doctor --probe` FAIL (before any task) | `glm=down` (state line + marker); announce once; Luna for the session. On `FAIL(auth)` / `FAIL(model-not-selected)` the announcement also tells the user to run `"$ZDISPATCH" login` themselves ("One-time setup", step 2) |
+```
+
+**L8.** **Find** in `skills/zcode-invocation/SKILL.md`:
+
+```text
+Nothing reads `~/.zcode`. If Z.ai
+```
+
+**Replace with:**
+
+```text
+The wrapper never reads or writes the user's `~/.zcode`; the CLI's credentials, sessions, logs and plugins live in the wrapper's `cli-home`, and the wrapper never reads the credential there. The one shared file is the CLI's own user config `~/.zcode/cli/config.json`, which the CLI reads on every run (no override exists). If Z.ai
+```
+
+**L9.** **Find** in `skills/zcode-invocation/SKILL.md`:
+
+```text
+- Change ZCode settings, plugins or login on the user's behalf — logging in (`zcode login zai`), enabling or disabling plugins are user actions.
+```
+
+**Replace with:**
+
+```text
+- Change ZCode settings, plugins or login on the user's behalf — logging in (`"$ZDISPATCH" login`, which runs the CLI's `zcode login zai`), enabling or disabling plugins are user actions.
+```
+
+**L10.** **Find** in `skills/zcode-invocation/SKILL.md`:
+
+```text
+- Personal provider config (wrapper-owned; holds the model pin, no credentials): `~/.claude/plugins/data/superpowers-strigov-ver-zcode/personal-provider-config.json`
+```
+
+**Replace with:**
+
+```text
+- Personal provider config (wrapper-owned; holds the model pin, no credentials): `~/.claude/plugins/data/superpowers-strigov-ver-zcode/personal-provider-config.json`
+- CLI home (`ZCODE_DATA_BASE_DIR` of every CLI run, mode 0700; written only by the CLI and never read by the wrapper): `~/.claude/plugins/data/superpowers-strigov-ver-zcode/cli-home` — credentials `.zcode/v2/credentials.json`, storage root `.zcode/cli/` (plugins, rollouts, memories), sessions `.zcode/cli/db/db.sqlite`, logs `.zcode/cli/log/`
+- CLI user config (no override; the CLI's own shared file, never edited by the wrapper): `~/.zcode/cli/config.json`
+```
+
+**L11.** **Find** in `skills/zcode-invocation/SKILL.md`:
+
+```text
+Exit codes everywhere: **0** success · **1** runtime failure (failed job on `result`, failed checks on `doctor`, internal error) · **2** usage error or guard refusal.
+```
+
+**Replace with:**
+
+```text
+Exit codes everywhere: **0** success · **1** runtime failure (failed job on `result`, failed checks on `doctor`, internal error) · **2** usage error or guard refusal. The one exception is `login`, which returns the CLI's own exit code (its argument refusals still exit 2).
+```
+
+- [ ] **Step 8: Edit `skills/dev-orchestrator/SKILL.md`**
+
+These edits cover the auth-failure handling (`glm=down` → announced Luna); the user is now also told to run the login verb.
+
+**D1.** **Find** in `skills/dev-orchestrator/SKILL.md`:
+
+```text
+Either fails → `glm=down`, one announcement (`ZCode doctor failed (<first FAIL line>) — implementer for this session: Luna max.`), and ladder item 3 applies for the rest of the session.
+```
+
+**Replace with:**
+
+```text
+Either fails → `glm=down`, one announcement (`ZCode doctor failed (<first FAIL line>) — implementer for this session: Luna max.`), and ladder item 3 applies for the rest of the session. When the first FAIL line is `model-selected: FAIL(auth)` or `model-selected: FAIL(model-not-selected)` (the probe's stderr then carries the hint `run: zcode-dispatch login`), the same announcement tells the user that the ZCode CLI login is missing or expired (it has no refresh token) and gives them the line to run themselves — `"$ZDISPATCH" login` with the absolute path filled in (`zcode-invocation` "One-time setup", step 2); GLM comes back in a later session. Never run the login yourself.
+```
+
+**D2.** **Find** in `skills/dev-orchestrator/SKILL.md`:
+
+```text
+announce (`GLM channel failed (errorClass=<class>) — Ф<id> falls back to Luna max; GLM is off for this session.`), re-dispatch
+```
+
+**Replace with:**
+
+```text
+announce (`GLM channel failed (errorClass=<class>) — Ф<id> falls back to Luna max; GLM is off for this session.`; on `auth` / `model-not-selected` the announcement also tells the user to run `"$ZDISPATCH" login` themselves, absolute path filled in — the CLI login is missing or expired, `zcode-invocation` "One-time setup", step 2), re-dispatch
+```
+
+**D3.** **Find** in `skills/dev-orchestrator/SKILL.md`:
+
+```text
+logging in (`zcode login zai`), enabling or disabling plugins are user actions; ask, never do.
+```
+
+**Replace with:**
+
+```text
+logging in (`"$ZDISPATCH" login`, which runs the CLI's `zcode login zai` in the wrapper's own CLI home), enabling or disabling plugins are user actions; ask, never do.
+```
+
+- [ ] **Step 9: Edit `README.md`, `README.ru.md` and `PLUGIN_README.md`**
+
+**R1.** **Find** in `README.md`:
+
+```text
+then log its CLI in once with your GLM Coding Plan account via `zcode login zai` (the exact command is in the `zcode-invocation` skill, "One-time setup").
+```
+
+**Replace with:**
+
+```text
+then log its CLI in once with your GLM Coding Plan account via `zcode-dispatch login` — it runs ZCode's own `zcode login zai` in the wrapper's separate CLI home, so the ZCode desktop app's login stays untouched; repeat it when the CLI login expires (details in the `zcode-invocation` skill, "One-time setup").
+```
+
+**R2.** **Find** in `README.md`:
+
+```text
+| ZCode CLI job wrapper: task/status/result/cancel/release-stale/doctor with
+```
+
+**Replace with:**
+
+```text
+| ZCode CLI job wrapper: task/status/result/cancel/release-stale/doctor/login with
+```
+
+**R3.** **Find** in `README.ru.md`:
+
+```text
+один раз войдите в его CLI под аккаунтом GLM Coding Plan через `zcode login zai` (точная команда — в скилле `zcode-invocation`, раздел «One-time setup»).
+```
+
+**Replace with:**
+
+```text
+один раз войдите в его CLI под аккаунтом GLM Coding Plan через `zcode-dispatch login` — команда запускает собственный `zcode login zai` от ZCode в отдельном каталоге данных CLI, принадлежащем обёртке, поэтому вход в десктопном приложении ZCode не затрагивается; повторите вход, когда логин CLI истечёт (подробности — в скилле `zcode-invocation`, раздел «One-time setup»).
+```
+
+**R4.** **Find** in `README.ru.md`:
+
+```text
+| Обёртка задач ZCode CLI: task/status/result/cancel/release-stale/doctor с
+```
+
+**Replace with:**
+
+```text
+| Обёртка задач ZCode CLI: task/status/result/cancel/release-stale/doctor/login с
+```
+
+**P1.** **Find** in `PLUGIN_README.md`:
+
+```text
+with the CLI logged in once by the user (`zcode login zai`, see `zcode-invocation`). `bin/zcode-dispatch` keeps its job state and its own personal provider config (the model pin) under `~/.claude/plugins/data/superpowers-strigov-ver-zcode` and never touches `~/.zcode`.
+```
+
+**Replace with:**
+
+```text
+with the CLI logged in by the user via `zcode-dispatch login` (ZCode's own `zcode login zai` in the wrapper's CLI home, repeated when the CLI login expires; see `zcode-invocation`). `bin/zcode-dispatch` keeps its job state, its own personal provider config (the model pin) and the CLI's own credentials and state (`cli-home`, passed as `ZCODE_DATA_BASE_DIR` plus storage, session-database and log overrides under it: the CLI's credentials, plugins, sessions and logs) under `~/.claude/plugins/data/superpowers-strigov-ver-zcode`, and never edits `~/.zcode`, which the ZCode desktop app uses; the CLI itself still reads its user config `~/.zcode/cli/config.json`, which has no override.
+```
+
+- [ ] **Step 10: Record the diagnosis in `docs/zcode-cli-findings.md`**
+
+**F1.** **Find** in `docs/zcode-cli-findings.md`:
+
+```text
+- Design consequence: `APP_VERSION_PLIST_KEY = CFBundleShortVersionString`, `VERIFIED_APP_VERSION = 3.15.1`.
+
+## Inputs for later phases
+```
+
+**Replace with:**
+
+```text
+- Design consequence: `APP_VERSION_PLIST_KEY = CFBundleShortVersionString`, `VERIFIED_APP_VERSION = 3.15.1`.
+
+## CLI data home — why the wrapper's CLI keeps its credentials and state out of `~/.zcode` (2026-10-14)
+- Answer: The CLI's standalone login and the ZCode desktop app keep their Z.ai login in one credential store under one key, but store different token kinds there, so each login invalidates the other. The wrapper therefore gives the CLI its own credential store, and its own state directories wherever the CLI offers an override.
+  - Both resolve the store as `<ZCODE_DATA_BASE_DIR, else $HOME>/.zcode/v2/credentials.json`, and both use the key `oauth:zai:access_token`.
+  - The desktop app exchanges its OAuth token for a business token (`exchangeToken`) and stores the exchanged token in that key.
+  - The CLI's `zcode login zai` stores its OAuth token there. Before every model request (`refreshBeforeModelRequest`) the CLI exchanges the stored token via `POST https://api.z.ai/api/auth/z/login`. With the desktop app's token in the key, that exchange fails with `project_token_login_failed`, so every CLI run fails. With the CLI's token in the key, the desktop app rejects it and asks the user to sign in again.
+  - The CLI login stores no refresh token, so it also expires on its own; the CLI then fails the same way until the user logs in again.
+  - `ZCODE_DATA_BASE_DIR` moves only the credential store. The headless path (`runPrompt` → `INn`) resolves its other state separately; each resolver and its override (bundle 3.15.1, env names exact):
+
+    | State | Resolver | Default location | Override |
+    |---|---|---|---|
+    | Credentials | `Vta` | `~/.zcode/v2/credentials.json` | `ZCODE_DATA_BASE_DIR` (→ `<dir>/.zcode/v2/credentials.json`) |
+    | Storage root: plugins, rollouts, memories (`<root>/cli/…`) | `storage.dir` in the merged config (`Fm` default), `K0` → `hU` | `~/.zcode` | `ZCODE_STORAGE_DIR` (env config `egn`, scope Env, above user and project config) |
+    | Session database | `vae` → `LYo` (`storage.sessionDbPath`, `Fm` default; not derived from `storage.dir`) | `~/.zcode/cli/db/db.sqlite` | `ZCODE_SESSION_DB_PATH`, alias `ZCODE_SESSION_DB` (env config `egn`) |
+    | Logs | `JB` → `xGs` | `~/.zcode/cli/log` | `ZCODE_LOG_DIR` (read from the env the headless entry passes) |
+    | User config | `Ig` → `yLe` | `~/.zcode/cli/config.json` | none: only a programmatic `userConfigPath` / `skipUserConfig`; `parseGlobalArgs` has no flag for it, no env name exists, and `HOME` is ruled out |
+
+  - The user config stays the CLI's normal shared file, also used by the desktop app's embedded agent. Every CLI run reads it; when it holds a legacy plugin id, the CLI rewrites it once in place (`cJs` → `lJs`, a temp file and rename). The design neither edits it nor isolates it.
+  - Not covered by the overrides above (defaults seen in the bundle, not verified as used on this path): the workflow store `~/.zcode/cli/workflows` (the wrapper runs `--workflow-mode disabled`), the session mailbox `~/.zcode/mailbox` (only with `ZCODE_MESSAGE_ENABLED`; override `ZCODE_MAILBOX_ROOT`), and the model-telemetry device id `~/.zcode/v2/telemetry-state.json` (`Wnc`, telemetry only; override `ZCODE_HOME`).
+- How verified:
+  - Bundle `zcode.cjs` (3.15.1): the credential-path resolver `Vta` (`ZCODE_DATA_BASE_DIR`, else the home directory, joined with `.zcode/v2/credentials.json`); the credential key table (`zaiAccessToken: "oauth:zai:access_token"`); `refreshBeforeModelRequest` (around byte offset 14361400); the exchange request to `/api/auth/z/login` and its error code `project_token_login_failed` (around byte offset 4381206).
+  - Bundle `zcode.cjs` (3.15.1), resolver table (read-only greps, ledger PC1-B1): `INn` (around byte offset 14332455) calls `Ig({env, userConfigPath, skipUserConfig, …})` and `JB({env})`, then `K0(config.storage.dir)` → `hU` (`<root>/cli`) and `LYo` → `vae` (`storage.sessionDbPath`); `Fm` (around 1364193) holds the defaults `storage: {dir: "~/.zcode", sessionDbPath: "~/.zcode/cli/db/db.sqlite"}`; `egn` (around 4185159) maps `ZCODE_STORAGE_DIR` / `ZCODE_SESSION_DB_PATH` / `ZCODE_SESSION_DB` into the Env scope (priority 40, above User 10 and Project 20); `JB` (around 4165465) takes `logDir ?? env.ZCODE_LOG_DIR ?? xGs()`; `yLe` (around 4178373) reads `userConfigPath ?? ~/.zcode/cli/config.json` and `lJs` rewrites it after the plugin-id migration; the headless entry takes `userConfigPath` / `skipUserConfig` only from injected deps, and `parseGlobalArgs` (bundle start) has no config-path flag; the CLI's env sanitizer (`C$t`) keeps all four override names.
+  - Desktop app `app.asar`, `out/host/index.js`: `exchangeToken` stores the exchanged business token under the same key.
+  - Live, 2026-10-14 (the Ф5 BLOCKED diagnosis): the desktop app's log `~/.zcode/v2/logs/2026-10-14.log` shows the desktop app rejecting the CLI-written token at 09:10:36; the user signed the desktop app in again at 09:10:59.
+- Holds for: ZCode 3.15.1 (zcode 0.16.9)
+- Design consequence (plan Ф4a):
+  - Every wrapper CLI run (task runner, `doctor --probe`, `login`) sets `ZCODE_DATA_BASE_DIR=<ZCODE_STATE_DIR>/cli-home` (a directory the wrapper creates with mode 0700), `ZCODE_STORAGE_DIR=<cli-home>/.zcode`, `ZCODE_SESSION_DB_PATH=<cli-home>/.zcode/cli/db/db.sqlite` and `ZCODE_LOG_DIR=<cli-home>/.zcode/cli/log`, and drops an inherited `ZCODE_SESSION_DB`. The wrapper never edits the user's `~/.zcode` or the desktop app's files; the CLI's own read (and one-time migration) of `~/.zcode/cli/config.json` remains, because no override exists for it.
+  - The user logs the CLI in with `zcode-dispatch login`, which runs `zcode login zai` with the wrapper's environment and re-pins the model afterwards. That is needed once per machine, and again whenever the login expires: `doctor --probe` FAIL(auth) or FAIL(model-not-selected) prints the hint `run: zcode-dispatch login`.
+  - Sessions of CLI runs made before the change live in `~/.zcode/cli/db/db.sqlite` and cannot be resumed from the new session database. The CLI seeds the bundled official plugins into the new storage root itself (`Drc`, error code `ZCODE_PLUGIN_SEED_INCOMPLETE`); which plugins are enabled still comes from the merged config, including the shared user config. The U8 plugin list was read with the old storage root and is not re-verified for the new one.
+
+## Inputs for later phases
+```
+
+- [ ] **Step 11: Run the checks and both suites (pass)**
+
+1. Run the Step 1 block again. Expected: last line `ALL CHECKS PASSED`.
+2. Run the Ф3 Step 1 block and the Ф4 Step 1 block unchanged, as a regression check of the skill and README anchors. Expected: each ends `ALL CHECKS PASSED`.
+3. Run: `bash tests/test-zcode-dispatch.sh && bash tests/test-sdd-scripts.sh`. Expected: both end with `PASS`, and the first suite shows 64 `[PASS]` lines.
+
+- [ ] **Step 12: Commit the phase**
+
+```bash
+git add bin/lib/zcode-dispatch.mjs bin/zcode-dispatch tests/test-zcode-dispatch.sh tests/fixtures/zcode-stub.cjs \
+  skills/zcode-invocation/SKILL.md skills/dev-orchestrator/SKILL.md README.md README.ru.md PLUGIN_README.md
+git add -f docs/zcode-cli-findings.md
+git commit -m "feat(zcode): Ф4a separate CLI credential store and state dirs, zcode-dispatch login"
+```
+
 ## Ф5: Live acceptance and the 1.5× quota-bonus measurement
 
 **Executor: the user, in a fresh plain Claude Code session** opened at the repo root (no `/dev`, no dev-orchestrator, no Opus or Codex calls) — spec §8.2 requires a session outside the protocol so that no other request falls inside the measurement window. Nothing else may use the Coding Plan between the baseline and the second reading (close agent sessions in the ZCode desktop app).
@@ -4529,12 +5605,21 @@ git commit -m "chore(release): 0.8.0 — GLM-5.3-Flash via ZCode as default impl
 - Modify: `README.ru.md`
 
 **Interfaces:**
-- Consumes: `bin/zcode-dispatch` with the command surface of Contract C1 (verbs `task`, `status`, `result`, `cancel`, `release-stale`, `doctor`, `doctor --probe`; start line `ZCode Task started in the background as zt-NNNN`; exit codes 0/1/2), job records per Contract C2 under the layout of Contract C3, errorClass set `timeout | crash | model-not-selected | auth | quota | launch | malformed`; `docs/zcode-cli-findings.md` with sections `## Go / no-go` (line `VERDICT: GO` | `VERDICT: NO-GO — <reason>`), `## U1 — …` through `## U11 — …`, and `## Inputs for later phases` filled for every key of Contract C7 (`VERDICT`, `MODEL_MECHANISM`, `SELECTION_PATH`, `PERSONAL_CONFIG_BASE`, `PINNED_SELECTION`, `RESUME_KEEPS_MODEL`, `REPORTED_MODEL_FIELD`, `USAGE_INPUT_FIELD`, `USAGE_CACHED_FIELD`, `USAGE_OUTPUT_FIELD`, `USAGE_REASONING_FIELD`, `CACHED_IS_SUBSET_OF_INPUT`, `PROMPT_TRANSPORT`, `MAX_PROMPT_BYTES`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `APP_VERSION_PLIST_KEY`, `DISALLOWED_TOOLS`, `GLM_CONCURRENCY`, `SESSION_SAVED_ON_SIGTERM`, `INTERFERING_PLUGINS`, `PATTERN_MODEL_NOT_SELECTED`, `PATTERN_AUTH`, `PATTERN_QUOTA`, `PATTERN_LAUNCH`); the protocol artifacts of Contract C8 (operations, body / dispatch / sidecar file names, session marker, state-line suffix, `risk_phases`, the `zcode-invocation` "Verified facts" lines including `- Quota bonus (1.5× in ZCode): not measured yet — live acceptance pending.`, gate-stall tokens); the ZCode preamble and channel-switch notice sections in `skills/dev-orchestrator/implementer-prompt.md`; the README paragraphs Ф5 appends to — `README.md` paragraph starting "`max` is reserved for the implementers GLM and Luna" and `README.ru.md` paragraph starting "`max` зарезервирован за имплементерами GLM и Luna".
+- Consumes: `bin/zcode-dispatch` with the command surface of Contract C1 (verbs `task`, `status`, `result`, `cancel`, `release-stale`, `doctor`, `doctor --probe`; start line `ZCode Task started in the background as zt-NNNN`; exit codes 0/1/2), job records per Contract C2 under the layout of Contract C3, errorClass set `timeout | crash | model-not-selected | auth | quota | launch | malformed`; `docs/zcode-cli-findings.md` with sections `## Go / no-go` (line `VERDICT: GO` | `VERDICT: NO-GO — <reason>`), `## U1 — …` through `## U11 — …`, and `## Inputs for later phases` filled for every key of Contract C7 (`VERDICT`, `MODEL_MECHANISM`, `SELECTION_PATH`, `PERSONAL_CONFIG_BASE`, `PINNED_SELECTION`, `RESUME_KEEPS_MODEL`, `REPORTED_MODEL_FIELD`, `USAGE_INPUT_FIELD`, `USAGE_CACHED_FIELD`, `USAGE_OUTPUT_FIELD`, `USAGE_REASONING_FIELD`, `CACHED_IS_SUBSET_OF_INPUT`, `PROMPT_TRANSPORT`, `MAX_PROMPT_BYTES`, `VERIFIED_APP_VERSION`, `VERIFIED_NODE_MAJOR`, `APP_VERSION_PLIST_KEY`, `DISALLOWED_TOOLS`, `GLM_CONCURRENCY`, `SESSION_SAVED_ON_SIGTERM`, `INTERFERING_PLUGINS`, `PATTERN_MODEL_NOT_SELECTED`, `PATTERN_AUTH`, `PATTERN_QUOTA`, `PATTERN_LAUNCH`); the protocol artifacts of Contract C8 (operations, body / dispatch / sidecar file names, session marker, state-line suffix, `risk_phases`, the `zcode-invocation` "Verified facts" lines including `- Quota bonus (1.5× in ZCode): not measured yet — live acceptance pending.`, gate-stall tokens); the ZCode preamble and channel-switch notice sections in `skills/dev-orchestrator/implementer-prompt.md`; the README paragraphs Ф5 appends to — `README.md` paragraph starting "`max` is reserved for the implementers GLM and Luna" and `README.ru.md` paragraph starting "`max` зарезервирован за имплементерами GLM и Luna"; from Ф4a: the verb `login [zai]` of Contract C1 (foreground, the C5 environment, exit code = the CLI's, a re-pin after exit 0), the cli-home environment on every CLI run (task runner, `doctor --probe`, `login`; C3, C5: `ZCODE_DATA_BASE_DIR` = `<ZCODE_STATE_DIR>/cli-home`, mode 0700, plus `ZCODE_STORAGE_DIR` / `ZCODE_SESSION_DB_PATH` / `ZCODE_LOG_DIR` under it; `~/.zcode/cli/config.json` stays the CLI's shared file), the `doctor` check `cli-home`, and the `doctor --probe` stderr hint `run: zcode-dispatch login` on `FAIL(auth)` / `FAIL(model-not-selected)` (C1).
 - Produces: nothing
 
 - [ ] **Step 1: Preconditions and `doctor` (no quota)**
 
-Prerequisite (user, once per machine): the ZCode CLI is logged in with `zcode login zai`. The exact command is in `skills/zcode-invocation/SKILL.md` → "One-time setup", step 2. On this machine Ф1 Step 6a already did it, because the login identity is shared by every CLI run. Repeat it only when Step 3 fails with `model-selected: FAIL(model-not-selected)` or `FAIL(auth)`; then restart Ф5 from Step 1. The wrapper pins the model itself, so there is no model-selection step.
+Prerequisite (user, once per machine, before Step 2's baseline): the ZCode CLI is logged in **in the wrapper's own CLI home**, through the wrapper's login verb (Ф4a; `skills/zcode-invocation/SKILL.md` → "One-time setup", step 2). Ф1 Step 6a's `zcode login zai` does not count: it went to the credential store in `~/.zcode`, which the wrapper's CLI runs no longer use, and the desktop app has since replaced that token (ledger PF-B5). The login opens a browser. The user runs it in a terminal at the repo root; Claude Code's `!` prefix also works when it can host the login:
+
+```bash
+ZDISPATCH="$(pwd)/bin/zcode-dispatch"   # the dev-tree wrapper, as the block below expects
+ZCODE_HTTP_PROXY=http://127.0.0.1:1082 "$ZDISPATCH" login
+```
+
+The `ZCODE_HTTP_PROXY=…` prefix is needed on this machine: the CLI's login failed without it (`docs/zcode-cli-findings.md` header). Drop it on a machine where the CLI reaches Z.ai directly. Expected: the CLI's browser login, then `login: ok — ZCode CLI login stored in <state root>/cli-home; <personal config> re-pinned to GLM-5.3-Flash$max`, exit 0.
+
+Repeat the login only when Step 3 fails with `model-selected: FAIL(model-not-selected)` or `FAIL(auth)` (with the stderr hint `run: zcode-dispatch login`; the CLI login has no refresh token and can expire), then restart Ф5 from Step 1. The wrapper pins the model itself, so there is no model-selection step.
 
 In the fresh session, from the repo root:
 
