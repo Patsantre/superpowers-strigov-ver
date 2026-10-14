@@ -120,10 +120,10 @@ VERDICT: GO
 - Design consequence: `INTERFERING_PLUGINS = none`; no user action needed.
 
 ## U9 — is the 1.5× ZCode quota bonus active
-- Answer: Deferred to the live acceptance (plan Ф5, spec §8.2 step 4).
-- How verified: —
-- Holds for: —
-- Design consequence: none for the protocol; measured in Ф5.
+- Answer: Inconclusive. Three GLM requests (probe, E2E task, one resumed fix round) were expected to cost 30.241 credits at the standard rate; the console measured 10 (9 → 19). The ratio expected/measured is 3.02 at the standard rate, outside both interpretation bands. It is 1.51 if the window was off-peak and billed at 50 %, which would mean "active". The console does not show whether the window (11:48–11:53 UTC+8, Wednesday) was off-peak; only an unverified third-party source puts peak at 14:00–18:00 UTC+8 on weekdays. The console shows integer credits, but the conclusion holds across ±1: off-peak 1.37–1.68, standard 2.75–3.36. So the data fits "active, window off-peak", but the off-peak status was not verified.
+- How verified: live acceptance, this file
+- Holds for: ZCode 3.15.1 (zcode 0.16.9)
+- Design consequence: none for the protocol; measured in Ф5. To settle it, re-measure inside a known peak window, or once Z.ai documents its off-peak hours.
 
 ## U10 — prompt-size limit of `-p`; does `-p -` read stdin
 - Answer: `-p` is a plain string option. Nothing reads stdin for `-p -`, so `-` would be sent as a literal one-character prompt. A 153,492-byte prompt (150 KiB) passed in argv answered `PONG` (exit 0, `inputTokens` 33200). The OS argv check printed `status 0 len 307200`.
@@ -200,3 +200,22 @@ VERDICT: GO
 | PATTERN_AUTH | 401;unauthorized;not logged in;login;token expired;credential;authentication failed | U4 |
 | PATTERN_QUOTA | 429;quota;rate limit;usage limit;insufficient;balance;usage_limit_exceeded;spend_limit_exceeded;coding_plan_required | U4 |
 | PATTERN_LAUNCH | ZCODE_BUILTIN_PROVIDER;provider config;Cannot find module;Cannot find package;Failed to load environment file;ZCode app factory is unavailable;Provider Registry runtime is unavailable | U4 |
+
+## Live acceptance (2026-10-14, ZCode 3.15.1)
+
+| Check | Result |
+|---|---|
+| `doctor` | ok — every check `ok` (app 3.15.1, cli, provider-config, node v26.11.0, app-version 3.15.1, git, state-dir, cli-home, personal-config pins GLM-5.3-Flash$max, kill-switch), `doctor: ok` |
+| `doctor --probe` | `probe: ok`; `reported-model: unreported`; `usage: input=14347 cached=320 output=4` |
+| E2E first round (zt-0001) | `DONE`; report written yes; commits after = 1 yes; node --test pass (1/1) |
+| Fix round (zt-0002) | resume (`--resume-task zt-0001`); `DONE`; same sessionId yes (`sess_bff347a4-…`); `## Fix round 1` appended yes; node --test pass (2/2) |
+| Baseline / second reading | 9 → 19 (measured 10 credits; 5-hour counter 0 → 10; a second reading 3 min later was identical); local time 2026-10-14 10:48–10:54 +0700 (11:48–11:54 UTC+8), Wednesday; peak / off-peak undetermined (the console does not say; an unverified third-party source gives peak = 14:00–18:00 UTC+8 weekdays, which would make this off-peak) |
+| Expected credits | 30.241 (formula of spec §8.2 step 4; halved: undetermined, since off-peak status is unverified; 15.121 if halved) |
+| Ratio expected / measured | 3.02 at the standard rate (inconclusive); 1.51 if off-peak (active) → inconclusive |
+
+Usage objects: probe `usage: input=14347 cached=320 output=4`; zt-0001 `{"source":"provider","modelRequestCount":9,"inputTokens":153107,"outputTokens":2098,"totalTokens":155205,"cacheReadTokens":130304,"cacheWriteTokens":0,"reasoningTokens":0,"webFetchRequests":0,"webSearchRequests":0}`; zt-0002 `{"source":"provider","modelRequestCount":8,"inputTokens":174195,"outputTokens":2704,"totalTokens":176899,"cacheReadTokens":169280,"cacheWriteTokens":0,"reasoningTokens":0,"webFetchRequests":0,"webSearchRequests":0}`.
+
+Notes:
+- The console shows credits as integers, so measured = 10 ± about 1.
+- The console's "Cumulative Tokens" rose only from 174.27K to 188.62K (+14.35K), although the three requests reported 341,649 input tokens, and the probe alone reported 14,347. That statistic does not track every billed token, or counts differently, so it was not used in the calculation.
+- The Step 3 probe first failed twice with `FAIL(auth)` (`project_token_login_failed`): the desktop app had replaced the CLI's token in the shared `~/.zcode` store. Those attempts cost no credits. After Ф4a (the wrapper's own CLI home) and the user's `zcode-dispatch login`, the run above needed no `ZCODE_HTTP_PROXY`.

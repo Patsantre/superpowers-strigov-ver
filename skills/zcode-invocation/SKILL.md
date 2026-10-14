@@ -19,7 +19,7 @@ The plan's terms (docs.z.ai/devpack/usage-policy): the Coding Plan may be used o
 - Model confirmation: not required
 - GLM resume: enabled
 - GLM concurrency: 2
-- Quota bonus (1.5× in ZCode): not measured yet — live acceptance pending.
+- Quota bonus (1.5× in ZCode): inconclusive — measured 2026-10-14 on ZCode 3.15.1; raw numbers in docs/zcode-cli-findings.md "Live acceptance".
 
 dev-orchestrator reads these lines: `Model selection: wrapper` → the wrapper pins GLM-5.3-Flash at `max` in its own personal provider config before every run, and the user's only setup step is the one-time CLI login ("One-time setup"); `Model confirmation: required` → one user confirmation per session, before the first GLM dispatch, that ZCode runs GLM-5.3-Flash with reasoning `max`; `GLM resume: disabled` → every GLM follow-up is a FRESH dispatch (dev-orchestrator Step 3); `GLM concurrency: 1` → at most one GLM track per parallel group.
 
@@ -44,6 +44,8 @@ Same idiom as `$DISPATCH` in `codex-invocation`: `command -v` when the marketpla
    ```
    ! "$ZDISPATCH" login
    ```
+
+   Behind a local proxy, the CLI ignores `HTTP(S)_PROXY` and the macOS system proxy. Prefix the login command with `ZCODE_HTTP_PROXY=http://<host>:<port>`, and also export it for headless runs if those fail with a network error; the wrapper passes it through.
 
    Expected: the CLI's own login output, then `login: ok — ZCode CLI login stored in <cli-home>; <personal config> re-pinned to GLM-5.3-Flash$max`, exit 0; on failure the exit code is the CLI's. The login stores the CLI's identity in the wrapper's own CLI home `~/.claude/plugins/data/superpowers-strigov-ver-zcode/cli-home` (passed to every CLI run as `ZCODE_DATA_BASE_DIR`), never in `~/.zcode`: the desktop app and the CLI write the same credential key with different token kinds and would log each other out (`docs/zcode-cli-findings.md`, "CLI data home"). The wrapper never reads that credential. The login also rewrites the default model in the wrapper's personal provider config; the wrapper re-pins GLM-5.3-Flash at `max` right after it and before every run. A plain `zcode login zai` made before this wrapper version went into `~/.zcode` and does not count — run this one once per machine.
 3. Login missing or expired: the CLI login stores no refresh token, so it can expire on its own. `doctor --probe` then prints `model-selected: FAIL(model-not-selected)` or `FAIL(auth)` and the stderr hint `run: zcode-dispatch login`, and a task fails with the same `errorClass`. Then `glm=down` and Luna max for the rest of the session (dev-orchestrator channel ladder, unchanged). Tell the user to run step 2 again; never run it yourself.

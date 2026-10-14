@@ -1,7 +1,7 @@
 ---
 slug: glm-zcode-implementer
 created: 2026-10-13
-status: in-progress
+status: done
 phases:
   - id: Ф1
     scope: "[Executor: Claude subagent opus/high + one user step] ZCode CLI discovery spike → docs/zcode-cli-findings.md; GO/NO-GO gate"
@@ -25,7 +25,8 @@ phases:
     commits: "4fe367a.."
   - id: Ф5
     scope: "[Executor: the user in a fresh plain Claude Code session] live acceptance §8.2 + 1.5x bonus measurement → findings, skill, READMEs"
-    status: in-progress
+    status: done
+    commits: "338221b.."
 ---
 
 # GLM-5.3-Flash via Z.ai's ZCode CLI as the default implementer — Implementation Plan
