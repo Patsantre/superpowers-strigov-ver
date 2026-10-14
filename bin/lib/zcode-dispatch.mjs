@@ -1,0 +1,1091 @@
+// zcode-dispatch.mjs — background-job wrapper around Z.ai's official ZCode CLI
+// (the Agent CLI embedded in /Applications/ZCode.app), shaped like the vendored
+// Codex companion: task / status / result / cancel / doctor.
+//
+// Pure Node ESM, no dependencies, no shell: every child process is spawned with
+// an argv array. Never reads or writes the user's ~/.zcode (shared with the desktop
+// app): every CLI run gets the cli-home environment — ZCODE_DATA_BASE_DIR=<state root>/cli-home
+// for the CLI's credentials, plus ZCODE_STORAGE_DIR, ZCODE_SESSION_DB_PATH and ZCODE_LOG_DIR
+// under it for its plugins/rollouts, sessions and logs. The CLI's user config
+// ~/.zcode/cli/config.json has no override and stays the CLI's own shared file. Never reads
+// those credentials and never calls the Z.ai API itself — the ZCode CLI is the only channel.
+// The model pin travels in the wrapper's own personal provider config under the state
+// root (ZCODE_PERSONAL_PROVIDER_CONFIG_FILE); the CLI login is the user's
+// `zcode-dispatch login`, which runs the CLI's own `zcode login zai` in that home.
+//
+// Usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor|login> [args...]
+// Exit codes: 0 success · 1 runtime failure · 2 usage error or guard refusal.
+
+import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { parseArgs } from "node:util";
+
+// ---- Values copied from docs/zcode-cli-findings.md "## Inputs for later phases" ----
+export const PINNED_MODEL = "GLM-5.3-Flash$max";
+export const VERIFIED_APP_VERSION = "3.15.1";
+export const VERIFIED_NODE_MAJOR = 26;
+export const PROMPT_TRANSPORT = "argv"; // "argv" | "stdin"
+export const MAX_PROMPT_BYTES = 200 * 1024;
+export const APP_VERSION_PLIST_KEY = "CFBundleShortVersionString";
+export const MODEL_ARGS = []; // MODEL_MECHANISM flag:<--name> → ["<--name>", PINNED_MODEL]
+export const MODEL_ENV = {}; // MODEL_MECHANISM env:<NAME> → { "<NAME>": PINNED_MODEL }
+// MODEL_MECHANISM personal-config: the selection written at SELECTION_PATH of the wrapper-owned
+// personal provider config before every run; PERSONAL_CONFIG_BASE seeds a missing file.
+export const SELECTION_PATH = "config.defaultModelSelection";
+export const PERSONAL_CONFIG_BASE = {"schemaVersion":1,"config":{"providerConfigRules":{"providerRules":[]},"modelConfigRules":{"providerModelRules":[],"manualProviderModelRules":[]}}};
+export const PINNED_SELECTION = {"providerId":"account:zai-individual-coding-plan","modelId":"GLM-5.3-Flash","options":{"reasoningLevel":"max"}};
+export const DISALLOWED_TOOLS = [];
+export const REPORTED_MODEL_PATH = null;
+export const USAGE_FIELDS = {"input":"inputTokens","cached":"cacheReadTokens","output":"outputTokens"};
+export const PATTERNS = {
+  "model-not-selected": ["Select a model before continuing","Model creation failed"],
+  auth: ["401","unauthorized","not logged in","login","token expired","credential","authentication failed"],
+  quota: ["429","quota","rate limit","usage limit","insufficient","balance","usage_limit_exceeded","spend_limit_exceeded","coding_plan_required"],
+  launch: ["ZCODE_BUILTIN_PROVIDER","provider config","Cannot find module","Cannot find package","Failed to load environment file","ZCode app factory is unavailable","Provider Registry runtime is unavailable"],
+};
+// --------------------------------------------------------------------------------------
+
+const PROBE_PROMPT = "Reply with exactly one word: PONG";
+const PROBE_TIMEOUT_MS = 120_000;
+const TIMEOUT_KILL_GRACE_MS = 10_000;
+const CANCEL_GRACE_MS = 5_000;
+const CLOSE_WAIT_MS = 5_000;
+const STARTUP_GRACE_MS = 60_000;
+const DEFAULT_TIMEOUT_MIN = 60;
+const ID_RE = /^zt-\d{4,}$/;
+const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+const SELF = fileURLToPath(import.meta.url);
+
+class UsageError extends Error {}
+
+// ---------- environment and paths ----------
+
+function zcodePaths(env = process.env) {
+  const app = env.ZCODE_APP || "/Applications/ZCode.app";
+  return {
+    app,
+    plist: path.join(app, "Contents", "Info.plist"),
+    bin: env.ZCODE_BIN || path.join(app, "Contents", "Resources", "glm", "zcode.cjs"),
+    providerConfig: path.join(app, "Contents", "Resources", "config", "provider", "zcode-builtin.json"),
+    node: env.ZCODE_NODE || "node",
+  };
+}
+
+function stateRoot(env = process.env) {
+  return env.ZCODE_STATE_DIR || path.join(os.homedir(), ".claude", "plugins", "data", "superpowers-strigov-ver-zcode");
+}
+
+const personalConfigFile = (env = process.env) => path.join(stateRoot(env), "personal-provider-config.json");
+
+// The CLI's own home for its credentials and state, apart from the user's ~/.zcode, whose credential
+// key the desktop app rewrites with a different token kind (docs/zcode-cli-findings.md, "CLI data home").
+// The CLI resolves each location separately, so cliHomeEnv sets one override per resolver that has one;
+// its user config ~/.zcode/cli/config.json has none (only HOME, which the wrapper never overrides).
+// The wrapper creates the directory (mode 0700) and never reads what the CLI keeps there.
+const cliHome = (env = process.env) => path.join(stateRoot(env), "cli-home");
+
+function cliHomeEnv() {
+  const home = cliHome();
+  const storage = path.join(home, ".zcode");
+  return {
+    ZCODE_DATA_BASE_DIR: home, // credentials: <cli-home>/.zcode/v2/credentials.json
+    ZCODE_STORAGE_DIR: storage, // storage root: plugins, rollouts, memories under <cli-home>/.zcode/cli/
+    ZCODE_SESSION_DB_PATH: path.join(storage, "cli", "db", "db.sqlite"), // not derived from the storage root
+    ZCODE_LOG_DIR: path.join(storage, "cli", "log"),
+  };
+}
+
+function ensureCliHome() {
+  const dir = cliHome();
+  fs.mkdirSync(stateRoot(), { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  return dir;
+}
+
+function readAppVersion(plist) {
+  const r = spawnSync("plutil", ["-extract", APP_VERSION_PLIST_KEY, "raw", "-o", "-", plist], { encoding: "utf8" });
+  if (r.error || r.status !== 0) return null;
+  const version = r.stdout.trim();
+  return version.length > 0 ? version : null;
+}
+
+function resolveWorkspace(cwd) {
+  const r = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" });
+  if (r.error || r.status !== 0) return null;
+  const root = r.stdout.trim();
+  if (!root) return null;
+  const slug = `${path.basename(root)}-${createHash("sha1").update(root).digest("hex").slice(0, 8)}`;
+  return { root, jobsDir: path.join(stateRoot(), "state", slug, "jobs") };
+}
+
+function requireWorkspace(cwdOption) {
+  const cwd = path.resolve(cwdOption ?? process.cwd());
+  const ws = resolveWorkspace(cwd);
+  if (!ws) throw new UsageError(`not inside a git work tree: ${cwd}`);
+  return ws;
+}
+
+function readTimeoutMin(env = process.env) {
+  const raw = env.ZCODE_TASK_TIMEOUT_MIN;
+  if (raw === undefined || raw === "") return DEFAULT_TIMEOUT_MIN;
+  const value = Number(raw);
+  if (!/^\d+(\.\d+)?$/.test(raw.trim()) || !(value > 0)) {
+    throw new UsageError(`ZCODE_TASK_TIMEOUT_MIN must be a positive number of minutes, got "${raw}"`);
+  }
+  return value;
+}
+
+// ---------- job records ----------
+
+const jobFile = (jobsDir, id) => path.join(jobsDir, `${id}.json`);
+const logFile = (jobsDir, id) => path.join(jobsDir, `${id}.log`);
+const formatId = (n) => `zt-${String(n).padStart(4, "0")}`;
+const idNumber = (id) => Number(id.slice(3));
+
+// The terminal record is claimed once, in a sibling file created atomically and
+// exclusively (link(2) fails with EEXIST when it already exists): the first
+// finalizer wins, and every reader prefers that file over the main record, so a
+// writer holding a stale `running` copy can never undo a terminal status.
+const terminalFile = (file) => `${file}.terminal`;
+let tmpSeq = 0;
+const tmpFile = (file) => `${file}.tmp-${process.pid}-${++tmpSeq}`;
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+export function readRecord(file) {
+  return readJson(terminalFile(file)) ?? readJson(file);
+}
+
+function writeRecord(file, record) {
+  const tmp = tmpFile(file);
+  fs.writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`);
+  fs.renameSync(tmp, file);
+}
+
+// Terminal statuses are sticky: a completed / failed / cancelled record is never rewritten,
+// also when two finalizers (cancel and the runner) race — exactly one claim succeeds.
+export function finalizeRecord(file, patch) {
+  const current = readRecord(file);
+  if (!current || TERMINAL.has(current.status)) return current;
+  const next = { ...current, ...patch, finishedAt: new Date().toISOString() };
+  const tmp = tmpFile(file);
+  fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`);
+  try {
+    fs.linkSync(tmp, terminalFile(file));
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    return readRecord(file); // another finalizer won: its terminal record stands
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+  writeRecord(file, next); // mirror into the main record (readers already see the claim)
+  return next;
+}
+
+// Returns null when the job is (or meanwhile became) terminal: a terminal claim that
+// landed after our read wins even if our stale rename replaced the main record.
+function updateRunning(file, patch) {
+  const current = readRecord(file);
+  if (!current || current.status !== "running") return null;
+  const next = { ...current, ...patch };
+  writeRecord(file, next);
+  return fs.existsSync(terminalFile(file)) ? null : next;
+}
+
+// The wrapper-owned personal provider config (ZCODE_PERSONAL_PROVIDER_CONFIG_FILE). Before every CLI
+// run the default selection at SELECTION_PATH is set to PINNED_SELECTION; everything else in the file
+// (e.g. what the user's one-time `zcode login zai` wrote there) is kept, and a missing or unreadable
+// file starts from PERSONAL_CONFIG_BASE. It lives under the state root, never under ~/.zcode, and
+// holds no credentials.
+export function pinPersonalConfig(file) {
+  const current = readJson(file);
+  const config = current && typeof current === "object" && !Array.isArray(current) ? current : structuredClone(PERSONAL_CONFIG_BASE);
+  const keys = SELECTION_PATH.split(".");
+  let node = config;
+  for (const key of keys.slice(0, -1)) {
+    if (!node[key] || typeof node[key] !== "object" || Array.isArray(node[key])) node[key] = {};
+    node = node[key];
+  }
+  node[keys.at(-1)] = structuredClone(PINNED_SELECTION);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  writeRecord(file, config); // atomic rename
+  return config;
+}
+
+function listRecords(jobsDir) {
+  let names = [];
+  try {
+    names = fs.readdirSync(jobsDir);
+  } catch {
+    return [];
+  }
+  return names
+    .filter((name) => /^zt-\d+\.json$/.test(name))
+    .map((name) => readRecord(path.join(jobsDir, name)))
+    .filter(Boolean)
+    .sort((a, b) => idNumber(b.id) - idNumber(a.id));
+}
+
+function nextJobId(jobsDir) {
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const used = fs
+    .readdirSync(jobsDir)
+    .map((name) => /^zt-(\d+)\.json$/.exec(name))
+    .filter(Boolean)
+    .map((match) => Number(match[1]));
+  let n = 1 + Math.max(0, ...used);
+  return formatId(n);
+}
+
+function allocateRecord(jobsDir, id, fields) {
+  fs.writeFileSync(jobFile(jobsDir, id), `${JSON.stringify({ id, ...fields }, null, 2)}\n`, { flag: "wx" });
+  return id;
+}
+
+function requireJob(jobsDir, ref) {
+  if (!ID_RE.test(ref)) throw new UsageError(`${ref} is not a zcode-dispatch job id (zt-NNNN); Codex task- ids belong to codex-dispatch`);
+  const record = readRecord(jobFile(jobsDir, ref));
+  if (!record) throw new UsageError(`unknown job ${ref} in this workspace (pass the same --cwd as the original task)`);
+  return record;
+}
+
+function appendLog(file, line) {
+  try {
+    fs.appendFileSync(file, `[zcode-dispatch] ${new Date().toISOString()} ${line}\n`);
+  } catch {
+    // the log is best effort
+  }
+}
+
+function tailLines(file, n) {
+  try {
+    const lines = fs.readFileSync(file, "utf8").split("\n");
+    if (lines.at(-1) === "") lines.pop();
+    return lines.slice(-n).map((line) => `${line}\n`).join("");
+  } catch {
+    return "";
+  }
+}
+
+// ---------- processes ----------
+
+function isAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function groupAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function killGroup(pid, signal) {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    // group already gone
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const reservationBase = (jobsDir) => path.join(path.dirname(jobsDir), "active.lock");
+const reservationFile = (jobsDir, generation) => `${reservationBase(jobsDir)}.${generation}`;
+
+function reservationGenerations(jobsDir) {
+  const directory = path.dirname(reservationBase(jobsDir));
+  const prefix = `${path.basename(reservationBase(jobsDir))}.`;
+  let names;
+  try {
+    names = fs.readdirSync(directory);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  return names.flatMap((name) => {
+    if (!name.startsWith(prefix)) return [];
+    const value = name.slice(prefix.length);
+    if (!/^(0|[1-9]\d*)$/.test(value)) return [];
+    const generation = Number(value);
+    if (!Number.isSafeInteger(generation)) throw new Error(`invalid workspace reservation generation: ${value}`);
+    return [generation];
+  }).sort((a, b) => a - b);
+}
+
+function currentReservation(jobsDir) {
+  const generations = reservationGenerations(jobsDir);
+  if (generations.length === 0) return null;
+  const generation = generations[generations.length - 1];
+  const file = reservationFile(jobsDir, generation);
+  return { file, generation, record: readJson(file) };
+}
+
+function reservationFileForToken(jobsDir, token) {
+  const generations = reservationGenerations(jobsDir);
+  for (let index = generations.length - 1; index >= 0; index -= 1) {
+    const file = reservationFile(jobsDir, generations[index]);
+    if (readJson(file)?.token === token) return file;
+  }
+  return null;
+}
+
+function reservationGuard(record) {
+  const id = typeof record?.jobId === "string" ? `job ${record.jobId}` : "a job";
+  throw new UsageError(`${id} is still running in this workspace; one write task per working tree`);
+}
+
+function refuseUnavailableReservation(jobsDir, workspaceRoot) {
+  const current = currentReservation(jobsDir);
+  if (!current) return;
+  const { file, generation, record } = current;
+  if (!record || !Number.isInteger(record.holderPid) || record.holderPid <= 0 || typeof record.token !== "string") {
+    reservationGuard(record);
+  }
+  if (readJson(`${file}.released`)?.token === record.token) return;
+  if (isAlive(record.holderPid)) reservationGuard(record);
+  throw new UsageError(
+    `workspace reservation generation ${generation} is stale (runner pid ${record.holderPid} is not alive); run zcode-dispatch release-stale --cwd ${JSON.stringify(workspaceRoot)}`,
+  );
+}
+
+function createReservation(file, reservation) {
+  const temp = `${file}.tmp-${process.pid}-${randomUUID()}`;
+  fs.writeFileSync(temp, `${JSON.stringify(reservation)}\n`, { flag: "wx", mode: 0o600 });
+  try {
+    fs.linkSync(temp, file);
+    return true;
+  } catch (error) {
+    if (error.code === "EEXIST") return false;
+    throw error;
+  } finally {
+    fs.rmSync(temp, { force: true });
+  }
+}
+
+function updateReservation(file, token, holderPid) {
+  let fd;
+  try {
+    fd = fs.openSync(file, "r+");
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+  try {
+    let current;
+    try {
+      current = JSON.parse(fs.readFileSync(fd, "utf8"));
+    } catch {
+      return false;
+    }
+    if (current.token !== token) return false;
+    const contents = Buffer.from(`${JSON.stringify({ ...current, holderPid })}\n`);
+    fs.ftruncateSync(fd, 0);
+    fs.writeSync(fd, contents, 0, contents.length, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+  const updated = readJson(file);
+  return updated?.token === token && updated.holderPid === holderPid;
+}
+
+function releaseReservation(file, token) {
+  const current = readJson(file);
+  if (current?.token !== token || current.holderPid !== process.pid) return false;
+  return createReservation(`${file}.released`, { holderPid: process.pid, token });
+}
+
+function acquireReservation(jobsDir, jobId, workspaceRoot) {
+  fs.mkdirSync(path.dirname(reservationBase(jobsDir)), { recursive: true });
+  for (;;) {
+    const current = currentReservation(jobsDir);
+    const generation = current ? current.generation + 1 : 0;
+    if (current) refuseUnavailableReservation(jobsDir, workspaceRoot);
+
+    const file = reservationFile(jobsDir, generation);
+    const reservation = { holderPid: process.pid, jobId, token: randomUUID(), generation };
+    if (createReservation(file, reservation)) return { file, token: reservation.token };
+    // Another task created this generation. Re-read the highest generation before deciding.
+  }
+}
+
+function cmdReleaseStale(args) {
+  const { values } = parse(args, { cwd: { type: "string" } }, 0);
+  const ws = requireWorkspace(values.cwd);
+  const current = currentReservation(ws.jobsDir);
+  if (!current) throw new UsageError("no workspace reservation to release");
+
+  const { file, generation, record } = current;
+  if (!record || !Number.isInteger(record.holderPid) || record.holderPid <= 0 || typeof record.token !== "string") {
+    throw new UsageError(`workspace reservation generation ${generation} has no valid holder`);
+  }
+  if (readJson(`${file}.released`)?.token === record.token) {
+    throw new UsageError(`workspace reservation generation ${generation} is already released`);
+  }
+  if (isAlive(record.holderPid)) {
+    throw new UsageError(`workspace reservation generation ${generation} is held by live runner pid ${record.holderPid}`);
+  }
+
+  const job = ID_RE.test(record.jobId ?? "") ? readRecord(jobFile(ws.jobsDir, record.jobId)) : null;
+  if (job?.childPid && groupAlive(job.childPid)) {
+    throw new UsageError(`workspace reservation generation ${generation} still has live CLI process group ${job.childPid}`);
+  }
+
+  const latest = currentReservation(ws.jobsDir);
+  if (latest?.generation !== generation || latest.record?.token !== record.token || latest.record?.holderPid !== record.holderPid) {
+    throw new UsageError("workspace reservation changed while checking; retry release-stale");
+  }
+  if (readJson(`${latest.file}.released`)?.token === record.token) {
+    throw new UsageError(`workspace reservation generation ${generation} is already released`);
+  }
+
+  if (job && !TERMINAL.has(job.status)) {
+    finalizeRecord(jobFile(ws.jobsDir, record.jobId), {
+      status: "failed",
+      errorClass: "crash",
+      note: "stale reservation released",
+    });
+  }
+  if (!createReservation(`${file}.released`, { holderPid: process.pid, token: record.token })) {
+    throw new UsageError(`workspace reservation generation ${generation} is already released`);
+  }
+  process.stdout.write(`released ${ws.root} generation ${generation}\n`);
+  return 0;
+}
+
+async function claimRunnerReservation(file, jobId, token) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const current = readJson(file);
+    if (current?.token !== token || current.jobId !== jobId) return false;
+    if (current.holderPid === process.pid) return true;
+    if (!isAlive(current.holderPid)) return false;
+    await sleep(10);
+  }
+  return false;
+}
+
+// Liveness check: no record is ever left `running` with a dead runner.
+function reapDeadRunners(jobsDir) {
+  for (const record of listRecords(jobsDir)) {
+    if (record.status !== "running") continue;
+    const file = jobFile(jobsDir, record.id);
+    if (record.runnerPid == null) {
+      if (Date.now() - Date.parse(record.startedAt) > STARTUP_GRACE_MS) {
+        finalizeRecord(file, { status: "failed", errorClass: "crash", note: "runner never started" });
+      }
+      continue;
+    }
+    if (isAlive(record.runnerPid)) continue;
+    killGroup(record.childPid, "SIGKILL");
+    const after = finalizeRecord(file, { status: "failed", errorClass: "crash", note: "runner died" });
+    if (after?.note === "runner died") appendLog(logFile(jobsDir, record.id), "runner died; liveness check marked the job failed/crash");
+  }
+}
+
+// ---------- the ZCode CLI invocation ----------
+
+export function buildCliArgv({ bin, prompt, workspaceRoot, sessionId }) {
+  const argv = [
+    bin,
+    "-p",
+    PROMPT_TRANSPORT === "stdin" ? "-" : prompt,
+    "--output-format",
+    "json",
+    "--mode",
+    "yolo",
+    "--surface",
+    "terminal",
+    "--workflow-mode",
+    "disabled",
+    "--cwd",
+    workspaceRoot,
+    ...MODEL_ARGS,
+  ];
+  if (DISALLOWED_TOOLS.length > 0) argv.push("--disallowedTools", DISALLOWED_TOOLS.join(","));
+  if (sessionId) argv.push("--resume", sessionId);
+  return argv;
+}
+
+function buildCliEnv(paths, appVersion) {
+  const env = {
+    ...process.env,
+    ...MODEL_ENV,
+    ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: paths.providerConfig,
+    ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE: paths.providerConfig,
+    ZCODE_APP_VERSION: appVersion,
+    ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: personalConfigFile(),
+    ...cliHomeEnv(),
+  };
+  // The CLI also reads ZCODE_SESSION_DB as an alias of ZCODE_SESSION_DB_PATH; an inherited one could win.
+  delete env.ZCODE_SESSION_DB;
+  return env;
+}
+
+function summarizeArgv(argv) {
+  return argv
+    .map((arg, i) => (i > 0 && argv[i - 1] === "-p" && arg !== "-" ? `<prompt ${Buffer.byteLength(arg)} bytes>` : JSON.stringify(arg)))
+    .join(" ");
+}
+
+// Runs the CLI as its own process group; resolves once it has exited and its output is drained.
+function runCli({ node, argv, cwd, env, stdinText, timeoutMs, logPath, onSpawn }) {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let spawnError = null;
+    let exitCode = null;
+    let signal = null;
+    let settled = false;
+    let timer = null;
+    let killTimer = null;
+    let closeTimer = null;
+    let child = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      clearTimeout(closeTimer);
+      if (timedOut && child?.pid) killGroup(child.pid, "SIGKILL");
+      resolve({ timedOut, spawnError, exitCode, signal, stdout, stderrTail: stderr.split("\n").slice(-200).join("\n") });
+    };
+    try {
+      child = spawn(node, argv, { cwd, env, detached: true, stdio: [stdinText === null ? "ignore" : "pipe", "pipe", "pipe"] });
+    } catch (error) {
+      spawnError = error;
+      finish();
+      return;
+    }
+    child.on("error", (error) => {
+      spawnError = error;
+      finish();
+    });
+    if (child.pid) onSpawn?.(child.pid);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      stderr = (stderr + text).slice(-262144);
+      if (logPath) {
+        try {
+          fs.appendFileSync(logPath, text);
+        } catch {
+          // the log is best effort
+        }
+      }
+    });
+    if (stdinText !== null) {
+      child.stdin.on("error", () => {});
+      child.stdin.end(stdinText);
+    }
+    timer = setTimeout(() => {
+      timedOut = true;
+      if (logPath) appendLog(logPath, `timeout after ${timeoutMs} ms: SIGTERM to process group ${child.pid}`);
+      killGroup(child.pid, "SIGTERM");
+      killTimer = setTimeout(() => killGroup(child.pid, "SIGKILL"), TIMEOUT_KILL_GRACE_MS);
+    }, timeoutMs);
+    child.on("exit", (code, sig) => {
+      exitCode = code;
+      signal = sig;
+      closeTimer = setTimeout(finish, CLOSE_WAIT_MS);
+    });
+    child.on("close", (code, sig) => {
+      if (exitCode === null && signal === null) {
+        exitCode = code;
+        signal = sig;
+      }
+      finish();
+    });
+  });
+}
+
+export function parseCliOutput(stdout) {
+  try {
+    const value = JSON.parse(stdout.trim());
+    if (value && typeof value === "object" && !Array.isArray(value) && typeof value.response === "string") return value;
+  } catch {
+    // not JSON
+  }
+  return null;
+}
+
+// First match wins: timeout, launch (spawn error), then the pattern lists, then crash.
+// ZCode ends every error with " (traceId: <uuid>)" (findings U4); strip it before matching,
+// because a uuid can contain digit runs such as 401 or 429.
+export function classifyFailure({ timedOut, spawnError, stdout, stderrTail }) {
+  if (timedOut) return "timeout";
+  if (spawnError) return "launch";
+  const haystack = `${stderrTail}\n${stdout}`.replace(/\s*\(traceId:[^)]*\)/gi, "").toLowerCase();
+  for (const errorClass of ["model-not-selected", "auth", "quota", "launch"]) {
+    if (PATTERNS[errorClass].some((pattern) => haystack.includes(pattern.toLowerCase()))) return errorClass;
+  }
+  return "crash";
+}
+
+function evaluate(result) {
+  if (!result.timedOut && !result.spawnError && result.exitCode === 0) {
+    const json = parseCliOutput(result.stdout);
+    return json ? { status: "completed", errorClass: null, json } : { status: "failed", errorClass: "malformed", json: null };
+  }
+  return { status: "failed", errorClass: classifyFailure(result), json: null };
+}
+
+const pick = (object, dotPath) => dotPath.split(".").reduce((acc, key) => (acc == null ? undefined : acc[key]), object);
+
+function reportedModelOf(json) {
+  if (!REPORTED_MODEL_PATH) return null;
+  const value = pick(json, REPORTED_MODEL_PATH);
+  return typeof value === "string" ? value : null;
+}
+
+function reportedMatchesPin(reported) {
+  const [pinnedId, pinnedLevel] = PINNED_MODEL.split("$");
+  const [id, level] = reported.slice(reported.lastIndexOf("/") + 1).split("$");
+  return id === pinnedId && (level === undefined || level === pinnedLevel);
+}
+
+// ---------- verbs ----------
+
+function parse(args, options, maxPositionals, minPositionals = 0) {
+  let parsed;
+  try {
+    parsed = parseArgs({ args, options, allowPositionals: true, strict: true });
+  } catch (error) {
+    throw new UsageError(error.message);
+  }
+  const count = parsed.positionals.length;
+  if (count > maxPositionals || count < minPositionals) throw new UsageError(`unexpected arguments: ${args.join(" ")}`);
+  return parsed;
+}
+
+function checkPromptFile(value) {
+  if (!value) throw new UsageError("task requires --prompt-file <file>");
+  const file = path.resolve(value);
+  let text;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    throw new UsageError(`prompt file not found or unreadable: ${file}`);
+  }
+  if (text.trim().length === 0) throw new UsageError(`prompt file is empty: ${file}`);
+  const bytes = Buffer.byteLength(text);
+  if (PROMPT_TRANSPORT === "argv" && bytes > MAX_PROMPT_BYTES) {
+    throw new UsageError(`prompt file is ${bytes} bytes, above MAX_PROMPT_BYTES=${MAX_PROMPT_BYTES} for the argv transport`);
+  }
+  return file;
+}
+
+function resolveResume(jobsDir, ref) {
+  if (!ID_RE.test(ref)) throw new UsageError(`${ref} is not a zcode-dispatch job id (zt-NNNN); Codex task- ids belong to codex-dispatch`);
+  const record = readRecord(jobFile(jobsDir, ref));
+  if (!record) throw new UsageError(`unknown job ${ref} in this workspace (pass the same --cwd as the original task)`);
+  if (record.status === "running") throw new UsageError(`job ${ref} is still running; wait for it to finish`);
+  if (record.status !== "completed" || !record.sessionId) throw new UsageError(`job ${ref} is ${record.status} / has no session; dispatch --fresh`);
+  return { resumeOf: ref, sessionId: record.sessionId };
+}
+
+async function cmdTask(args) {
+  const { values } = parse(
+    args,
+    {
+      background: { type: "boolean" },
+      cwd: { type: "string" },
+      "resume-task": { type: "string" },
+      fresh: { type: "boolean" },
+      "prompt-file": { type: "string" },
+    },
+    0,
+  );
+  if (!values.background) throw new UsageError("task requires --background (there is no foreground mode)");
+  if (values["resume-task"] !== undefined && values.fresh) throw new UsageError("--resume-task and --fresh are mutually exclusive");
+  if (process.env.SP_IMPLEMENTER === "luna") throw new UsageError("SP_IMPLEMENTER=luna is set: the GLM channel is switched off (kill switch)");
+  const ws = requireWorkspace(values.cwd);
+  refuseUnavailableReservation(ws.jobsDir, ws.root);
+  const promptFile = checkPromptFile(values["prompt-file"]);
+  const paths = zcodePaths();
+  const appVersion = readAppVersion(paths.plist);
+  if (!appVersion) throw new UsageError(`cannot read ${APP_VERSION_PLIST_KEY} from ${paths.plist}; refusing to run with an unknown client version`);
+  if (!fs.existsSync(paths.bin)) throw new UsageError(`ZCode CLI not found: ${paths.bin}`);
+  if (!fs.existsSync(paths.providerConfig)) throw new UsageError(`ZCode provider config not found: ${paths.providerConfig}`);
+  const resume = values["resume-task"] !== undefined ? resolveResume(ws.jobsDir, values["resume-task"]) : { resumeOf: null, sessionId: null };
+  const timeoutMin = readTimeoutMin();
+  const id = nextJobId(ws.jobsDir);
+  const reservation = acquireReservation(ws.jobsDir, id, ws.root);
+  let handedOff = false;
+  try {
+    reapDeadRunners(ws.jobsDir);
+    const running = listRecords(ws.jobsDir).find((record) => record.status === "running");
+    if (running) throw new UsageError(`job ${running.id} is still running in this workspace; one write task per working tree`);
+    allocateRecord(ws.jobsDir, id, {
+      status: "running",
+      errorClass: null,
+      sessionId: resume.sessionId,
+      resumeOf: resume.resumeOf,
+      workspaceRoot: ws.root,
+      promptFile,
+      model: PINNED_MODEL,
+      reportedModel: null,
+      appVersion,
+      runnerPid: null,
+      childPid: null,
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      exitCode: null,
+      signal: null,
+      timeoutMin,
+      response: null,
+      usage: null,
+      note: null,
+    });
+    const logFd = fs.openSync(logFile(ws.jobsDir, id), "a");
+    let runner;
+    try {
+      runner = spawn(process.execPath, [SELF, "__run", id, ws.jobsDir, reservation.token], {
+        cwd: ws.root,
+        detached: true,
+        stdio: ["ignore", logFd, logFd],
+        env: process.env,
+      });
+    } finally {
+      fs.closeSync(logFd);
+    }
+    if (!runner.pid) {
+      finalizeRecord(jobFile(ws.jobsDir, id), { status: "failed", errorClass: "launch", note: "runner failed to start" });
+      throw new Error(`failed to start the runner for ${id}`);
+    }
+    if (!updateReservation(reservation.file, reservation.token, runner.pid)) {
+      finalizeRecord(jobFile(ws.jobsDir, id), { status: "failed", errorClass: "launch", note: "workspace reservation was lost before the runner started" });
+      throw new Error(`workspace reservation was lost before the runner started for ${id}`);
+    }
+    runner.unref();
+    handedOff = true;
+    process.stdout.write(`ZCode Task started in the background as ${id}\n`);
+    return 0;
+  } finally {
+    if (!handedOff) releaseReservation(reservation.file, reservation.token);
+  }
+}
+
+async function runJob(id, jobsDir, token) {
+  if (!ID_RE.test(id ?? "") || !jobsDir || !token) throw new UsageError("usage: zcode-dispatch __run <zt-id> <jobs-dir> <reservation-token> (internal)");
+  const file = jobFile(jobsDir, id);
+  const log = logFile(jobsDir, id);
+  const lock = reservationFileForToken(jobsDir, token);
+  try {
+    const record = updateRunning(file, { runnerPid: process.pid });
+    if (!record) return 0; // cancelled (or otherwise terminal) before the runner started
+    if (!lock || !(await claimRunnerReservation(lock, id, token))) {
+      finalizeRecord(file, { status: "failed", errorClass: "launch", note: "workspace reservation was lost before the runner started" });
+      return 1;
+    }
+    let prompt;
+    try {
+      prompt = fs.readFileSync(record.promptFile, "utf8");
+    } catch (error) {
+      finalizeRecord(file, { status: "failed", errorClass: "launch", note: `cannot read prompt file: ${error.message}` });
+      return 1;
+    }
+    try {
+      pinPersonalConfig(personalConfigFile());
+    } catch (error) {
+      finalizeRecord(file, { status: "failed", errorClass: "launch", note: `cannot write the personal provider config: ${error.message}` });
+      return 1;
+    }
+    try {
+      ensureCliHome();
+    } catch (error) {
+      finalizeRecord(file, { status: "failed", errorClass: "launch", note: `cannot create the CLI home: ${error.message}` });
+      return 1;
+    }
+    const paths = zcodePaths();
+    const argv = buildCliArgv({ bin: paths.bin, prompt, workspaceRoot: record.workspaceRoot, sessionId: record.resumeOf ? record.sessionId : null });
+    appendLog(log, `start ${id}: ${JSON.stringify(paths.node)} ${summarizeArgv(argv)}`);
+    const result = await runCli({
+      node: paths.node,
+      argv,
+      cwd: record.workspaceRoot,
+      env: buildCliEnv(paths, record.appVersion),
+      stdinText: PROMPT_TRANSPORT === "stdin" ? prompt : null,
+      timeoutMs: record.timeoutMin * 60_000,
+      logPath: log,
+      onSpawn: (pid) => {
+        if (!updateRunning(file, { childPid: pid })) killGroup(pid, "SIGTERM"); // cancelled meanwhile
+      },
+    });
+    const verdict = evaluate(result);
+    const patch = { status: verdict.status, errorClass: verdict.errorClass, exitCode: result.exitCode, signal: result.signal };
+    if (verdict.json) {
+      patch.response = verdict.json.response;
+      patch.usage = verdict.json.usage && typeof verdict.json.usage === "object" ? verdict.json.usage : null;
+      patch.reportedModel = reportedModelOf(verdict.json);
+      if (typeof verdict.json.sessionId === "string") patch.sessionId = verdict.json.sessionId;
+    } else {
+      const reason = result.spawnError ? `spawn error ${result.spawnError.code ?? result.spawnError.message}` : `exit=${result.exitCode} signal=${result.signal} timedOut=${result.timedOut}`;
+      appendLog(log, `classified failed/${verdict.errorClass} (${reason})`);
+      if (result.stdout.trim()) appendLog(log, `raw stdout:\n${result.stdout}`);
+    }
+    const final = finalizeRecord(file, patch);
+    appendLog(log, `finish ${id}: ${final?.status}${final?.errorClass ? `/${final.errorClass}` : ""}`);
+    return 0;
+  } finally {
+    if (lock) releaseReservation(lock, token);
+  }
+}
+
+function statusLine(record) {
+  const end = record.finishedAt ? Date.parse(record.finishedAt) : Date.now();
+  const secs = Math.max(0, Math.round((end - Date.parse(record.startedAt)) / 1000));
+  const state = record.status === "failed" ? `failed/${record.errorClass}` : record.status;
+  const elapsed = `${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, "0")}s`;
+  return [record.id, state, elapsed, record.model, record.sessionId ?? "-", ...(record.resumeOf ? [`resumeOf=${record.resumeOf}`] : [])].join(" ");
+}
+
+function cmdStatus(args) {
+  const { values, positionals } = parse(args, { cwd: { type: "string" }, all: { type: "boolean" }, json: { type: "boolean" } }, 1);
+  const ws = requireWorkspace(values.cwd);
+  reapDeadRunners(ws.jobsDir);
+  if (positionals.length === 1) {
+    const record = requireJob(ws.jobsDir, positionals[0]);
+    process.stdout.write(values.json ? `${JSON.stringify({ job: record }, null, 2)}\n` : `${statusLine(record)}\n`);
+    return 0;
+  }
+  const records = listRecords(ws.jobsDir);
+  const running = records.filter((record) => record.status === "running");
+  const terminal = records.filter((record) => record.status !== "running");
+  const recent = values.all ? terminal : terminal.slice(0, 10);
+  if (values.json) {
+    process.stdout.write(`${JSON.stringify({ workspaceRoot: ws.root, running, recent }, null, 2)}\n`);
+  } else {
+    for (const record of [...running, ...recent]) process.stdout.write(`${statusLine(record)}\n`);
+  }
+  return 0;
+}
+
+function cmdResult(args) {
+  const { values, positionals } = parse(args, { cwd: { type: "string" } }, 1, 1);
+  const ws = requireWorkspace(values.cwd);
+  reapDeadRunners(ws.jobsDir);
+  const record = requireJob(ws.jobsDir, positionals[0]);
+  if (record.status === "completed") {
+    const text = record.response ?? "";
+    process.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
+    return 0;
+  }
+  process.stderr.write(`job ${record.id} is ${record.status} errorClass=${record.errorClass}\n${tailLines(logFile(ws.jobsDir, record.id), 20)}`);
+  return 1;
+}
+
+async function cmdCancel(args) {
+  const { values, positionals } = parse(args, { cwd: { type: "string" } }, 1, 1);
+  const ws = requireWorkspace(values.cwd);
+  reapDeadRunners(ws.jobsDir);
+  const record = requireJob(ws.jobsDir, positionals[0]);
+  const file = jobFile(ws.jobsDir, record.id);
+  // The cancelled record is written first, so a runner finishing meanwhile cannot overwrite it.
+  const after = record.status === "running" ? finalizeRecord(file, { status: "cancelled", errorClass: null, note: "cancelled by zcode-dispatch cancel" }) : record;
+  if (after.status !== "cancelled" || record.status !== "running") {
+    process.stdout.write(`${record.id} is ${after.status}\n`);
+    return 0;
+  }
+  appendLog(logFile(ws.jobsDir, record.id), "cancel: record set to cancelled; SIGTERM to the CLI process group");
+  killGroup(after.childPid, "SIGTERM");
+  const deadline = Date.now() + CANCEL_GRACE_MS;
+  while (groupAlive(after.childPid) && Date.now() < deadline) await sleep(200);
+  if (groupAlive(after.childPid)) killGroup(after.childPid, "SIGKILL");
+  process.stdout.write(`cancelled ${record.id}\n`);
+  return 0;
+}
+
+async function cmdDoctor(args) {
+  const { values } = parse(args, { cwd: { type: "string" }, probe: { type: "boolean" } }, 0);
+  const cwd = path.resolve(values.cwd ?? process.cwd());
+  const paths = zcodePaths();
+  const lines = [];
+  let failed = false;
+  const report = (level, check, detail) => {
+    lines.push(`${level} ${check}: ${detail}`);
+    if (level === "FAIL") failed = true;
+  };
+
+  const appVersion = readAppVersion(paths.plist);
+  if (appVersion) report("ok", "app", `${paths.app} ${appVersion}`);
+  else report("FAIL", "app", `cannot read ${APP_VERSION_PLIST_KEY} from ${paths.plist}`);
+  if (fs.existsSync(paths.bin)) report("ok", "cli", paths.bin);
+  else report("FAIL", "cli", `not found: ${paths.bin}`);
+  if (fs.existsSync(paths.providerConfig)) report("ok", "provider-config", paths.providerConfig);
+  else report("FAIL", "provider-config", `not found: ${paths.providerConfig}`);
+  const nodeRun = spawnSync(paths.node, ["--version"], { encoding: "utf8" });
+  if (nodeRun.error || nodeRun.status !== 0) {
+    report("FAIL", "node", `cannot run ${paths.node} --version`);
+  } else {
+    const version = nodeRun.stdout.trim();
+    const major = Number(/^v(\d+)/.exec(version)?.[1] ?? 0);
+    if (major >= VERIFIED_NODE_MAJOR) report("ok", "node", version);
+    else report("WARN", "node", `${version} is below the verified major ${VERIFIED_NODE_MAJOR}`);
+  }
+  if (!appVersion) report("WARN", "app-version", "unknown (app check failed)");
+  else if (appVersion !== VERIFIED_APP_VERSION) report("WARN", "app-version", `installed ${appVersion} differs from verified ${VERIFIED_APP_VERSION}; re-run the live acceptance`);
+  else report("ok", "app-version", appVersion);
+  const ws = resolveWorkspace(cwd);
+  if (ws) report("ok", "git", ws.root);
+  else report("FAIL", "git", `not inside a git work tree: ${cwd}`);
+  try {
+    fs.mkdirSync(stateRoot(), { recursive: true });
+    fs.accessSync(stateRoot(), fs.constants.W_OK);
+    report("ok", "state-dir", stateRoot());
+  } catch (error) {
+    report("FAIL", "state-dir", `${stateRoot()} is not writable: ${error.message}`);
+  }
+  try {
+    report("ok", "cli-home", ensureCliHome());
+  } catch (error) {
+    report("FAIL", "cli-home", `cannot create ${cliHome()}: ${error.message}`);
+  }
+  try {
+    pinPersonalConfig(personalConfigFile());
+    const selection = pick(readJson(personalConfigFile()) ?? {}, SELECTION_PATH);
+    if (JSON.stringify(selection) === JSON.stringify(PINNED_SELECTION)) report("ok", "personal-config", `${personalConfigFile()} pins ${PINNED_MODEL}`);
+    else report("FAIL", "personal-config", `${personalConfigFile()}: ${SELECTION_PATH} does not hold PINNED_SELECTION after pinning`);
+  } catch (error) {
+    report("FAIL", "personal-config", `cannot write ${personalConfigFile()}: ${error.message}`);
+  }
+  if (process.env.SP_IMPLEMENTER === "luna") report("WARN", "kill-switch", "SP_IMPLEMENTER=luna is set; task will refuse");
+  else report("ok", "kill-switch", "SP_IMPLEMENTER is not luna");
+
+  process.stdout.write(`${lines.join("\n")}\ndoctor: ${failed ? "FAIL" : "ok"}\n`);
+  if (failed) return 1;
+  if (!values.probe) return 0;
+  return await runProbe(paths, appVersion, ws.root);
+}
+
+// One synchronous PONG request: the only diagnostic that spends quota.
+async function runProbe(paths, appVersion, root) {
+  pinPersonalConfig(personalConfigFile());
+  ensureCliHome();
+  const argv = buildCliArgv({ bin: paths.bin, prompt: PROBE_PROMPT, workspaceRoot: root, sessionId: null });
+  const result = await runCli({
+    node: paths.node,
+    argv,
+    cwd: root,
+    env: buildCliEnv(paths, appVersion),
+    stdinText: PROMPT_TRANSPORT === "stdin" ? PROBE_PROMPT : null,
+    timeoutMs: PROBE_TIMEOUT_MS,
+    logPath: null,
+  });
+  const verdict = evaluate(result);
+  const json = verdict.json;
+  const modelSelected = verdict.status === "completed";
+  const answers = modelSelected && json.response.includes("PONG");
+  const reported = json ? reportedModelOf(json) : null;
+  const modelMatches = reported === null || reportedMatchesPin(reported);
+  const usage = json?.usage ?? {};
+  const count = (field) => {
+    const value = field ? pick(usage, field) : undefined;
+    return typeof value === "number" ? String(value) : "-";
+  };
+  const ok = modelSelected && answers && modelMatches;
+  process.stdout.write(
+    [
+      `model-selected: ${modelSelected ? "ok" : `FAIL(${verdict.errorClass})`}`,
+      `answers: ${answers ? "ok" : "FAIL"}`,
+      `reported-model: ${reported ?? "unreported"}`,
+      `usage: input=${count(USAGE_FIELDS.input)} cached=${count(USAGE_FIELDS.cached)} output=${count(USAGE_FIELDS.output)}`,
+      `probe: ${ok ? "ok" : "FAIL"}`,
+    ].join("\n") + "\n",
+  );
+  if (!modelSelected && result.stderrTail.trim()) process.stderr.write(`${result.stderrTail.split("\n").slice(-20).join("\n")}\n`);
+  if (verdict.errorClass === "auth" || verdict.errorClass === "model-not-selected") {
+    process.stderr.write(
+      `hint: the ZCode CLI is not logged in (or its login expired) in ${cliHome()}; run: zcode-dispatch login (prefix ZCODE_HTTP_PROXY=<proxy url> if the CLI needs a proxy on this machine)\n`,
+    );
+  }
+  return ok ? 0 : 1;
+}
+
+// `login [zai]` — the user's CLI login, in the foreground: the CLI's own `zcode login zai` with exactly
+// the environment of every wrapper run (buildCliEnv: provider config, real app version, the wrapper's
+// personal config, the cli-home environment, inherited ZCODE_HTTP_PROXY), stdio inherited so the
+// user sees the browser URL. The login rewrites the personal config's default selection, so a successful
+// login is followed by a re-pin. Exit code = the CLI's. Never reads or prints a credential.
+function cmdLogin(args) {
+  const { positionals } = parse(args, {}, 1);
+  if (positionals.length === 1 && positionals[0] !== "zai") throw new UsageError(`login supports only the zai provider, got "${positionals[0]}"`);
+  const paths = zcodePaths();
+  const appVersion = readAppVersion(paths.plist);
+  if (!appVersion) throw new UsageError(`cannot read ${APP_VERSION_PLIST_KEY} from ${paths.plist}; refusing to run with an unknown client version`);
+  if (!fs.existsSync(paths.bin)) throw new UsageError(`ZCode CLI not found: ${paths.bin}`);
+  if (!fs.existsSync(paths.providerConfig)) throw new UsageError(`ZCode provider config not found: ${paths.providerConfig}`);
+  const home = ensureCliHome();
+  const run = spawnSync(paths.node, [paths.bin, "login", "zai"], { env: buildCliEnv(paths, appVersion), stdio: "inherit" });
+  if (run.error) throw new Error(`cannot run ${paths.node} ${paths.bin} login zai: ${run.error.message}`);
+  if (run.status !== 0) {
+    process.stderr.write(`zcode-dispatch: login failed (CLI ${run.status === null ? `signal ${run.signal}` : `exit ${run.status}`}); nothing re-pinned\n`);
+    return run.status ?? 1;
+  }
+  pinPersonalConfig(personalConfigFile());
+  process.stdout.write(`login: ok — ZCode CLI login stored in ${home}; ${personalConfigFile()} re-pinned to ${PINNED_MODEL}\n`);
+  return 0;
+}
+
+export async function main(argv) {
+  const [verb, ...rest] = argv;
+  try {
+    switch (verb) {
+      case "task":
+        return await cmdTask(rest);
+      case "status":
+        return cmdStatus(rest);
+      case "result":
+        return cmdResult(rest);
+      case "cancel":
+        return await cmdCancel(rest);
+      case "release-stale":
+        return cmdReleaseStale(rest);
+      case "doctor":
+        return await cmdDoctor(rest);
+      case "login":
+        return cmdLogin(rest);
+      case "__run":
+        return await runJob(rest[0], rest[1], rest[2]);
+      default:
+        throw new UsageError(`usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor|login> [args...]${verb ? ` (unknown verb: ${verb})` : ""}`);
+    }
+  } catch (error) {
+    process.stderr.write(`zcode-dispatch: ${error.message}\n`);
+    return error instanceof UsageError ? 2 : 1;
+  }
+}
+
+const invokedDirectly = (() => {
+  try {
+    return Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(SELF);
+  } catch {
+    return false;
+  }
+})();
+if (invokedDirectly) process.exitCode = await main(process.argv.slice(2));

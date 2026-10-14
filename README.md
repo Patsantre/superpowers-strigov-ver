@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.7.0" src="https://img.shields.io/badge/version-0.7.0-7c8cff?style=flat-square">
+  <img alt="Version 0.8.0" src="https://img.shields.io/badge/version-0.8.0-7c8cff?style=flat-square">
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square">
   <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-35d6a6?style=flat-square">
 </p>
@@ -34,6 +34,8 @@ You need a recent **Claude Code**, the standalone **Codex CLI**, and a one-time 
 npm install -g @openai/codex
 codex login
 ```
+
+Optional — the default implementer, **GLM-5.3-Flash via Z.ai's ZCode**: install [ZCode.app](https://github.com/zai-org/ZCode) into `/Applications`, then log its CLI in once with your GLM Coding Plan account via `zcode-dispatch login` — it runs ZCode's own `zcode login zai` in the wrapper's separate CLI home, so the ZCode desktop app's login stays untouched; repeat it when the CLI login expires (details in the `zcode-invocation` skill, "One-time setup"). Without it, `zcode-dispatch doctor` fails and the pipeline implements on Codex Luna `max` instead — announced, never silent. Behind a local proxy, prefix the login with `ZCODE_HTTP_PROXY=http://<host>:<port>` (the CLI ignores `HTTP(S)_PROXY` and the macOS system proxy; the wrapper passes the variable through to headless runs too).
 
 ### 2. Install the plugin
 
@@ -72,12 +74,12 @@ You can also describe the implementation task normally. The plugin recognizes En
 
 1. **Plan** — an Opus `xhigh` subagent explores the repository and writes a durable implementation plan with scope, interfaces, global constraints, tests, and risks.
 2. **Challenge** — a fresh Codex Astra `xhigh` review finds material gaps; authorized corrections go back to a fresh Opus `high` reviser through the ledger.
-3. **Build** — Luna `max` implements one phase and writes a report. Sol 6.1 `xhigh` continues the same thread when an Opus diagnosis says deeper reasoning is required.
+3. **Build** — GLM-5.3-Flash `max` implements one phase through Z.ai's own ZCode CLI and writes a report. Codex Luna `max` takes over when the GLM channel is down or switched off; Sol 6.1 `xhigh` implements SECURITY/DATA_LOSS phases from the start and takes over when an Opus diagnosis, a stalled gate or a third blocked review round calls for deeper reasoning.
 4. **Verify** — a Sonnet `medium` gate runs lint, typecheck, and affected tests before expensive review begins.
 5. **Review twice** — Opus `high` checks spec compliance and quality (`xhigh` on SECURITY/DATA_LOSS phases and in the last round), then a fresh Codex Astra `high` control review probes edge cases, races, security, and regressions.
-6. **Gate the branch** — after all phases pass, a fresh Opus `xhigh` review checks the complete branch and full test suite (Astra `xhigh` if Opus is unavailable). One consolidated Luna fix wave is allowed before the final verdict.
+6. **Gate the branch** — after all phases pass, a fresh Opus `xhigh` review checks the complete branch and full test suite (Astra `xhigh` if Opus is unavailable). One consolidated fix wave is allowed before the final verdict.
 
-Every Codex continuation is thread-addressed with `--resume-task <task-id>`. Reviewers receive a generated package containing the commit list, stat, and contextual diff instead of reconstructing the change from chat history.
+Every implementer continuation is addressed by id with `--resume-task` — `task-…` for Codex threads, `zt-…` for ZCode sessions. Reviewers receive a generated package containing the commit list, stat, and contextual diff instead of reconstructing the change from chat history.
 
 ## Model roles
 
@@ -89,16 +91,17 @@ Every role runs on a pinned model + effort pair. Claude subagents receive an exp
 | Plan writer / spec writer | Claude Opus · `xhigh` |
 | Plan and spec reviser | Claude Opus · `high` |
 | Plan and spec reviewer | GPT-6 Astra · `xhigh` |
-| Implementer, fix rounds, final fix wave | GPT-6 Luna · `max` |
-| Reasoning escalation (BLOCKED) | GPT-6.1 Sol · `xhigh`, same thread |
+| Implementer, fix rounds, final fix wave | GLM-5.3-Flash · `max` via Z.ai's ZCode CLI |
+| Availability fallback (GLM down or switched off) | GPT-6 Luna · `max` |
+| SECURITY/DATA_LOSS phases, reasoning escalation | GPT-6.1 Sol · `xhigh` |
 | Frontend implementer | Claude Opus · `high` (new UI) / Claude Sonnet · `medium` (tweaks) |
 | Primary code review (4.1) | Claude Opus · `high`; `xhigh` on SECURITY/DATA_LOSS phases and in round 4 |
 | Control review (4.2) | GPT-6 Astra · `high` |
 | Final whole-branch review | Claude Opus · `xhigh`; GPT-6 Astra · `xhigh` if Opus is unavailable |
-| BLOCKED diagnosis, impasse summaries | Claude Opus · `high` |
+| BLOCKED and gate-stall diagnosis, impasse summaries | Claude Opus · `high` |
 | Verification gate, synthesis, quickfix, integration check | Claude Sonnet · `medium` |
 
-`max` is reserved for Luna (or used when the user asks for it by name); `ultra` is never chosen automatically — only when the user explicitly asks for it.
+`max` is reserved for the implementers GLM and Luna (or used when the user asks for it by name); `ultra` is never chosen automatically — only when the user explicitly asks for it. GLM quota: on 2026-10-14 the 1.5× ZCode quota bonus measured inconclusive (expected/measured credits = 3.02 at the standard rate, or 1.51 if the window was off-peak; details in docs/zcode-cli-findings.md).
 
 ## Guardrails
 
@@ -109,6 +112,7 @@ Every role runs on a pinned model + effort pair. Claude subagents receive an exp
 - **Human authority** — plan conflicts, material scope changes, and unresolved impasses return to the user.
 - **Safe Git** — no `--no-verify`, no amend, no force push, and no push without explicit approval in the current session.
 - **Isolated parallelism** — plan-marked independent phases may run in separate worktrees, with a hard concurrency width of two.
+- **Terms-respecting GLM access** — GLM is reached only through Z.ai's own ZCode CLI with truthful client identification; no raw API, no token extraction; GLM never receives SECURITY / DATA_LOSS phases and runs unsandboxed only inside a git tree under the preamble's restrictions.
 
 ## Inside the plugin
 
@@ -118,10 +122,12 @@ Every role runs on a pinned model + effort pair. Claude subagents receive an exp
 |---|---|
 | `dev-orchestrator` | Complete planning, implementation, verification, review, commit, and resume protocol |
 | `codex-invocation` | Reliable background Codex dispatch through the vendored companion runtime |
+| `zcode-invocation` | Background GLM-5.3-Flash dispatch through Z.ai's ZCode CLI: setup, doctor/probe, Monitor loop, failure handling |
 | `architecture-memory` | Compact persistent architecture map in `docs/ARCHI.md` |
 | `/dev` | Explicit entry point for the full delivery protocol |
 | `bin/review-package` | Generates reviewer-ready commit and diff packages |
 | `bin/sdd-workspace` | Resolves isolated per-plan scratch workspaces |
+| `bin/zcode-dispatch` | ZCode CLI job wrapper: task/status/result/cancel/release-stale/doctor/login with pinned model, mode and client identification; `release-stale` frees a workspace reservation left by a crashed job, after verifying it is dead |
 
 ### Adapted Superpowers skills
 
@@ -139,13 +145,17 @@ The upstream `subagent-driven-development` skill is replaced by `dev-orchestrato
 ├── bin/
 │   ├── codex-dispatch               # Vendored companion wrapper
 │   ├── review-package               # Reviewer-ready diff package generator
-│   └── sdd-workspace                # Per-plan scratch workspace resolver
+│   ├── sdd-workspace                # Per-plan scratch workspace resolver
+│   ├── zcode-dispatch               # ZCode CLI job wrapper (shim)
+│   └── lib/zcode-dispatch.mjs       # ZCode job runner, records, doctor
 ├── skills/
 │   ├── dev-orchestrator/            # Protocol and role prompt templates
 │   ├── codex-invocation/
+│   ├── zcode-invocation/
 │   ├── architecture-memory/
 │   └── ...                          # Adapted Superpowers skills
 ├── tests/test-sdd-scripts.sh        # Workspace/package integration tests
+├── tests/test-zcode-dispatch.sh     # ZCode wrapper tests (stubbed CLI)
 └── vendor/codex-companion/          # Vendored OpenAI companion runtime
 ```
 
@@ -162,10 +172,11 @@ The upstream base is recorded in `vendor/codex-companion/VERSION`. Local patches
 
 ## Development and releases
 
-Run the integration suite:
+Run the test suites:
 
 ```bash
 bash tests/test-sdd-scripts.sh
+bash tests/test-zcode-dispatch.sh
 ```
 
 For a release, synchronize the version in `.claude-plugin/plugin.json`, both README files, `PLUGIN_README.md`, and the plugin entry in the external [`strigov-cc-plugins` marketplace catalog](https://github.com/strigov/strigov-cc-plugins). Updating this repository alone does not publish a marketplace release.

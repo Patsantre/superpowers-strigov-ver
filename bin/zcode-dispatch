@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Wrapper for the plugin's ZCode dispatcher (bin/lib/zcode-dispatch.mjs).
+#
+# Resolves zcode-dispatch.mjs regardless of install layout (marketplace cache,
+# newest version first, then the local dev tree), pins ZCODE_STATE_DIR so job
+# state lives under ~/.claude/plugins/data/superpowers-strigov-ver-zcode, and
+# execs node. The .mjs drives Z.ai's own ZCode CLI (embedded in
+# /Applications/ZCode.app) headless — never the Z.ai API directly.
+#
+# Usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor|login> [args...]
+set -eu
+
+resolve_mjs() {
+  local marketplace_glob="$HOME/.claude/plugins/cache/strigov-cc-plugins/superpowers-strigov-ver/*/bin/lib/zcode-dispatch.mjs"
+  local path
+  for path in $(ls -1d $marketplace_glob 2>/dev/null | sort -rV); do
+    if [ -f "$path" ]; then echo "$path"; return; fi
+  done
+
+  local self_dir
+  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [ -f "$self_dir/lib/zcode-dispatch.mjs" ]; then echo "$self_dir/lib/zcode-dispatch.mjs"; return; fi
+
+  echo ""
+}
+
+MJS="$(resolve_mjs)"
+if [ -z "$MJS" ]; then
+  echo "zcode-dispatch: cannot find bin/lib/zcode-dispatch.mjs" >&2
+  echo "  searched: ~/.claude/plugins/cache/strigov-cc-plugins/superpowers-strigov-ver/*/bin/lib/... and \$(dirname zcode-dispatch)/lib/..." >&2
+  exit 1
+fi
+
+export ZCODE_STATE_DIR="${ZCODE_STATE_DIR:-$HOME/.claude/plugins/data/superpowers-strigov-ver-zcode}"
+
+exec node "$MJS" "$@"
