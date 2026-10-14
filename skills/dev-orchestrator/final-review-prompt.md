@@ -20,7 +20,7 @@ Agent tool:
 
 1. BEFORE the Astra dispatch, run check 6 as a dispatched Sonnet subagent (`model: "sonnet"`, `effort: "medium"`) with the integration-check prompt from SKILL.md "Parallel groups" step 7 (full tests + typecheck + linter, `INTEGRATION_OK | INTEGRATION_FAIL`) against the branch tree.
 2. Write the filled prompt below to a scratch file and adapt it: change the opening "You are a fresh Opus subagent" to "You are a fresh Codex reviewer"; replace check 6 with "Check 6 was run by the orchestrator; result: <INTEGRATION_OK/INTEGRATION_FAIL + summary>. Do not run tests yourself — the sandbox is read-only. Treat a reported failure as a BLOCKING item."; drop the `git worktree add` advice under "Read-only review" (it cannot write either).
-3. Dispatch `"$DISPATCH" task --background --model gpt-6-astra --effort xhigh --prompt-file <scratch>/final-review-r<k>.md` (no `--write`; poll per `codex-invocation`).
+3. Dispatch `"$DISPATCH" task --background --model gpt-6-astra --effort xhigh --prompt-file <scratch>/final-review-r<k>.md` (no `--write`; first `Read` `../codex-invocation/SKILL.md` and poll per its manual-only instructions).
 4. An `INTEGRATION_FAIL` is a BLOCKING item (ledger `FR<k>-B<n>`) whatever Astra's verdict is. Repeat steps 1–3 in round 2.
 
 Tell the user the final review ran on Astra and — when Codex (Luna or Sol) implemented any phase of the branch — that it is same-family with the implementer's code (a declared exception to the family rule) — never a silent substitution. The ledger reviewer id stays `opus-final`.

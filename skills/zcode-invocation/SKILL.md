@@ -1,9 +1,12 @@
 ---
 name: zcode-invocation
 description: How to invoke GLM-5.3-Flash through Z.ai's ZCode CLI via the zcode-dispatch wrapper — background tasks + Monitor polling. Read this before the first GLM call in a session, including from dev-orchestrator.
+disable-model-invocation: true
 ---
 
 # ZCode invocation (zcode-dispatch wrapper, background-only)
+
+> **Manual-only pipeline skill (superpowers-strigov-ver).** It starts only from the user (`/dev`, `/superpowers-strigov-ver:<skill>`), from another skill of this plugin, or when resuming an in-progress plan — never on your own initiative. The Skill tool refuses it by design, so this plugin's pipeline skills are loaded with `Read`, never through the Skill tool. This file: `${CLAUDE_SKILL_DIR}/SKILL.md` (if the variable shows unexpanded, it is the path you just read). Another skill named below (`writing-plans`, `codex-invocation`, `zcode-invocation`, `dev-orchestrator`, …) is `../<name>/SKILL.md` relative to this skill's directory — `Read` it there. After a context compaction, re-`Read` this file before your next step.
 
 ## What this is
 
@@ -34,7 +37,7 @@ ZDISPATCH="$(command -v zcode-dispatch || true)"
 echo "ZDISPATCH=$ZDISPATCH"
 ```
 
-Same idiom as `$DISPATCH` in `codex-invocation`: `command -v` when the marketplace install put `bin/` on `PATH`, the cache glob for a fresh session, `$(pwd)/bin/...` for local dev runs from the repo root.
+For the parallel Codex wrapper-resolution method, `Read` `../codex-invocation/SKILL.md` (manual-only — never through the Skill tool): `command -v` when the marketplace install put `bin/` on `PATH`, the cache glob for a fresh session, `$(pwd)/bin/...` for local dev runs from the repo root.
 
 ### 2. One-time setup (user actions only — never run by the orchestrator)
 

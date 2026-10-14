@@ -55,7 +55,7 @@ The companion runtime is already vendored. OpenAI's separate `codex-plugin-cc` C
 /dev Implement resumable uploads with integrity checks
 ```
 
-You can also describe the implementation task normally. The plugin recognizes English and Russian requests and performs triage automatically. Trivial single-file edits take a lightweight Sonnet quickfix path.
+The pipeline never starts on its own. Start it with `/dev`, or with `/superpowers-strigov-ver:brainstorming` to settle the design first. To pick an in-progress plan back up in a new session, type `/dev` with no task or just ask to continue: a quiet SessionStart hook names the plan. Inside the pipeline, `dev-orchestrator` triages the task, and trivial single-file edits take a lightweight Sonnet quickfix path.
 
 ## What changes
 
@@ -105,6 +105,7 @@ Every role runs on a pinned model + effort pair. Claude subagents receive an exp
 
 ## Guardrails
 
+- **Manual start** — pipeline skills carry `disable-model-invocation: true`: the model neither sees nor loads them on its own. They run only after you start them, chain into each other by reading `SKILL.md` files, and resume an in-progress plan only when you ask to continue. The discipline skills (`systematic-debugging`, `test-driven-development`, `verification-before-completion`, `receiving-code-review`) still trigger automatically.
 - **Independent judgment** — the writer and reviewer of an artifact come from different model families.
 - **Authorization ledger** — review feedback is triaged before a fixer receives it; scope expansion is never silently implemented.
 - **Bounded loops** — plan and phase reviews cap at four rounds; final whole-branch review caps at two.
@@ -124,7 +125,8 @@ Every role runs on a pinned model + effort pair. Claude subagents receive an exp
 | `codex-invocation` | Reliable background Codex dispatch through the vendored companion runtime |
 | `zcode-invocation` | Background GLM-5.3-Flash dispatch through Z.ai's ZCode CLI: setup, doctor/probe, Monitor loop, failure handling |
 | `architecture-memory` | Compact persistent architecture map in `docs/ARCHI.md` |
-| `/dev` | Explicit entry point for the full delivery protocol |
+| `/dev` | Explicit entry point for the full delivery protocol; with no task, resumes an in-progress plan |
+| `bin/pipeline-context` | SessionStart hook: names an in-progress plan and the skill to re-read after compaction, otherwise silent |
 | `bin/review-package` | Generates reviewer-ready commit and diff packages |
 | `bin/sdd-workspace` | Resolves isolated per-plan scratch workspaces |
 | `bin/zcode-dispatch` | ZCode CLI job wrapper: task/status/result/cancel/release-stale/doctor/login/api-key with pinned model, mode and client identification; `release-stale` frees a workspace reservation left by a crashed job, after verifying it is dead |
@@ -133,7 +135,7 @@ Every role runs on a pinned model + effort pair. Claude subagents receive an exp
 
 `brainstorming`, `dispatching-parallel-agents`, `executing-plans`, `finishing-a-development-branch`, `receiving-code-review`, `requesting-code-review`, `systematic-debugging`, `test-driven-development`, `using-git-worktrees`, `verification-before-completion`, `writing-plans`, and `writing-skills`.
 
-The upstream `subagent-driven-development` skill is replaced by `dev-orchestrator`. The aggressive `using-superpowers` injection and SessionStart hook are intentionally not included.
+The upstream `subagent-driven-development` skill is replaced by `dev-orchestrator`. The aggressive `using-superpowers` injection and its SessionStart hook are intentionally not included; the plugin's own SessionStart hook speaks only when a plan is in progress or a pipeline skill needs re-reading after compaction.
 
 <details>
 <summary><strong>Repository map</strong></summary>
@@ -142,8 +144,10 @@ The upstream `subagent-driven-development` skill is replaced by `dev-orchestrato
 .
 ├── .claude-plugin/plugin.json       # Plugin manifest and source version
 ├── commands/dev.md                  # /dev command entry point
+├── hooks/hooks.json                 # SessionStart → bin/pipeline-context
 ├── bin/
 │   ├── codex-dispatch               # Vendored companion wrapper
+│   ├── pipeline-context             # In-progress plan / re-read hint for the session
 │   ├── review-package               # Reviewer-ready diff package generator
 │   ├── sdd-workspace                # Per-plan scratch workspace resolver
 │   ├── zcode-dispatch               # ZCode CLI job wrapper (shim)
@@ -155,6 +159,7 @@ The upstream `subagent-driven-development` skill is replaced by `dev-orchestrato
 │   ├── architecture-memory/
 │   └── ...                          # Adapted Superpowers skills
 ├── tests/test-sdd-scripts.sh        # Workspace/package integration tests
+├── tests/test-pipeline-context.sh   # SessionStart hook + manual-only skill checks
 ├── tests/test-zcode-dispatch.sh     # ZCode wrapper tests (stubbed CLI)
 └── vendor/codex-companion/          # Vendored OpenAI companion runtime
 ```
@@ -176,6 +181,7 @@ Run the test suites:
 
 ```bash
 bash tests/test-sdd-scripts.sh
+bash tests/test-pipeline-context.sh
 bash tests/test-zcode-dispatch.sh
 ```
 

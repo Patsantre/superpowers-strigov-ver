@@ -1,9 +1,12 @@
 ---
 name: brainstorming
-description: "You MUST use this before any creative work - creating features, building components, adding functionality, or modifying behavior. Explores user intent, requirements and design before implementation."
+description: "Manual-only. Explores user intent, requirements and design before implementation - for creating features, building components, adding functionality, or modifying behavior."
+disable-model-invocation: true
 ---
 
 # Brainstorming Ideas Into Designs
+
+> **Manual-only pipeline skill (superpowers-strigov-ver).** It starts only from the user (`/dev`, `/superpowers-strigov-ver:<skill>`), from another skill of this plugin, or when resuming an in-progress plan — never on your own initiative. The Skill tool refuses it by design, so this plugin's pipeline skills are loaded with `Read`, never through the Skill tool. This file: `${CLAUDE_SKILL_DIR}/SKILL.md` (if the variable shows unexpanded, it is the path you just read). Another skill named below (`writing-plans`, `codex-invocation`, `zcode-invocation`, `dev-orchestrator`, …) is `../<name>/SKILL.md` relative to this skill's directory — `Read` it there. After a context compaction, re-`Read` this file before your next step.
 
 Help turn ideas into fully formed designs and specs through natural collaborative dialogue.
 
@@ -25,7 +28,7 @@ Dispatch via `Agent(subagent_type="general-purpose", model="opus", effort=..., p
 
 The main thread never writes the spec directly — dispatch Opus. Exception: the main thread runs `git add` / `git commit` after Codex Astra returns APPROVED (mechanical orchestrator work — see "Codex Astra Spec Review" below).
 
-**Codex Astra xhigh is invoked for spec review** (loop cap=4) after Opus finishes writing. Dispatched via `companion.mjs --background` per the `codex-invocation` skill — standard Agent paths auto-reject on this machine. See "Codex Astra Spec Review" below for the loop procedure.
+**Codex Astra xhigh is invoked for spec review** (loop cap=4) after Opus finishes writing. Before dispatch, `Read` `../codex-invocation/SKILL.md` (manual-only — never through the Skill tool); dispatch via `companion.mjs --background` because standard Agent paths auto-reject on this machine. See "Codex Astra Spec Review" below for the loop procedure.
 
 ## Anti-Pattern: "This Is Too Simple To Need A Design"
 
@@ -44,7 +47,7 @@ You MUST create a task for each of these items and complete them in order:
 7. **Spec self-review** — Opus runs this inline while writing the spec (placeholders, contradictions, ambiguity, scope — see below)
 8. **Codex Astra xhigh reviews spec** — loop cap=4, using `./spec-reviewer-prompt.md`; if CHANGES_REQUESTED, dispatch Opus (high) to revise then Codex re-reviews; after APPROVED, commit from main thread
 9. **User reviews written spec** — ask user to review the spec file before proceeding
-10. **Transition to implementation** — invoke writing-plans skill to create implementation plan
+10. **Transition to implementation** — `Read` `../writing-plans/SKILL.md` and follow it to create the implementation plan
 
 ## Pre-send self-check (every message during the dialogue)
 
@@ -73,7 +76,7 @@ digraph brainstorming {
     "Codex approved?" [shape=diamond];
     "Commit spec" [shape=box];
     "User reviews spec?" [shape=diamond];
-    "Invoke writing-plans skill" [shape=doublecircle];
+    "Read ../writing-plans/SKILL.md" [shape=doublecircle];
 
     "Explore project context" -> "Visual questions ahead?";
     "Visual questions ahead?" -> "Offer Visual Companion\n(own message, no other content)" [label="yes"];
@@ -91,11 +94,11 @@ digraph brainstorming {
     "Codex approved?" -> "Commit spec" [label="APPROVED"];
     "Commit spec" -> "User reviews spec?";
     "User reviews spec?" -> "Write design doc\n(Opus subagent)" [label="changes requested"];
-    "User reviews spec?" -> "Invoke writing-plans skill" [label="approved"];
+    "User reviews spec?" -> "Read ../writing-plans/SKILL.md" [label="approved"];
 }
 ```
 
-**The terminal state is invoking writing-plans.** Do NOT invoke frontend-design, mcp-builder, or any other implementation skill. The ONLY skill you invoke after brainstorming is writing-plans.
+**The terminal state is loading writing-plans** — `Read` `../writing-plans/SKILL.md` (it is manual-only; the Skill tool refuses it). Do NOT invoke frontend-design, mcp-builder, or any other implementation skill. The ONLY skill you load after brainstorming is writing-plans.
 
 ## The Process
 
@@ -233,8 +236,8 @@ Wait for the user's response. If they request changes, dispatch an Opus subagent
 
 **Implementation:**
 
-- Invoke the writing-plans skill to create a detailed implementation plan
-- Do NOT invoke any other skill. writing-plans is the next step.
+- `Read` `../writing-plans/SKILL.md` and follow it to create a detailed implementation plan (manual-only skill — never through the Skill tool)
+- Do NOT load any other skill. `writing-plans` is the next step.
 
 ## Key Principles
 

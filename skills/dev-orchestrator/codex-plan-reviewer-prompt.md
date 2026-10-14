@@ -12,7 +12,7 @@ Use when dispatching a plan review to Codex. The plan was written by an Opus sub
   --prompt-file <scratch>/plan-review-<slug>-r<k>.md
 ```
 
-`$DISPATCH` is the `codex-dispatch` wrapper — resolve it once per session per the `codex-invocation` skill. Write the filled prompt to a scratch file first and pass it via `--prompt-file`; inline multi-line prompts break silently.
+`$DISPATCH` is the `codex-dispatch` wrapper — first `Read` `../codex-invocation/SKILL.md` (manual-only; never through the Skill tool), then resolve it once per session. Write the filled prompt to a scratch file first and pass it via `--prompt-file`; inline multi-line prompts break silently.
 
 **No `--write`.** This is a read-only review: Codex must not touch the plan file. Revisions go back to the Opus writer (`./opus-plan-writer-prompt.md` Mode B) through the ledger — that separation is what makes the review independent.
 
@@ -20,7 +20,7 @@ Use when dispatching a plan review to Codex. The plan was written by an Opus sub
 
 **Every round is a FRESH task — never `--resume-task`.** Reviewer freshness is a bias decision, exactly as for the Step 4.2 control review: a reviewer that remembers its own prior rounds anchors on them. The AUTHORIZED_CHANGE_LEDGER, not thread memory, carries the round history. Rounds 2+ use the follow-up template below.
 
-Poll with Monitor using the terminal-only filter from `codex-invocation`. Fetch via `"$DISPATCH" result task-XXXX`.
+Poll with Monitor using the terminal-only filter from `../codex-invocation/SKILL.md` (`Read` it — manual-only). Fetch via `"$DISPATCH" result task-XXXX`.
 
 Do NOT paste the full plan text in any round — always point at the file; Codex reads it from the working tree.
 

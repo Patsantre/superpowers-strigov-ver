@@ -12,13 +12,13 @@ Use when dispatching a design spec review to Codex Astra xhigh after Opus writes
   --prompt-file <scratch>/spec-review.md
 ```
 
-`$DISPATCH` is the `codex-dispatch` wrapper — resolve it once per session per the `codex-invocation` skill. Write the filled prompt to a scratch file first and pass it via `--prompt-file` — do not inline multi-line text.
+`$DISPATCH` is the `codex-dispatch` wrapper — first `Read` `../codex-invocation/SKILL.md` (manual-only; never through the Skill tool), then resolve it once per session. Write the filled prompt to a scratch file first and pass it via `--prompt-file` — do not inline multi-line text.
 
 No `--write`. Review is read-only.
 
-For round 2+, add `--resume-task <task-id of round 1's review>` and tell Codex the spec file was updated and must be re-read (thread-addressed resume — see `codex-invocation` "Resume semantics". If a stale job record forces `--fresh`, send the full first-round prompt + a digest of prior rounds instead of the follow-up prompt.) Do NOT send the full spec text — always point to the file.
+For round 2+, add `--resume-task <task-id of round 1's review>` and tell Codex the spec file was updated and must be re-read (thread-addressed resume — see `../codex-invocation/SKILL.md` "Resume semantics"; `Read` it — manual-only. If a stale job record forces `--fresh`, send the full first-round prompt + a digest of prior rounds instead of the follow-up prompt.) Do NOT send the full spec text — always point to the file.
 
-Poll with Monitor using the terminal-only filter from the `codex-invocation` skill. Fetch result via `"$DISPATCH" result task-XXXX`.
+Poll with Monitor using the terminal-only filter from `../codex-invocation/SKILL.md` (`Read` it — manual-only). Fetch result via `"$DISPATCH" result task-XXXX`.
 
 ## First-round prompt template
 
