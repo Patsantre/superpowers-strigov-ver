@@ -145,7 +145,7 @@ main() {
     unset ZCODE_STORAGE_DIR ZCODE_SESSION_DB_PATH ZCODE_SESSION_DB ZCODE_LOG_DIR
     unset ZCODE_STUB_MODE ZCODE_STUB_RECORD ZCODE_STUB_DELAY_MS ZCODE_STUB_MESSAGE ZCODE_STUB_EXIT ZCODE_STUB_TERM_DELAY_MS
     unset ZCODE_ENV_PASSTHROUGH
-    export ZCODE_ENV_PASSTHROUGH="ZCODE_STUB_MODE,ZCODE_STUB_RECORD,ZCODE_STUB_DELAY_MS,ZCODE_STUB_MESSAGE,ZCODE_STUB_EXIT,ZCODE_STUB_TERM_DELAY_MS,ZCODE_SESSION_DB"
+    export ZCODE_ENV_PASSTHROUGH="ZCODE_STUB_MODE,ZCODE_STUB_RECORD,ZCODE_STUB_DELAY_MS,ZCODE_STUB_MESSAGE,ZCODE_STUB_EXIT,ZCODE_STUB_TERM_DELAY_MS,ZCODE_STUB_GO,ZCODE_STUB_DONE,ZCODE_SESSION_DB"
     export ZCODE_SESSION_DB="$TEST_ROOT/inherited-alias.sqlite"
     # The CLI's own state (Ф4a): every CLI run gets cli-home overrides, even if the inherited
     # ZCODE_SESSION_DB alias is explicitly listed in ZCODE_ENV_PASSTHROUGH.
@@ -274,17 +274,23 @@ const keys = process.env.SEL_PATH.split(".");
 keys.slice(0, -1).reduce((a, k) => a[k], o)[keys.at(-1)] = { providerId: "p", modelId: "GLM-5.3" };
 o.keptByWrapper = true;
 fs.writeFileSync(process.env.PCFG, JSON.stringify(o));'
+    local unpinned_rc=0 unpinned_doctor
+    "$ZD" task --background --prompt-file "$prompt" >"$TEST_ROOT/task-unpinned.out" 2>&1 || unpinned_rc=$?
+    unpinned_doctor="$("$ZD" doctor 2>&1)" || true
+    printf '%s\n' "setup-fake-key-0123456789" | "$ZD" api-key set >/dev/null
     id="$(start_task --prompt-file "$prompt")"
     st="$(wait_status "$id" 'completed|failed|cancelled' 20)"
-    if [[ "$st" == completed ]] && REC="$TEST_ROOT/record.json" SEL_PATH="$sel_path" PINNED="$pinned" node -e '
+    if [[ "$unpinned_rc" -eq 2 && "$unpinned_doctor" == *"FAIL personal-config: $pcfg does not pin GLM-5.3-Flash\$max via zai-api"* && "$st" == completed ]] \
+        && grep -Fq "does not pin" "$TEST_ROOT/task-unpinned.out" && grep -Fq "zcode-dispatch api-key set" "$TEST_ROOT/task-unpinned.out" \
+        && REC="$TEST_ROOT/record.json" SEL_PATH="$sel_path" PINNED="$pinned" node -e '
 const fs = require("node:fs");
 const r = JSON.parse(fs.readFileSync(process.env.REC, "utf8"));
 const at = (o) => process.env.SEL_PATH.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
 process.exit(r.personalConfig?.keptByWrapper === true && JSON.stringify(at(r.personalConfig)) === process.env.PINNED ? 0 : 1);'; then
-        pass "2 a changed selection is re-pinned before the next run; other content of the file is kept"
+        pass "2 runs never rewrite the personal config: a changed selection makes task refuse (exit 2) and doctor FAIL personal-config; api-key set re-pins it and keeps the file's other content"
     else
-        fail "2 a changed selection is re-pinned before the next run; other content of the file is kept"
-        echo "    status: $st record: $(head -c 600 "$TEST_ROOT/record.json" 2>/dev/null)"
+        fail "2 runs never rewrite the personal config: a changed selection makes task refuse (exit 2) and doctor FAIL personal-config; api-key set re-pins it and keeps the file's other content"
+        echo "    task: $unpinned_rc status: $st"
     fi
 
     # --- 2. allowlisted CLI environment: drop ambient secrets; honor explicit, safe passthrough ---
@@ -870,15 +876,15 @@ process.exit(injected && runner.status === "cancelled" && m.readRecord(file).sta
     rc=0
     out="$("$ZD" doctor)" || rc=$?
     local checks=0 c
-    for c in app cli provider-config node app-version git state-dir cli-home personal-config auth kill-switch env; do
+    for c in platform app cli provider-config node app-version git state-dir cli-home personal-config auth kill-switch env; do
         if grep -Eq "^(ok|WARN) $c: " <<<"$out"; then checks=$((checks + 1)); fi
     done
-    if [[ "$rc" -eq 0 && "$checks" -eq 12 && "$(tail -1 <<<"$out")" == "doctor: ok" ]] && ! grep -q '^FAIL' <<<"$out" \
+    if [[ "$rc" -eq 0 && "$checks" -eq 13 && "$(tail -1 <<<"$out")" == "doctor: ok" ]] && ! grep -q '^FAIL' <<<"$out" \
         && grep -Fqx "ok cli-home: $cli_home" <<<"$out" && grep -Fq "ok auth: Coding Plan API key" <<<"$out" \
         && grep -Fq "pins GLM-5.3-Flash\$max via zai-api" <<<"$out"; then
-        pass "11 doctor against the fixtures: 12 checks ok/WARN, including env ('ok cli-home: <state root>/cli-home') and 'ok auth' for the stored key, 'doctor: ok', exit 0"
+        pass "11 doctor against the fixtures: 13 checks ok/WARN, including env ('ok cli-home: <state root>/cli-home') and 'ok auth' for the stored key, 'doctor: ok', exit 0"
     else
-        fail "11 doctor against the fixtures: 12 checks ok/WARN, including env ('ok cli-home: <state root>/cli-home') and 'ok auth' for the stored key, 'doctor: ok', exit 0"
+        fail "11 doctor against the fixtures: 13 checks ok/WARN, including env ('ok cli-home: <state root>/cli-home') and 'ok auth' for the stored key, 'doctor: ok', exit 0"
         echo "    exit: $rc"
         echo "$out" | sed 's/^/    /'
     fi
@@ -1096,26 +1102,158 @@ process.exit(!inEnv && !inArgv && rule?.config?.access?.apiKey === process.env.K
         fail "15 a failed doctor --probe prints the CLI's stderr tail with the key redacted"
         echo "    exit: $rc"
     fi
-    # The key is rotated while a job runs: the CLI saw key A at start and key B later; both are scrubbed.
-    local rotated_key="rotated-zai-key.fedcba9876543210"
-    export ZCODE_STUB_MODE=leak ZCODE_STUB_DELAY_MS=2500
+    # A descendant that outlives the CLI inherits its stderr but, like ZCode's tool processes, not the config
+    # lock. Once the job is terminal it cannot write to the job log any more, and the key is free to change.
+    # Handshake files; the log is checked after the runner process has exited, so its stderr handling is over.
+    local go="$TEST_ROOT/linger.go" done_file="$TEST_ROOT/linger.done" runner_pid after_set_rc=0 runner_gone=no
+    rm -f "$go" "$done_file"
+    export ZCODE_STUB_MODE=linger ZCODE_STUB_GO="$go" ZCODE_STUB_DONE="$done_file"
     id="$(start_task --prompt-file "$prompt")"
-    child="$(wait_child "$id")"
-    printf '%s\n' "$rotated_key" | "$ZD" api-key set >/dev/null 2>&1 || true
     st="$(wait_status "$id" 'completed|failed|cancelled' 20)"
     export ZCODE_STUB_MODE=ok
-    unset ZCODE_STUB_DELAY_MS
+    runner_pid="$("$ZD" status "$id" --json | jfield job.runnerPid)"
+    : > "$go"
+    local wait_i=0
+    while [[ "$wait_i" -lt 100 && ! -e "$done_file" ]]; do sleep 0.1; wait_i=$((wait_i + 1)); done
+    wait_i=0
+    while [[ "$wait_i" -lt 150 ]] && kill -0 "$runner_pid" 2>/dev/null; do sleep 0.1; wait_i=$((wait_i + 1)); done
+    kill -0 "$runner_pid" 2>/dev/null || runner_gone=yes
+    printf '%s\n' "$fake_key" | "$ZD" api-key set >/dev/null 2>&1 || after_set_rc=$?
+    unset ZCODE_STUB_GO ZCODE_STUB_DONE
     key_log="$(find "$ZCODE_STATE_DIR/state" -name "$id.log" | head -1)"
-    leak_result="$("$ZD" result "$id" 2>&1)" || true
-    if [[ -n "$child" && "$st" == completed && "$leak_result" == *"<redacted: Coding Plan API key>"* ]] \
-        && ! grep -rFq "$fake_key" "$ZCODE_STATE_DIR/state" && ! grep -rFq "$rotated_key" "$ZCODE_STATE_DIR/state" \
-        && [[ "$leak_result" != *"$fake_key"* && "$leak_result" != *"$rotated_key"* ]]; then
-        pass "15 a key rotated by api-key set during a running job: both the key seen at start and the new one are redacted in the log, the response and the record"
+    if [[ "$st" == completed && -n "$runner_pid" && -e "$done_file" && "$runner_gone" == yes && "$after_set_rc" -eq 0 ]] && ! grep -Fq "late-line" "$key_log"; then
+        pass "15 a descendant that outlives the CLI (no config lock, like ZCode's tools) cannot write to the job log once the job is terminal; the key is then free to change"
     else
-        fail "15 a key rotated by api-key set during a running job: both the key seen at start and the new one are redacted in the log, the response and the record"
-        echo "    status: $st child: $child result: $leak_result"
+        fail "15 a descendant that outlives the CLI (no config lock, like ZCode's tools) cannot write to the job log once the job is terminal; the key is then free to change"
+        echo "    status: $st runner: $runner_pid gone: $runner_gone done: $([[ -e "$done_file" ]] && echo yes || echo no) set: $after_set_rc"
     fi
-    printf '%s\n' "$fake_key" | "$ZD" api-key set >/dev/null
+
+    # The CLI itself holds the config lock (fd 3): with its runner killed, the key stays frozen until it ends.
+    local orphan_rc=0 thawed=no
+    export ZCODE_STUB_MODE=hang
+    id="$(start_task --prompt-file "$prompt")"
+    child="$(wait_child "$id")"
+    export ZCODE_STUB_MODE=ok
+    runner_pid="$("$ZD" status "$id" --json | jfield job.runnerPid)"
+    kill -9 "$runner_pid" 2>/dev/null || true
+    gone "$runner_pid" || true
+    printf '%s\n' "$fake_key" | "$ZD" api-key set >"$TEST_ROOT/key-orphan.out" 2>&1 || orphan_rc=$?
+    kill -9 -- "-$child" 2>/dev/null || true
+    gone "$child" || true
+    thawed=no
+    wait_i=0
+    while [[ "$wait_i" -lt 50 ]]; do
+        if printf '%s\n' "$fake_key" | "$ZD" api-key set >/dev/null 2>&1; then thawed=yes; break; fi
+        sleep 0.2; wait_i=$((wait_i + 1))
+    done
+    "$ZD" status >/dev/null 2>&1 || true
+    "$ZD" release-stale >/dev/null 2>&1 || true # the killed runner left its workspace reservation behind
+    if [[ -n "$child" && "$orphan_rc" -eq 2 && "$thawed" == yes ]] && grep -Fq "still holds $pcfg.lock" "$TEST_ROOT/key-orphan.out"; then
+        pass "15 with its runner killed (SIGKILL), the job's CLI still holds the config lock via fd 3: api-key set is refused until the CLI ends"
+    else
+        fail "15 with its runner killed (SIGKILL), the job's CLI still holds the config lock via fd 3: api-key set is refused until the CLI ends"
+        echo "    child: $child orphan: $orphan_rc thawed: $thawed"
+    fi
+
+    # A probe holds the config lock for its CLI as well.
+    local probe_pid probe_frozen_rc=0
+    ZCODE_STUB_MODE=hang "$ZD" doctor --probe >/dev/null 2>&1 &
+    probe_pid=$!
+    wait_i=0
+    while [[ "$wait_i" -lt 100 ]] && ! pgrep -f "$FIX/zcode-stub.cjs" >/dev/null; do sleep 0.1; wait_i=$((wait_i + 1)); done
+    printf '%s\n' "$fake_key" | "$ZD" api-key set >"$TEST_ROOT/key-probe-lock.out" 2>&1 || probe_frozen_rc=$?
+    pkill -f "$FIX/zcode-stub.cjs" 2>/dev/null || true
+    wait "$probe_pid" 2>/dev/null || true
+    thawed=no
+    wait_i=0
+    while [[ "$wait_i" -lt 50 ]]; do
+        if printf '%s\n' "$fake_key" | "$ZD" api-key set >/dev/null 2>&1; then thawed=yes; break; fi
+        sleep 0.2; wait_i=$((wait_i + 1))
+    done
+    if [[ "$probe_frozen_rc" -eq 2 && "$thawed" == yes ]] && grep -Fq "still holds $pcfg.lock" "$TEST_ROOT/key-probe-lock.out"; then
+        pass "15 while a doctor --probe CLI runs, api-key set is refused (exit 2); afterwards it works"
+    else
+        fail "15 while a doctor --probe CLI runs, api-key set is refused (exit 2); afterwards it works"
+        echo "    frozen: $probe_frozen_rc thawed: $thawed"
+    fi
+
+    # The pin check is structural: the same selection with its keys in another order still pins.
+    PCFG="$pcfg" node -e '
+const fs = require("node:fs");
+const o = JSON.parse(fs.readFileSync(process.env.PCFG, "utf8"));
+const s = o.config.defaultModelSelection;
+o.config.defaultModelSelection = { options: { reasoningLevel: s.options.reasoningLevel }, modelId: s.modelId, providerId: s.providerId };
+fs.writeFileSync(process.env.PCFG, JSON.stringify(o), { mode: 0o600 });'
+    rc=0
+    out="$("$ZD" doctor 2>&1)" || rc=$?
+    if [[ "$rc" -eq 0 && "$out" == *"ok personal-config: $pcfg pins GLM-5.3-Flash\$max via zai-api"* ]]; then
+        pass "15 a selection with reordered keys still counts as pinned (structural check)"
+    else
+        fail "15 a selection with reordered keys still counts as pinned (structural check)"
+        echo "$out" | grep personal-config | sed 's/^/    /'
+    fi
+
+    # A session from before 0.10.0 (no provider zai-api in its record) is not resumed onto the API key.
+    local legacy_id
+    legacy_id="$(start_task --prompt-file "$prompt")"
+    wait_status "$legacy_id" 'completed|failed|cancelled' 20 >/dev/null
+    local legacy_file
+    legacy_file="$(find "$ZCODE_STATE_DIR/state" -name "$legacy_id.json" | head -1)"
+    for f in "$legacy_file" "$legacy_file.terminal"; do
+        [[ -f "$f" ]] && F="$f" node -e 'const fs=require("node:fs");const o=JSON.parse(fs.readFileSync(process.env.F,"utf8"));delete o.provider;fs.writeFileSync(process.env.F,JSON.stringify(o));'
+    done
+    rc=0
+    "$ZD" task --background --resume-task "$legacy_id" --prompt-file "$prompt" >"$TEST_ROOT/legacy-resume.out" 2>&1 || rc=$?
+    if [[ "$rc" -eq 2 ]] && grep -Fq "ran on the OAuth account provider, not zai-api; its session cannot move to the API key; dispatch --fresh" "$TEST_ROOT/legacy-resume.out"; then
+        pass "15 resuming a job recorded without provider zai-api (pre-0.10.0, OAuth) is refused with 'dispatch --fresh' (exit 2)"
+    else
+        fail "15 resuming a job recorded without provider zai-api (pre-0.10.0, OAuth) is refused with 'dispatch --fresh' (exit 2)"
+        echo "    exit: $rc out: $(cat "$TEST_ROOT/legacy-resume.out")"
+    fi
+
+    # Keys are restricted to A-Z a-z 0-9 . _ - (so JSON escaping never changes them); leftover temp copies are removed.
+    rc=0
+    printf 'quote"key0123456789\n' | "$ZD" api-key set >"$TEST_ROOT/key-quote.out" 2>&1 || rc=$?
+    if [[ "$rc" -eq 2 ]] && grep -Fq "1 other character(s) outside A–Z a–z 0–9 . _ -" "$TEST_ROOT/key-quote.out" && ! grep -Fq 'quote"key' "$TEST_ROOT/key-quote.out"; then
+        pass "15 a key with a character outside A-Z a-z 0-9 . _ - is refused (exit 2), described by shape only"
+    else
+        fail "15 a key with a character outside A-Z a-z 0-9 . _ - is refused (exit 2), described by shape only"
+        echo "    exit: $rc out: $(cat "$TEST_ROOT/key-quote.out")"
+    fi
+    printf '{"leftover":"%s"}' "$fake_key" > "$pcfg.tmp-99999-1"
+    rc=0
+    printf '%s\n' "$fake_key" | "$ZD" api-key set >/dev/null 2>&1 || rc=$?
+    if [[ "$rc" -eq 0 && ! -e "$pcfg.tmp-99999-1" ]]; then
+        pass "15 api-key set removes temp copies of the personal config left by a crash (they may hold a key)"
+    else
+        fail "15 api-key set removes temp copies of the personal config left by a crash (they may hold a key)"
+        echo "    exit: $rc"
+    fi
+
+    # The key cannot change while a run holds the config lock: api-key set / clear refuse until the CLI is gone.
+    local rotated_key="rotated-zai-key.fedcba9876543210" during_rc=0 clear_during_rc=0 after_rc=0
+    export ZCODE_STUB_MODE=hang
+    id="$(start_task --prompt-file "$prompt")"
+    child="$(wait_child "$id")"
+    before_cfg="$(cat "$pcfg")"
+    printf '%s\n' "$rotated_key" | "$ZD" api-key set >"$TEST_ROOT/key-during-run.out" 2>&1 || during_rc=$?
+    "$ZD" api-key clear >"$TEST_ROOT/clear-during-run.out" 2>&1 || clear_during_rc=$?
+    local during_cfg
+    during_cfg="$(cat "$pcfg")"
+    "$ZD" cancel "$id" >/dev/null
+    st="$(wait_status "$id" 'completed|failed|cancelled' 20)"
+    export ZCODE_STUB_MODE=ok
+    local wait_i=0
+    while [[ "$wait_i" -lt 50 ]] && ! printf '%s\n' "$fake_key" | "$ZD" api-key set >/dev/null 2>&1; do sleep 0.2; wait_i=$((wait_i + 1)); done
+    [[ "$wait_i" -lt 50 ]] || after_rc=1
+    if [[ -n "$child" && "$during_rc" -eq 2 && "$clear_during_rc" -eq 2 && "$during_cfg" == "$before_cfg" && "$st" == cancelled && "$after_rc" -eq 0 ]] \
+        && grep -Fq "still holds $pcfg.lock" "$TEST_ROOT/key-during-run.out" && grep -Fq "still holds $pcfg.lock" "$TEST_ROOT/clear-during-run.out" \
+        && ! grep -Fq "$rotated_key" "$TEST_ROOT/key-during-run.out"; then
+        pass "15 while a job's CLI runs, api-key set and clear are refused (exit 2, config unchanged, the config lock is held); once it is gone, api-key set works again"
+    else
+        fail "15 while a job's CLI runs, api-key set and clear are refused (exit 2, config unchanged, the config lock is held); once it is gone, api-key set works again"
+        echo "    set: $during_rc clear: $clear_during_rc status: $st after: $after_rc out: $(cat "$TEST_ROOT/key-during-run.out")"
+    fi
 
     # Refusals: nothing is stored, and no argument is echoed (a key typed as an argument must not leak).
     local before_cfg
@@ -1139,7 +1277,7 @@ process.exit(!inEnv && !inArgv && rule?.config?.access?.apiKey === process.env.K
     expect_exit 2 "15 api-key set with empty stdin is refused (exit 2)" "$ZD" api-key set </dev/null
     rc=0
     printf 'two words\n' | "$ZD" api-key set >"$TEST_ROOT/key-words.out" 2>&1 || rc=$?
-    if [[ "$rc" -eq 2 ]] && grep -Fq "got 9 characters on 1 line(s), 1 space(s), 0 non-ASCII" "$TEST_ROOT/key-words.out" \
+    if [[ "$rc" -eq 2 ]] && grep -Fq "got 9 characters on 1 line(s), 1 space(s), 0 other character(s)" "$TEST_ROOT/key-words.out" \
         && grep -Fq "without a pipe" "$TEST_ROOT/key-words.out" && ! grep -Fq "two words" "$TEST_ROOT/key-words.out"; then
         pass "15 api-key set with a line containing spaces is refused (exit 2), describing the input's shape (length, lines, spaces) but never its content"
     else
@@ -1166,7 +1304,7 @@ process.exit(!inEnv && !inArgv && rule?.config?.access?.apiKey === process.env.K
     fi
     rc=0
     out="$(ZCODE_APP="$TEST_ROOT/NoTemplate.app" "$ZD" doctor)" || rc=$?
-    if [[ "$rc" -eq 1 && "$out" == *"FAIL auth: a Coding Plan API key is configured, but "* && "$(tail -1 <<<"$out")" == "doctor: FAIL" ]]; then
+    if [[ "$rc" -eq 1 && "$out" == *"FAIL auth: ZCode template incompatible: a Coding Plan API key is stored, but "* && "$(tail -1 <<<"$out")" == "doctor: FAIL" ]]; then
         pass "15 doctor in api-key mode against an app without the zai-api template: FAIL auth, exit 1"
     else
         fail "15 doctor in api-key mode against an app without the zai-api template: FAIL auth, exit 1"
@@ -1192,7 +1330,7 @@ process.exit(!inEnv && !inArgv && rule?.config?.access?.apiKey === process.env.K
     out="$("$ZD" doctor 2>&1)" || rc=$?
     local set_rc=0
     printf '%s\n' "other-fake-key-0123456789" | "$ZD" api-key set >"$TEST_ROOT/key-broken.out" 2>&1 || set_rc=$?
-    if [[ "$rc" -eq 1 && "$out" == *"FAIL personal-config: cannot pin $pcfg: $pcfg is not valid JSON"* && "$out" != *"$fake_key"* \
+    if [[ "$rc" -eq 1 && "$out" == *"FAIL personal-config: cannot read $pcfg: $pcfg is not valid JSON"* && "$out" != *"$fake_key"* \
         && "$set_rc" -eq 1 && "$(cat "$pcfg")" == "$broken_cfg" ]] && ! grep -Fq "$fake_key" "$TEST_ROOT/key-broken.out"; then
         pass "15 an unparseable personal config: doctor FAIL personal-config and api-key set exit 1, the file is left as is and its content never printed"
     else
@@ -1202,24 +1340,16 @@ process.exit(!inEnv && !inArgv && rule?.config?.access?.apiKey === process.env.K
     printf '%s' "$good_cfg" > "$pcfg"
     chmod 600 "$pcfg"
 
-    # The wrapper's config lock: a held lock blocks a pin (then times out), a stale one is removed.
-    mkdir "$pcfg.wrapper-lock"
+    # The state root is 0700 and the config 0600; doctor restores them (modes only) after a foreign rewrite.
+    chmod 755 "$ZCODE_STATE_DIR"
+    chmod 644 "$pcfg"
     rc=0
     out="$("$ZD" doctor 2>&1)" || rc=$?
-    if [[ "$rc" -eq 1 && "$out" == *"FAIL personal-config: cannot pin $pcfg: the personal provider config is locked by another zcode-dispatch"* ]]; then
-        pass "15 a held personal-config lock makes the pin wait and then fail (doctor FAIL personal-config), nothing written"
+    if [[ "$rc" -eq 0 && "$(mode_of "$ZCODE_STATE_DIR")" == 700 && "$(mode_of "$pcfg")" == 600 ]]; then
+        pass "15 doctor restores the state root to 0700 and the personal config to 0600 without rewriting it"
     else
-        fail "15 a held personal-config lock makes the pin wait and then fail (doctor FAIL personal-config), nothing written"
-        echo "$out" | sed 's/^/    /'
-    fi
-    touch -t 202001010000 "$pcfg.wrapper-lock"
-    rc=0
-    out="$("$ZD" doctor 2>&1)" || rc=$?
-    if [[ "$rc" -eq 0 && ! -e "$pcfg.wrapper-lock" && "$out" == *"ok auth: Coding Plan API key"* && "$(mode_of "$ZCODE_STATE_DIR")" == 700 ]]; then
-        pass "15 a stale personal-config lock (older than 30 s) is removed and the pin proceeds; the state root is 0700"
-    else
-        fail "15 a stale personal-config lock (older than 30 s) is removed and the pin proceeds; the state root is 0700"
-        echo "    exit: $rc state-root mode: $(mode_of "$ZCODE_STATE_DIR")"
+        fail "15 doctor restores the state root to 0700 and the personal config to 0600 without rewriting it"
+        echo "    exit: $rc root: $(mode_of "$ZCODE_STATE_DIR") cfg: $(mode_of "$pcfg")"
     fi
 
     # A rotated key that extends an older one is redacted whole (longest form first).

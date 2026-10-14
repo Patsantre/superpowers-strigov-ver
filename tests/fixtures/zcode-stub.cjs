@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Test stand-in for ZCode's zcode.cjs, selected via ZCODE_BIN. Never calls a model.
-// ZCODE_STUB_MODE: ok | pong | resume | record | leak | model-not-selected | auth | quota |
+// ZCODE_STUB_MODE: ok | pong | resume | record | leak | linger | model-not-selected | auth | quota |
 //                  launch | hang | ignore-term | split-utf8 | crash | malformed
 // ZCODE_STUB_RECORD: file the `record` mode writes, including envAll and
 // `resolved`, the stub's model of where the CLI keeps its state; ZCODE_STUB_DELAY_MS: wait before acting;
@@ -120,6 +120,24 @@ async function run() {
     case "record":
       writeStubRecord(flag("-p") === "-" ? await readStdin() : null);
       return emit("DONE\nrecorded");
+    case "linger": {
+      // A descendant outlives the CLI: it inherits the CLI's stderr but, like ZCode's tool processes, not fd 3
+      // (the wrapper's config lock); it waits for the file $ZCODE_STUB_GO, writes one stderr line, creates
+      // $ZCODE_STUB_DONE and exits.
+      const script = `
+        const fs = require("node:fs");
+        process.stderr.on("error", () => {});
+        const tick = setInterval(() => {
+          if (!fs.existsSync(process.env.ZCODE_STUB_GO)) return;
+          clearInterval(tick);
+          try { process.stderr.write("late-line from a lingering descendant\\n"); } catch {}
+          fs.writeFileSync(process.env.ZCODE_STUB_DONE, "done");
+          setTimeout(() => process.exit(0), 100);
+        }, 50);
+        setTimeout(() => process.exit(0), 60000);`;
+      require("node:child_process").spawn(process.execPath, ["-e", script], { stdio: ["ignore", "ignore", "inherit"] }).unref();
+      return emit("DONE\nlinger");
+    }
     case "leak": {
       // Stand-in for GLM's shell printing the personal provider config (in api-key mode it holds the key),
       // now and as read at process start: the text goes to stderr in two chunks split inside the first key
