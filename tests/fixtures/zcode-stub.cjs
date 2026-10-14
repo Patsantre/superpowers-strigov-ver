@@ -22,6 +22,14 @@ const flag = (name) => {
   return i >= 0 ? argv[i + 1] : undefined;
 };
 const sessionId = flag("--resume") || `sess_stub_${process.pid}`;
+// `leak` also prints the personal config as it was when the process started (a key read early, then rotated).
+const configAtStart = (() => {
+  try {
+    return fs.readFileSync(process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, "utf8");
+  } catch {
+    return "";
+  }
+})();
 
 function emit(response) {
   process.stdout.write(
@@ -136,10 +144,11 @@ async function run() {
       return process.exit(Number(process.env.ZCODE_STUB_EXIT || 0));
     }
     case "leak": {
-      // Stand-in for GLM's shell printing the personal provider config (in api-key mode it holds the key):
-      // the text goes to stderr in two chunks split inside the key value, then to the response (exit 0)
-      // or raw to stdout with exit ZCODE_STUB_EXIT.
-      const text = fs.readFileSync(process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, "utf8").replace(/\s+/g, " ");
+      // Stand-in for GLM's shell printing the personal provider config (in api-key mode it holds the key),
+      // now and as read at process start: the text goes to stderr in two chunks split inside the first key
+      // value, then to the response (exit 0) or raw to stdout with exit ZCODE_STUB_EXIT.
+      const now = fs.readFileSync(process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, "utf8");
+      const text = `${now} || at start: ${configAtStart}`.replace(/\s+/g, " ");
       const at = text.indexOf('"apiKey":');
       const splitAt = at >= 0 ? text.indexOf('"', at + 9) + 6 : Math.floor(text.length / 2);
       process.stderr.write(`leaked: ${text.slice(0, splitAt)}`);

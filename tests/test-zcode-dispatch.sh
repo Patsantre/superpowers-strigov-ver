@@ -1132,6 +1132,26 @@ process.exit(!inEnv && !inArgv && rule?.config?.access?.apiKey === process.env.K
         fail "15 a failed doctor --probe prints the CLI's stderr tail with the key redacted"
         echo "    exit: $rc"
     fi
+    # The key is rotated while a job runs: the CLI saw key A at start and key B later; both are scrubbed.
+    local rotated_key="rotated-zai-key.fedcba9876543210"
+    export ZCODE_STUB_MODE=leak ZCODE_STUB_DELAY_MS=2500
+    id="$(start_task --prompt-file "$prompt")"
+    child="$(wait_child "$id")"
+    printf '%s\n' "$rotated_key" | "$ZD" api-key set >/dev/null 2>&1 || true
+    st="$(wait_status "$id" 'completed|failed|cancelled' 20)"
+    export ZCODE_STUB_MODE=ok
+    unset ZCODE_STUB_DELAY_MS
+    key_log="$(find "$ZCODE_STATE_DIR/state" -name "$id.log" | head -1)"
+    leak_result="$("$ZD" result "$id" 2>&1)" || true
+    if [[ -n "$child" && "$st" == completed && "$leak_result" == *"<redacted: Coding Plan API key>"* ]] \
+        && ! grep -rFq "$fake_key" "$ZCODE_STATE_DIR/state" && ! grep -rFq "$rotated_key" "$ZCODE_STATE_DIR/state" \
+        && [[ "$leak_result" != *"$fake_key"* && "$leak_result" != *"$rotated_key"* ]]; then
+        pass "15 a key rotated by api-key set during a running job: both the key seen at start and the new one are redacted in the log, the response and the record"
+    else
+        fail "15 a key rotated by api-key set during a running job: both the key seen at start and the new one are redacted in the log, the response and the record"
+        echo "    status: $st child: $child result: $leak_result"
+    fi
+    printf '%s\n' "$fake_key" | "$ZD" api-key set >/dev/null
 
     rc=0
     login_out="$(ZCODE_STUB_MODE=login "$ZD" login 2>&1)" || rc=$?

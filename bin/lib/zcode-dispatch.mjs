@@ -354,13 +354,44 @@ function ensurePrivateDir(dir) {
   fs.chmodSync(dir, 0o700);
 }
 
-// Replaces the configured API key — raw and JSON-escaped — in CLI output before the wrapper logs,
-// records or prints it (GLM's shell can read the personal config). Identity without a key.
-export function keyRedactor(config) {
-  const key = apiKeyRuleOf(config)?.config.access.apiKey;
-  if (!key) return (text) => text;
-  const forms = [...new Set([key, key.trim(), JSON.stringify(key).slice(1, -1), JSON.stringify(key.trim()).slice(1, -1)])].filter((form) => form.length >= 8);
-  return (text) => forms.reduce((acc, form) => acc.split(form).join(REDACTED_KEY), String(text));
+// Replaces every API key the personal config has held since the run started — raw and JSON-escaped —
+// in CLI output before the wrapper logs, records or prints it (GLM's shell can read the personal config).
+// Each call re-checks the file (by mtime, size and inode), so a key stored or rotated by `api-key set`
+// during the run is scrubbed too; keys seen earlier stay in the set after `clear` or a rotation.
+export function keyRedactor(file, initialConfig = null) {
+  const forms = new Set();
+  let seenId = null;
+  const add = (config) => {
+    const key = apiKeyRuleOf(config)?.config.access.apiKey;
+    if (!key) return;
+    for (const form of [key, key.trim(), JSON.stringify(key).slice(1, -1), JSON.stringify(key.trim()).slice(1, -1)]) {
+      if (form.length >= 8) forms.add(form);
+    }
+  };
+  const refresh = () => {
+    let stat;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      return;
+    }
+    const id = `${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+    if (id === seenId) return;
+    seenId = id;
+    try {
+      add(JSON.parse(fs.readFileSync(file, "utf8")));
+    } catch {
+      // unreadable or unparseable: keep the keys already known
+    }
+  };
+  if (initialConfig) add(initialConfig);
+  refresh();
+  return (text) => {
+    refresh();
+    let out = String(text);
+    for (const form of forms) out = out.split(form).join(REDACTED_KEY);
+    return out;
+  };
 }
 
 function providerRulesOf(config) {
@@ -1074,7 +1105,7 @@ async function runJob(id, jobsDir, token) {
     appendLog(log, `start ${id}: ${JSON.stringify(paths.node)} ${summarizeArgv(argv)}`);
     appendLog(log, describeCliEnv(env));
     appendLog(log, `auth: ${authModeOf(pinned)}`); // the mode only, never the key
-    const redact = keyRedactor(pinned);
+    const redact = keyRedactor(personalConfigFile(), pinned);
     const result = await runCli({
       node: paths.node,
       argv,
@@ -1270,7 +1301,7 @@ async function runProbe(paths, appVersion, root) {
     stdinText: PROMPT_TRANSPORT === "stdin" ? PROBE_PROMPT : null,
     timeoutMs: PROBE_TIMEOUT_MS,
     logPath: null,
-    redact: keyRedactor(pinned),
+    redact: keyRedactor(personalConfigFile(), pinned),
   });
   const verdict = evaluate(result);
   const json = verdict.json;
