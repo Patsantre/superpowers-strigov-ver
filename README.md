@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.8.0" src="https://img.shields.io/badge/version-0.8.0-7c8cff?style=flat-square">
+  <img alt="Version 0.8.1" src="https://img.shields.io/badge/version-0.8.1-7c8cff?style=flat-square">
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square">
   <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-35d6a6?style=flat-square">
 </p>
@@ -35,7 +35,7 @@ npm install -g @openai/codex
 codex login
 ```
 
-Optional — the default implementer, **GLM-5.3-Flash via Z.ai's ZCode**: install [ZCode.app](https://github.com/zai-org/ZCode) into `/Applications`, then log its CLI in once with your GLM Coding Plan account via `zcode-dispatch login` — it runs ZCode's own `zcode login zai` in the wrapper's separate CLI home, so the ZCode desktop app's login stays untouched; repeat it when the CLI login expires (details in the `zcode-invocation` skill, "One-time setup"). Without it, `zcode-dispatch doctor` fails and the pipeline implements on Codex Luna `max` instead — announced, never silent. Behind a local proxy, prefix the login with `ZCODE_HTTP_PROXY=http://<host>:<port>` (the CLI ignores `HTTP(S)_PROXY` and the macOS system proxy; the wrapper passes the variable through to headless runs too).
+Optional — the default implementer, **GLM-5.3-Flash via Z.ai's ZCode**: install [ZCode.app](https://github.com/zai-org/ZCode) into `/Applications`, then log its CLI in once with your GLM Coding Plan account via `zcode-dispatch login` — it runs ZCode's own `zcode login zai` in the wrapper's separate CLI home, so the ZCode desktop app's login stays untouched; repeat it when the CLI login expires (details in the `zcode-invocation` skill, "One-time setup"). Without it, `zcode-dispatch doctor` fails and the pipeline implements on Codex Luna `max` instead — announced, never silent. Behind a local proxy, prefix the login with `ZCODE_HTTP_PROXY=http://<host>:<port>` (the CLI ignores `HTTP(S)_PROXY` and the macOS system proxy; the wrapper passes this variable via the allowlist to headless runs too). The CLI receives an allowlisted environment; explicitly pass extra names with `ZCODE_ENV_PASSTHROUGH="NAME1,NAME2"`.
 
 ### 2. Install the plugin
 
