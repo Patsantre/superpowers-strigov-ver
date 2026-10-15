@@ -46,13 +46,13 @@ Agent(subagent_type="general-purpose", model="opus", effort="xhigh", prompt=<ass
 **Pre-dispatch verification — run on the assembled prompt before dispatching:**
 
 1. `model="opus"`, `effort="xhigh"` (Mode B revisions: `effort="high"`), and no `ultrathink` in the prompt.
-2. Every bullet above is physically present in the prompt. In particular the FULL TEXT of these sections must be pasted in: Scope Check, File Structure, Bite-Sized Step Granularity, Plan Document Header, Required body sections, Phase Structure, No Placeholders, Remember, Self-Review. Litmus test: if the prompt does not contain the fenced YAML frontmatter template and the `## Ф1:` example layout, you referenced instead of pasted — go back and paste.
+2. Every bullet above is physically present in the prompt. In particular the FULL TEXT of these sections must be pasted in: Scope Check, File Structure, Bite-Sized Step Granularity, Plan Document Header, Required body sections, Phase Structure, Risk Tags, No Placeholders, Remember, Self-Review. Litmus test: if the prompt does not contain the fenced YAML frontmatter template, the `## Ф1:` example layout, and the `<!-- risk-tag checklist` block, you referenced instead of pasted — go back and paste.
 3. No unfilled `<placeholder>` tokens remain (scan the prompt for `<`).
 4. All paths absolute.
 
 **After the writer returns — mechanical frontmatter validation (main thread):**
 
-Read the plan file's first 30 lines and check: file starts with `---`; frontmatter has `slug`, `created`, `status: in-progress`, and a `phases:` list; first phase `status: in-progress`, all others `status: pending`; every `phases[].id` matches a `## <id>:` H2 in the body (check via `grep -n '^## Ф' <plan-file>`); if any `parallel_group` is present, each group id appears on exactly 2 phases. If a check fails: frontmatter-only defects you may fix mechanically yourself; body defects → dispatch a fresh Opus writer at effort `high` (Mode B shape: plan path + the specific defect as the authorized change). Do not send a malformed plan to review.
+Read the plan file's first 30 lines and check: file starts with `---`; frontmatter has `slug`, `created`, `status: in-progress`, and a `phases:` list; first phase `status: in-progress`, all others `status: pending`; every `phases[].id` matches a `## <id>:` H2 in the body (check via `grep -n '^## Ф' <plan-file>`); if any `parallel_group` is present, each group id appears on exactly 2 phases; `risk_phases` is present as one top-level line directly after the top-level `status:` line, its keys are exactly the `phases[].id`s, and every value lists only `SECURITY` / `DATA_LOSS` or is empty (`[]`); there is no `risk_checked:` line (orchestrator-only — delete it mechanically if the writer wrote one). If a check fails: frontmatter-only defects you may fix mechanically yourself; body defects → dispatch a fresh Opus writer at effort `high` (Mode B shape: plan path + the specific defect as the authorized change). A missing key, a missing or extra phase id, or a value outside `SECURITY` / `DATA_LOSS` in `risk_phases` counts as a body defect: choosing a risk tag is judgment — never write or guess one yourself (only a misplaced but otherwise valid line may be moved mechanically). Do not send a malformed plan to review.
 
 This skill produces plans in the YAML-frontmatter + phases format consumed natively by `dev-orchestrator`. The TDD discipline (failing test → minimal impl → passing test → commit) lives **inside** each phase as the step pattern — phases are the orchestration unit, TDD steps are the work pattern. The canonical format definition lives in `../dev-orchestrator/opus-plan-writer-prompt.md` Mode A — keep this skill's format guidance below in sync with it.
 
@@ -64,7 +64,7 @@ Verdict handling (identical to dev-orchestrator Step 2):
 - `CHANGES_REQUESTED` → run the ledger sequence from `../dev-orchestrator/SKILL.md` Step 2, in order: (a) triage the BLOCKING list, (b) write/update the ledger (see "Authorized Change Ledger" below), (c) dispatch a fresh Opus writer at effort `high` (Mode B from `../dev-orchestrator/opus-plan-writer-prompt.md`) with the plan file path, the ledger path, and the open ACCEPTED / PARTIALLY_ACCEPTED items inline — revise in place, not rewrite, (d) after the writer returns, dispatch a FRESH Codex Astra xhigh reviewer with the follow-up template. Never dispatch the writer on the raw BLOCKING list before the ledger exists. Increment counter.
 - Round 4 without APPROVED → escalate to user: plan path + last blocking list + one-sentence disagreement summary. User picks: accept / another round / close.
 
-Anti-pingpong: if the reviewer repeats a blocking point that was explicitly rejected with reasoning in a prior round, mark `resolved-by-decision`, do not loop on it. No-progress: if two consecutive rounds produce an identical blocking list, escalate immediately.
+Anti-pingpong: if the reviewer repeats a blocking point that was explicitly rejected with reasoning in a prior round, mark `resolved-by-decision`, do not loop on it — except a finding that asks to add a missing risk tag (`risk_phases`), which is never filtered: an extra tag is always safe, so it goes to the writer as ACCEPTED. No-progress: if two consecutive rounds produce an identical blocking list, escalate immediately.
 
 **New-blocker churn detector.** Escalate immediately, even before cap=4, when all prior blockers are closed (per the ledger) and the reviewer returns only NEW `MUST_FIX_NOW` items that don't cite DATA_LOSS / SECURITY / GUARANTEED_FAIL materiality. `REGRESSION_FROM_AUTHORIZED_FIX` items don't count as "new" — they are causally tied to a prior accepted fix. Canonical wording lives in `../dev-orchestrator/SKILL.md` Step 2 verdict-handling; mirror it from there rather than restating.
 
@@ -94,7 +94,7 @@ This structure informs the phase decomposition. Each phase should produce self-c
 - "Run the tests and make sure they pass" - step
 - "Commit" - step (the last step of the phase commits the whole phase)
 
-Note: when the plan is executed via `dev-orchestrator`, the final "Commit" step is performed by the orchestrator's auto-commit, not by the Codex implementer — the implementer prompt tells it to skip that step and leave the working tree uncommitted for review. Keep the step in the plan anyway: it documents intent and serves direct human execution.
+Note: when the plan is executed via `dev-orchestrator`, the final "Commit" step is performed by the orchestrator's auto-commit, not by the implementer (GLM-5.3-Flash via `zcode-dispatch` by default; Codex Luna as the availability fallback and Codex Sol for risk-tagged phases; the Claude frontend implementer for frontend phases) — the implementer prompt tells it to skip that step and leave the working tree uncommitted for review. Keep the step in the plan anyway: it documents intent and serves direct human execution.
 
 ## Plan Document Header
 
@@ -105,6 +105,7 @@ Note: when the plan is executed via `dev-orchestrator`, the final "Commit" step 
 slug: <short-kebab-slug>
 created: YYYY-MM-DD
 status: in-progress          # in-progress | done | abandoned
+risk_phases: { Ф1: [], Ф2: [], Ф3: [] }   # one key per phases[] id — see "Risk Tags"
 phases:
   - id: Ф1
     scope: "<one-line scope>"
@@ -128,7 +129,7 @@ phases:
 
 After the `---` separator the body begins, starting with `## Goal` and following the H2 sequence below. Do NOT add `**Goal:**` / `**Architecture:**` / `**Tech Stack:**` bold lines before the H2 sections — those are upstream mini-header conventions and would duplicate `## Goal`.
 
-The first phase MUST start at `status: in-progress`; all others at `status: pending`. The top-level `status: in-progress` until the last phase flips to `done`. These fields are what `dev-orchestrator` reads during resume-check and auto-commit — keep them well-formed. On phase completion the orchestrator appends a `commits:` range field (`"<base7>.."` on the sequential path, `"<base7>..<head7>"` for parallel groups) to that phase's `phases[]` entry — a runtime field written by the orchestrator, never by the plan author; do not emit it when writing the plan.
+The first phase MUST start at `status: in-progress`; all others at `status: pending`. The top-level `status: in-progress` until the last phase flips to `done`. These fields are what `dev-orchestrator` reads during resume-check and auto-commit — keep them well-formed. On phase completion the orchestrator appends a `commits:` range field (`"<base7>.."` on the sequential path, `"<base7>..<head7>"` for parallel groups) to that phase's `phases[]` entry — a runtime field written by the orchestrator, never by the plan author; do not emit it when writing the plan. `risk_phases` is the opposite: the plan author writes it (see "## Risk Tags"), and `dev-orchestrator` routes every phase by it. The `risk_checked: true` line the orchestrator later adds after it is again orchestrator-only — never emit it.
 
 ## Required body sections
 
@@ -141,7 +142,7 @@ After the YAML frontmatter and the `# [Feature Name] Implementation Plan` title,
 2. `## Files` — paths to create/modify, grouped by phase. Each file: one-line responsibility (see "## File Structure" guidance above).
 3. `## Contracts` — function signatures, data shapes, API surface. Exact enough that the implementer can build without guessing.
 4. `## Test strategy` — what proves correctness, per phase. Test types (unit/integration/e2e), key cases, what NOT to test.
-5. `## Risks / unknowns / assumptions` — named explicitly. Anything you are guessing at.
+5. `## Risks / unknowns / assumptions` — named explicitly. Anything you are guessing at. It opens with the risk-tag lines (see "## Risk Tags" below).
 6. `## Phases` — per phase an H2 `## Ф1: <title>`, `## Ф2: <title>`, ... with the detailed TDD steps inside each (see "## Phase Structure" below).
 
 This mirrors `dev-orchestrator/opus-plan-writer-prompt.md` Mode A — the two files are the joint authority for the format. Keep them aligned when either changes.
@@ -157,7 +158,7 @@ Self-Review (see below) is a check the plan writer runs in-process while writing
 - **Right-sizing (lower bound)**: a phase is the smallest unit that carries its own test cycle and is worth a fresh reviewer's gate. When drawing phase boundaries: fold setup, configuration, scaffolding, and documentation steps into the phase whose deliverable needs them; split only where a reviewer could meaningfully reject one phase while approving its neighbor. Each phase ends with an independently testable deliverable.
 - Prefer 2–5 phases. More than 5 is a signal to split into multiple plans.
 - Put risky / blocking decisions as early as possible so later phases can assume they're settled.
-- **Backend / frontend split (required for full-stack work)**: if a candidate phase would touch BOTH backend (.py, .rs, .go, .java, server-side .ts/.js, SQL, protobuf, etc.) AND frontend (.tsx, .jsx, .vue, .svelte, .css, .scss), split it into two phases — one BE, one FE — with an explicit contract between them. Reason: `dev-orchestrator` routes BE phases to Codex and FE phases to a Claude subagent; mixed phases cannot be dispatched cleanly.
+- **Backend / frontend split (required for full-stack work)**: if a candidate phase would touch BOTH backend (.py, .rs, .go, .java, server-side .ts/.js, SQL, protobuf, etc.) AND frontend (.tsx, .jsx, .vue, .svelte, .css, .scss), split it into two phases — one BE, one FE — with an explicit contract between them. Reason: `dev-orchestrator` routes BE phases to the backend implementer (GLM via ZCode by default, Codex Sol for risk-tagged phases) and FE phases to a Claude subagent; mixed phases cannot be dispatched cleanly.
 - **Parallel groups (optional)**: mark exactly two phases with the same `parallel_group: G<n>` in the frontmatter `phases[]` ONLY when ALL of: (a) their file sets are fully disjoint; (b) neither depends on the other's *implementation* — only on contracts frozen in `## Contracts` (a BE+FE pair with an explicit contract is the canonical case); (c) each phase still commits independently. The orchestrator builds a marked group concurrently in separate git worktrees and merges afterwards — overlapping files or an implementation dependency guarantee a failed merge. When in doubt, do NOT mark: sequential is always correct.
 
 ### Per-phase layout
@@ -209,6 +210,40 @@ git commit -m "feat: <phase scope summary>"
 ```
 ````
 
+## Risk Tags
+
+`dev-orchestrator` picks each backend phase's implementer from the frontmatter `risk_phases` map, never from prose: a phase with a non-empty value runs on Codex Sol inside the Codex sandbox; a phase with `[]` normally runs on GLM, which is **not sandboxed** (it can touch any file of the user and reach the network). A tag also raises the code reviewer's effort for that phase. Follow these rules mechanically:
+
+<!-- risk-tag rules — keep byte-identical in dev-orchestrator/opus-plan-writer-prompt.md and writing-plans/SKILL.md (tests/test-pipeline-context.sh compares them) -->
+1. Write `risk_phases` as ONE line directly after the top-level `status:` line — one key per `phases[]` id, in the same order, no other keys: `risk_phases: { Ф1: [], Ф2: [DATA_LOSS], Ф3: [SECURITY, DATA_LOSS] }`.
+2. A value is exactly one of `[]`, `[SECURITY]`, `[DATA_LOSS]`, `[SECURITY, DATA_LOSS]` — upper case, nothing else. `[]` means "checked, no risk"; it is never a default you skip checking.
+3. Tag every phase, frontend phases included: walk each of its steps through the checklist below; a step that matches adds that kind.
+4. For each tag, `## Risks / unknowns / assumptions` opens with one line `- <id> — <KIND>: <the matching step and why>`, e.g. `- Ф2 — DATA_LOSS: Step 3 rewrites stored config files in place.` No phase tagged → the section's first line is literally `- Risk tags: none.` Never name `SECURITY` or `DATA_LOSS` for a phase anywhere in the plan without the tag in the map.
+5. Before returning, check: the map's keys equal the `phases[]` ids; each tag has exactly one risk-tag line and each risk-tag line has its tag.
+6. Never write a `risk_checked:` line — the orchestrator adds it after its own check.
+<!-- /risk-tag rules -->
+
+This mirrors `../dev-orchestrator/opus-plan-writer-prompt.md` Mode A "Risk tags"; the Codex plan reviewer checks the map against the same checklist (`../dev-orchestrator/codex-plan-reviewer-prompt.md`). Keep the three checklist copies byte-identical.
+
+<!-- risk-tag checklist — keep byte-identical in dev-orchestrator/opus-plan-writer-prompt.md, writing-plans/SKILL.md, dev-orchestrator/codex-plan-reviewer-prompt.md (tests/test-pipeline-context.sh compares them) -->
+**SECURITY** — the phase has a step that:
+- adds or changes authentication, authorization, sessions, tokens, or a permission check;
+- reads, stores, logs, or sends secrets, credentials, API keys, or tokens;
+- adds or changes cryptography, signing, or randomness used for security;
+- builds a shell command, SQL query, file path, URL, HTML/template, or deserialized object from input the code does not control;
+- adds or changes a listening endpoint, CORS / CSP / TLS settings, or an outbound call that carries credentials;
+- changes a sandbox, file permissions, process isolation, or the environment passed to a child process.
+
+**DATA_LOSS** — the phase has a step that:
+- deletes, overwrites, truncates, or moves persisted data (user or project files, database rows, stored state);
+- adds or changes a schema or data migration, or a stored format that existing data must still load from;
+- runs, or ships code that runs, a destructive filesystem or git operation (`rm -rf`, `git reset --hard`, `git clean`, force-push, branch deletion);
+- changes backup, retention, cleanup, or garbage-collection logic;
+- changes how writes reach storage (atomic rename, locking, transactions, write order) so that a crash or a concurrent write could lose data.
+
+Steps that touch only documentation, or only test code working inside a temporary directory the test itself creates, do not match. Unsure whether a step matches → tag it: an extra tag only moves the phase to the slower sandboxed implementer; a missing tag runs a risky phase unsandboxed.
+<!-- /risk-tag checklist -->
+
 ## No Placeholders
 
 Every step must contain the actual content an engineer needs. These are **plan failures** — never write them:
@@ -238,6 +273,8 @@ The plan writer runs this self-review inline while writing the plan — include 
 **4. Acceptance-criteria coverage:** does every phase produce something observable in the `## Acceptance criteria` list? Are `## Non-goals / deferred` entries explicit enough that a reviewer would classify a scope-expansion request as `REJECTED_BY_SCOPE`?
 
 **5. Frontmatter sanity:** YAML frontmatter present and well-formed? `phases[]` ids match the `## ФN:` H2 titles in the body? First phase `status: in-progress`, all others `status: pending`, top-level `status: in-progress`?
+
+**6. Risk tags:** walk every phase's steps through the "## Risk Tags" checklist once more. `risk_phases` sits directly after the top-level `status:` line, its keys equal the `phases[]` ids, every value is `[]`, `[SECURITY]`, `[DATA_LOSS]` or `[SECURITY, DATA_LOSS]`, and every tag has its `- <id> — <KIND>: …` line at the top of `## Risks / unknowns / assumptions` (or the line `- Risk tags: none.`). A step you are unsure about gets the tag.
 
 If you find issues, fix them inline. No need to re-review — just fix and move on. If you find a spec requirement with no phase, add the phase (and update the frontmatter `phases[]` list to match).
 

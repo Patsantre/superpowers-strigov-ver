@@ -92,6 +92,33 @@ A plan step that names a function, module, path, or CLI flag which does not exis
 
 If the frontmatter marks phases with a shared `parallel_group`, additionally verify: their `## Files` sets are fully disjoint, and neither phase uses anything from the other beyond contracts frozen in `## Contracts`. A violated parallel_group is `MUST_FIX_NOW` (`GUARANTEED_FAIL` — the phases are built concurrently in separate worktrees and merged; overlap or implementation dependency guarantees a broken merge). A group with 3+ phases is also `MUST_FIX_NOW` (orchestrator supports exactly 2).
 
+**Risk tags (`risk_phases`).** The orchestrator picks each phase's implementer from the frontmatter `risk_phases` map alone: a phase with a non-empty value runs inside the Codex sandbox, a phase with `[]` normally runs on an unsandboxed model. Check the map like a contract — every plan must carry it, even when no phase is risky. Walk every phase's steps through the checklist below, then apply these rules in order:
+
+1. `risk_phases` missing; a `phases[]` id without a key; a key that names no phase; or a value holding anything other than `SECURITY` / `DATA_LOSS` (`[]` is valid) → `MUST_FIX_NOW` (`GUARANTEED_FAIL`).
+2. A phase has a step that matches the checklist, but its value lacks that kind → `MUST_FIX_NOW` (`SECURITY` or `DATA_LOSS`); name the phase, the step, and the checklist line it matches.
+3. The plan text (`## Risks / unknowns / assumptions` or the phase itself) names `SECURITY` or `DATA_LOSS` for a phase whose value lacks that kind → `MUST_FIX_NOW` (`SECURITY` or `DATA_LOSS`).
+4. A tagged phase without its `- <id> — <KIND>: …` line at the top of `## Risks / unknowns / assumptions` → `NIT`.
+5. A phase tagged although none of its steps matches → `DEFER` (an extra tag only costs a slower implementer).
+
+<!-- risk-tag checklist — keep byte-identical in dev-orchestrator/opus-plan-writer-prompt.md, writing-plans/SKILL.md, dev-orchestrator/codex-plan-reviewer-prompt.md (tests/test-pipeline-context.sh compares them) -->
+**SECURITY** — the phase has a step that:
+- adds or changes authentication, authorization, sessions, tokens, or a permission check;
+- reads, stores, logs, or sends secrets, credentials, API keys, or tokens;
+- adds or changes cryptography, signing, or randomness used for security;
+- builds a shell command, SQL query, file path, URL, HTML/template, or deserialized object from input the code does not control;
+- adds or changes a listening endpoint, CORS / CSP / TLS settings, or an outbound call that carries credentials;
+- changes a sandbox, file permissions, process isolation, or the environment passed to a child process.
+
+**DATA_LOSS** — the phase has a step that:
+- deletes, overwrites, truncates, or moves persisted data (user or project files, database rows, stored state);
+- adds or changes a schema or data migration, or a stored format that existing data must still load from;
+- runs, or ships code that runs, a destructive filesystem or git operation (`rm -rf`, `git reset --hard`, `git clean`, force-push, branch deletion);
+- changes backup, retention, cleanup, or garbage-collection logic;
+- changes how writes reach storage (atomic rename, locking, transactions, write order) so that a crash or a concurrent write could lose data.
+
+Steps that touch only documentation, or only test code working inside a temporary directory the test itself creates, do not match. Unsure whether a step matches → tag it: an extra tag only moves the phase to the slower sandboxed implementer; a missing tag runs a risky phase unsandboxed.
+<!-- /risk-tag checklist -->
+
 **Stage B — Design hardening suggestions.** Report as `DEFER` by default. Stage B candidates include:
 
 - extra guards;
@@ -158,6 +185,8 @@ Re-read the whole plan for coherence, but your blocker authority is narrower tha
 - no direct regression introduced by the fix;
 - no stale cross-reference directly caused by the fix.
 
+Then re-run the Stage A **Risk tags** rules 1–3 on the whole plan — they are cheap and safety-relevant; a new `MUST_FIX_NOW` from them still carries its `new_blocker_materiality:` field (`GUARANTEED_FAIL`, `SECURITY` or `DATA_LOSS`). A revision that added, removed, split, or renamed a phase without updating `risk_phases`, or removed a tag without naming the ACCEPTED / PARTIALLY_ACCEPTED ledger item that removed the matching step (see the writer's `risk_phases:` line below), is `REGRESSION_FROM_AUTHORIZED_FIX` — report it once, under that class, not again under rule 1.
+
 For any NEW issue not tied to an open ledger item:
 
 - classify it as `DEFER` unless it clears the high-materiality bar — guaranteed implementation/test failure, data-loss/security risk, regression of an existing public contract, or direct contradiction of a stated user requirement / failure of a phase acceptance criterion.
@@ -169,6 +198,8 @@ For any NEW issue not tied to an open ledger item:
 ## What the writer did with your prior blocking list
 
 [For each prior BLOCKING ledger item: "Fixed in section <X>" / "Rejected — reason: ..." / "Deferred — reason: ..."]
+
+The writer's risk-tag report, verbatim: [paste the writer's output line `risk_phases: unchanged` or `risk_phases: <old line> → <new line>` with any `(removed by <ledger id>)`]
 
 Same output format as round 1 (`APPROVED` or `CHANGES_REQUESTED` on line 1; `class:` on each BLOCKING item; sections for DEFER / NIT / REJECTED_BY_SCOPE). Do not repeat blocking items the orchestrator marked `rejected` with reasoning unless you have a genuinely new argument.
 ```
