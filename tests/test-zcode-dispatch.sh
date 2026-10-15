@@ -1418,8 +1418,7 @@ process.exit(!text.includes(process.env.KEY) && rules.length === 1 && rules[0].p
     # --- 16. reboot: job records and reservations from an earlier boot are dead, never signalled ---
     # Section 15 ends with the key cleared; every task below needs one again.
     printf '%s\n' "$fake_key" | "$ZD" api-key set >/dev/null
-    # (ledger Ф2-F1-D1). ZCODE_TEST_BOOT_ID / ZCODE_TEST_BOOT_TIME inject the current boot id and boot
-    # time; a live detached `sleep` stands in for an unrelated process that reused a recorded pid, and
+    # (ledger Ф2-F1-D1). ZCODE_TEST_BOOT_ID injects the current boot id; a live detached `sleep` stands in for an unrelated process that reused a recorded pid, and
     # pid 1 for a reused root-owned pid (EPERM). Records stamped boot-a come from an earlier boot.
     export ZCODE_STUB_MODE=ok
     git init -q -b main "$TEST_ROOT/reboot"
@@ -1433,7 +1432,7 @@ process.exit(!text.includes(process.env.KEY) && rules.length === 1 && rules[0].p
     recent_iso="$(node -e 'console.log(new Date(Number(process.argv[1]) - 10000).toISOString())' "$now_ms")"
     past="2020-01-01T00:00:00.000Z"
     reboot_note="system rebooted since the job started"
-    local this_boot=(env ZCODE_TEST_BOOT_ID=boot-b) no_boot_info=(env ZCODE_TEST_BOOT_ID=unknown ZCODE_TEST_BOOT_TIME=unknown)
+    local this_boot=(env ZCODE_TEST_BOOT_ID=boot-b) no_boot_info=(env ZCODE_TEST_BOOT_ID=unknown)
 
     # Reaper: dead runner pid, live reused childPid group -> finalized without SIGKILL to that group.
     sleeper="$(spawn_sleeper)"
@@ -1456,40 +1455,42 @@ process.exit(!text.includes(process.env.KEY) && rules.length === 1 && rules[0].p
     rec="$("${this_boot[@]}" "$ZD" status zt-0002 --cwd "$rb" --json)"
     if [[ "$unknown_st" == running && "$(jfield job.status <<<"$rec")" == failed \
         && "$(jfield job.note <<<"$rec")" == "$reboot_note" ]]; then
-        pass "16 a job from an earlier boot whose runnerPid is now a root process (EPERM) is failed by the boot rule; boot id and time unknown -> pid checks only, still running"
+        pass "16 a job from an earlier boot whose runnerPid is now a root process (EPERM) is failed by the boot rule; boot id unknown -> pid checks only, still running"
     else
-        fail "16 a job from an earlier boot whose runnerPid is now a root process (EPERM) is failed by the boot rule; boot id and time unknown -> pid checks only, still running"
+        fail "16 a job from an earlier boot whose runnerPid is now a root process (EPERM) is failed by the boot rule; boot id unknown -> pid checks only, still running"
         echo "    unknown=$unknown_st rec=$(printf '%s' "$rec" | head -c 400)"
     fi
 
-    # Wall-clock step: a job of this boot whose startedAt reads older than the boot time stays on pid checks.
-    # Same with the current id unreadable: a stamped record never falls back to the time rule.
+    # A job stamped with the current boot id stays on pid checks, however old its startedAt reads (no
+    # timestamp counts as a reboot); with the current id unreadable it is unknown: pid checks, still running.
     running_record "$rb_jobs/zt-0003.json" zt-0003 "$past" "$sleeper" null boot-b
     local st_unreadable
-    st="$("${this_boot[@]}" ZCODE_TEST_BOOT_TIME="$now_ms" "$ZD" status zt-0003 --cwd "$rb" --json | jfield job.status)"
-    st_unreadable="$(env ZCODE_TEST_BOOT_ID=unknown ZCODE_TEST_BOOT_TIME="$now_ms" "$ZD" status zt-0003 --cwd "$rb" --json | jfield job.status)"
+    st="$("${this_boot[@]}" "$ZD" status zt-0003 --cwd "$rb" --json | jfield job.status)"
+    st_unreadable="$(env ZCODE_TEST_BOOT_ID=unknown "$ZD" status zt-0003 --cwd "$rb" --json | jfield job.status)"
     out="$("${this_boot[@]}" "$ZD" cancel zt-0003 --cwd "$rb")"
     if [[ "$st" == running && "$st_unreadable" == running && "$out" == "cancelled zt-0003" ]]; then
-        pass "16 a job stamped with the current boot id keeps the pid liveness check when its startedAt precedes the boot time (clock step), also while the current id is unreadable"
+        pass "16 a job stamped with the current boot id keeps the pid liveness check whatever its startedAt, also while the current id is unreadable"
     else
-        fail "16 a job stamped with the current boot id keeps the pid liveness check when its startedAt precedes the boot time (clock step), also while the current id is unreadable"
+        fail "16 a job stamped with the current boot id keeps the pid liveness check whatever its startedAt, also while the current id is unreadable"
         echo "    status=$st status(id unreadable)=$st_unreadable cancel=$out"
     fi
 
-    # Records without a boot id (written before it existed): startedAt against the boot time, with slack.
-    running_record "$rb_jobs/zt-0004.json" zt-0004 "$past" "$sleeper" "$sleeper"
-    running_record "$rb_jobs/zt-0005.json" zt-0005 "$recent_iso" "$sleeper" null
-    expect_exit 2 "16 an invalid ZCODE_TEST_BOOT_TIME is refused when a record without a boot id needs it (exit 2)" env ZCODE_TEST_BOOT_TIME=yesterday "$ZD" status --cwd "$rb"
-    local legacy_old legacy_new
-    legacy_old="$(ZCODE_TEST_BOOT_TIME="$now_ms" "$ZD" status zt-0004 --cwd "$rb" --json)"
-    legacy_new="$(ZCODE_TEST_BOOT_TIME="$now_ms" "$ZD" status zt-0005 --cwd "$rb" --json | jfield job.status)"
-    out="$("$ZD" cancel zt-0005 --cwd "$rb")"
-    if [[ "$(jfield job.status <<<"$legacy_old")" == failed && "$(jfield job.note <<<"$legacy_old")" == "$reboot_note" \
-        && "$legacy_new" == running && "$out" == "cancelled zt-0005" ]] && kill -0 "$sleeper" 2>/dev/null; then
-        pass "16 a record without a boot id: started before the boot time -> failed '$reboot_note', unsignalled; started 10 s before it (within the slack) -> pid checks"
+    # Records without a boot id (written before 0.10.2): the boot is unknown, so the pid checks decide
+    # liveness, but no stored pid is signalled — a dead runner's job is finalized without SIGKILL to its
+    # group, and cancel reports instead of sending SIGTERM.
+    running_record "$rb_jobs/zt-0004.json" zt-0004 "$past" 2147483647 "$sleeper"
+    running_record "$rb_jobs/zt-0005.json" zt-0005 "$recent_iso" "$sleeper" "$sleeper"
+    local legacy_dead legacy_live
+    legacy_dead="$("${this_boot[@]}" "$ZD" status zt-0004 --cwd "$rb" --json)"
+    legacy_live="$("${this_boot[@]}" "$ZD" status zt-0005 --cwd "$rb" --json | jfield job.status)"
+    out="$("${this_boot[@]}" "$ZD" cancel zt-0005 --cwd "$rb")"
+    if [[ "$(jfield job.status <<<"$legacy_dead")" == failed && "$(jfield job.note <<<"$legacy_dead")" == "runner died" \
+        && "$legacy_live" == running && "$out" == "cancelled zt-0005 (CLI process group $sleeper not signalled"* ]] \
+        && grep -q "CLI process group $sleeper not signalled" "$rb_jobs/zt-0004.log" && kill -0 "$sleeper" 2>/dev/null; then
+        pass "16 a record without a boot id (unknown boot): pid checks decide liveness; a dead runner's job is failed without signalling its group, and cancel reports instead of signalling"
     else
-        fail "16 a record without a boot id: started before the boot time -> failed '$reboot_note', unsignalled; started 10 s before it (within the slack) -> pid checks"
-        echo "    old=$(printf '%s' "$legacy_old" | head -c 300) new=$legacy_new cancel=$out"
+        fail "16 a record without a boot id (unknown boot): pid checks decide liveness; a dead runner's job is failed without signalling its group, and cancel reports instead of signalling"
+        echo "    dead=$(printf '%s' "$legacy_dead" | head -c 300) live=$legacy_live cancel=$out sleeper_alive=$(kill -0 "$sleeper" 2>/dev/null && echo yes || echo no)"
     fi
 
     # cancel on a job from an earlier boot: the liveness check finalizes it first; nothing is signalled.
@@ -1543,64 +1544,106 @@ process.exit(!text.includes(process.env.KEY) && rules.length === 1 && rules[0].p
         echo "    next=$rb_next_id/$rb_next_status lock_boot=$rb_lock_boot job_boot=$rb_job_boot createdAt=$rb_created"
     fi
 
-    # A reservation written before createdAt / bootId existed: the file's mtime against the boot time.
-    local rb_legacy="$rb_dir/active.lock.2" rb_legacy_rc=0 rb_legacy_out
-    printf '{"holderPid":%s,"jobId":"zt-0999","token":"legacy-holder","generation":2}\n' "$sleeper" > "$rb_legacy"
+    # A reservation written before 0.10.2 (no bootId): unknown boot, so release-stale keeps the pid checks —
+    # a live holder is refused, a dead one is released. No timestamp ever counts as a reboot.
+    local rb_legacy="$rb_dir/active.lock.2" rb_legacy_rc=0 rb_legacy_out rb_legacy_dead_rc=0 rb_legacy_dead_out legacy_holder
+    legacy_holder="$(spawn_sleeper)"
+    SLEEPERS="$SLEEPERS $legacy_holder"
+    printf '{"holderPid":%s,"jobId":"zt-0999","token":"legacy-holder","generation":2}\n' "$legacy_holder" > "$rb_legacy"
     touch -t 202001010000 "$rb_legacy"
-    rb_legacy_out="$(ZCODE_TEST_BOOT_TIME="$now_ms" "$ZD" release-stale --cwd "$rb" 2>&1)" || rb_legacy_rc=$?
-    if [[ "$rb_legacy_rc" -eq 0 && "$rb_legacy_out" == "released $rb generation 2" ]] && kill -0 "$sleeper" 2>/dev/null; then
-        pass "16 a legacy reservation without createdAt / bootId whose file predates the boot time is released by release-stale"
+    rb_legacy_out="$("${this_boot[@]}" "$ZD" release-stale --cwd "$rb" 2>&1)" || rb_legacy_rc=$?
+    kill "$legacy_holder" 2>/dev/null || true
+    gone "$legacy_holder" || true
+    rb_legacy_dead_out="$("${this_boot[@]}" "$ZD" release-stale --cwd "$rb" 2>&1)" || rb_legacy_dead_rc=$?
+    if [[ "$rb_legacy_rc" -eq 2 && "$rb_legacy_out" == *"held by live runner pid $legacy_holder"* \
+        && "$rb_legacy_dead_rc" -eq 0 && "$rb_legacy_dead_out" == "released $rb generation 2" ]]; then
+        pass "16 a reservation without a boot id keeps the pid checks: live holder refused, dead holder released (an old mtime is no evidence of a reboot)"
     else
-        fail "16 a legacy reservation without createdAt / bootId whose file predates the boot time is released by release-stale"
-        echo "    exit=$rb_legacy_rc out=$rb_legacy_out"
+        fail "16 a reservation without a boot id keeps the pid checks: live holder refused, dead holder released (an old mtime is no evidence of a reboot)"
+        echo "    live=$rb_legacy_rc/$rb_legacy_out dead=$rb_legacy_dead_rc/$rb_legacy_dead_out"
     fi
     kill "$sleeper" 2>/dev/null || true
 
-    # The hand-off to the runner replaces the generation file by rename, never truncates it in place
-    # (ledger Ф2-F2-N2 / Ф2-F4-N4): with ftruncate failing, a task still starts and completes.
+    # The hand-off to the runner replaces the generation file by rename and never opens it for writing or
+    # truncation (ledger Ф2-F2-N2 / Ф2-F4-N4). A failing rename leaves the generation file as it was and no
+    # temp file behind.
     local handoff_json handoff_id handoff_status handoff_holder handoff_runner
     handoff_json="$(ROOT="$rb" PROMPT="$prompt" MJS="$MJS" node --input-type=module -e '
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 const m = await import(pathToFileURL(process.env.MJS).href);
-let truncates = 0;
-fs.ftruncateSync = fs.truncateSync = () => {
-  truncates += 1;
-  throw Object.assign(new Error("ENOSPC: injected"), { code: "ENOSPC" });
-};
+const generation = (p) => /\/active\.lock\.\d+$/.test(String(p));
+const truncating = (flags) => typeof flags === "number" ? (flags & fs.constants.O_TRUNC) !== 0 || (flags & fs.constants.O_WRONLY) !== 0 || (flags & fs.constants.O_RDWR) !== 0 : /^[wa+]|r\+/.test(String(flags ?? "r"));
+let writesToGeneration = 0, renamesOntoGeneration = 0;
+const { openSync, writeFileSync, renameSync, truncateSync, ftruncateSync } = fs;
+fs.openSync = (p, flags, ...rest) => { if (generation(p) && truncating(flags)) writesToGeneration += 1; return openSync(p, flags, ...rest); };
+fs.writeFileSync = (p, ...rest) => { if (generation(p)) writesToGeneration += 1; return writeFileSync(p, ...rest); };
+fs.truncateSync = (p, ...rest) => { if (generation(p)) writesToGeneration += 1; return truncateSync(p, ...rest); };
+fs.ftruncateSync = () => { writesToGeneration += 1; throw Object.assign(new Error("ENOSPC: injected"), { code: "ENOSPC" }); };
+fs.renameSync = (from, to) => { if (generation(to)) renamesOntoGeneration += 1; return renameSync(from, to); };
 let out = "";
 const stdout = process.stdout.write;
 process.stdout.write = (chunk) => { out += chunk.toString(); return true; };
 const rc = await m.main(["task", "--background", "--cwd", process.env.ROOT, "--prompt-file", process.env.PROMPT]);
 process.stdout.write = stdout;
-process.stdout.write(JSON.stringify({ rc, truncates, out }) + "\n");')"
+process.stdout.write(JSON.stringify({ rc, writesToGeneration, renamesOntoGeneration, out }) + "\n");')"
     handoff_id="$(jfield out <<<"$handoff_json" 2>/dev/null || true)"
     handoff_id="${handoff_id##* }"
     handoff_status="$(wait_status "$handoff_id" 'completed|failed|cancelled' 20 --cwd "$rb")"
     handoff_holder="$( { jfield holderPid < "$rb_dir/active.lock.3"; } 2>/dev/null || true)"
     handoff_runner="$("$ZD" status "$handoff_id" --cwd "$rb" --json 2>/dev/null | jfield job.runnerPid 2>/dev/null || true)"
-    if [[ "$(jfield rc <<<"$handoff_json")" == 0 && "$(jfield truncates <<<"$handoff_json")" == 0 \
+    if [[ "$(jfield rc <<<"$handoff_json")" == 0 && "$(jfield writesToGeneration <<<"$handoff_json")" == 0 && "$(jfield renamesOntoGeneration <<<"$handoff_json")" -ge 1 \
         && "$handoff_status" == completed && -n "$handoff_runner" && "$handoff_holder" == "$handoff_runner" ]] \
         && ! compgen -G "$rb_dir/active.lock.*.tmp-*" >/dev/null; then
-        pass "16 the reservation hand-off writes a temp file and renames it (no in-place truncate, no temp file left); the runner holds the new generation"
+        pass "16 the reservation hand-off replaces the generation file by rename (never opened for writing or truncated, no temp file left); the runner holds the new generation"
     else
-        fail "16 the reservation hand-off writes a temp file and renames it (no in-place truncate, no temp file left); the runner holds the new generation"
+        fail "16 the reservation hand-off replaces the generation file by rename (never opened for writing or truncated, no temp file left); the runner holds the new generation"
         echo "    result=$handoff_json status=$handoff_status holder=$handoff_holder runner=$handoff_runner"
         command ls "$rb_dir" | sed 's/^/    /'
     fi
+    local fail_json fail_gen fail_before fail_after
+    fail_json="$(ROOT="$rb" PROMPT="$prompt" MJS="$MJS" RBDIR="$rb_dir" node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+const m = await import(pathToFileURL(process.env.MJS).href);
+const { renameSync } = fs;
+let snapshot = null, target = null;
+fs.renameSync = (from, to) => {
+  if (/\/active\.lock\.\d+$/.test(String(to)) && /\.tmp-/.test(String(from))) {
+    target = to;
+    snapshot = fs.readFileSync(to, "utf8");
+    throw Object.assign(new Error("EIO: injected rename failure"), { code: "EIO" });
+  }
+  return renameSync(from, to);
+};
+let err = "";
+const stderr = process.stderr.write;
+process.stderr.write = (chunk) => { err += chunk.toString(); return true; };
+const rc = await m.main(["task", "--background", "--cwd", process.env.ROOT, "--prompt-file", process.env.PROMPT]);
+process.stderr.write = stderr;
+const after = target ? fs.readFileSync(target, "utf8") : null;
+const temps = fs.readdirSync(process.env.RBDIR).filter((n) => /active\.lock\.\d+\.tmp-/.test(n));
+process.stdout.write(JSON.stringify({ rc, injected: target !== null, intact: snapshot !== null && after === snapshot, temps: temps.length, err: err.slice(0, 200) }) + "\n");')"
+    "$ZD" status --cwd "$rb" >/dev/null 2>&1 || true
+    if [[ "$(jfield rc <<<"$fail_json")" == 1 && "$(jfield injected <<<"$fail_json")" == true && "$(jfield intact <<<"$fail_json")" == true && "$(jfield temps <<<"$fail_json")" == 0 ]]; then
+        pass "16 a failing hand-off rename leaves the generation file intact and no temp file behind; task exits 1"
+    else
+        fail "16 a failing hand-off rename leaves the generation file intact and no temp file behind; task exits 1"
+        echo "    result=$fail_json"
+    fi
 
-    # Reservation side of the clock step: stamped with the current boot id, createdAt older than the
-    # boot time, holder alive -> still held.
-    local same_boot_sleeper same_boot_out same_boot_rc=0 rb_same="$rb_dir/active.lock.4"
+    # Reservation side: stamped with the current boot id, an old createdAt, holder alive -> still held.
+    local same_boot_sleeper same_boot_out same_boot_rc=0 rb_same="$rb_dir/active.lock.9"
     same_boot_sleeper="$(spawn_sleeper)"
     SLEEPERS="$SLEEPERS $same_boot_sleeper"
-    printf '{"holderPid":%s,"jobId":"zt-0998","token":"same-boot-holder","generation":4,"createdAt":"%s","bootId":"boot-b"}\n' "$same_boot_sleeper" "$past" > "$rb_same"
-    same_boot_out="$("${this_boot[@]}" ZCODE_TEST_BOOT_TIME="$now_ms" "$ZD" release-stale --cwd "$rb" 2>&1)" || same_boot_rc=$?
+    printf '{"holderPid":%s,"jobId":"zt-0998","token":"same-boot-holder","generation":9,"createdAt":"%s","bootId":"boot-b"}\n' "$same_boot_sleeper" "$past" > "$rb_same"
+    same_boot_out="$("${this_boot[@]}" "$ZD" release-stale --cwd "$rb" 2>&1)" || same_boot_rc=$?
     kill "$same_boot_sleeper" 2>/dev/null || true
     if [[ "$same_boot_rc" -eq 2 && "$same_boot_out" == *"held by live runner pid $same_boot_sleeper"* && ! -e "$rb_same.released" ]]; then
-        pass "16 release-stale still sees the live holder of a reservation stamped with the current boot id whose createdAt precedes the boot time"
+        pass "16 release-stale still sees the live holder of a reservation stamped with the current boot id, whatever its createdAt"
     else
-        fail "16 release-stale still sees the live holder of a reservation stamped with the current boot id whose createdAt precedes the boot time"
+        fail "16 release-stale still sees the live holder of a reservation stamped with the current boot id, whatever its createdAt"
         echo "    exit=$same_boot_rc out=$same_boot_out"
     fi
 
