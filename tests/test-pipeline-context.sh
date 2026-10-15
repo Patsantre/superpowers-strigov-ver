@@ -2,7 +2,8 @@
 # Tests for manual-only invocation: bin/pipeline-context (the SessionStart hook
 # that surfaces an in-progress pipeline plan and re-read hints after
 # compaction), plus static checks that every pipeline skill is manual-only and
-# carries the loading header, while the discipline skills stay model-invocable.
+# carries the loading header, while the discipline skills stay model-invocable,
+# and that the plan-format docs agree on the writer-emitted risk_phases tags.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -134,6 +135,21 @@ main() {
         ".claude/plans/next.md — next phase: Ф2"
     rm "$repo/.claude/plans/next.md"
 
+    write_plan "$repo/docs/plans/risk.md" in-progress done in-progress
+    sed -i.bak 's/^status: in-progress .*$/&\
+risk_phases: { Ф1: [], "Ф2": [SECURITY, DATA_LOSS] }   # one key per phases[] id/' \
+        "$repo/docs/plans/risk.md" && rm "$repo/docs/plans/risk.md.bak"
+    sed -i.bak 's/^risk_phases: .*$/&\
+risk_checked: true/' "$repo/docs/plans/risk.md" && rm "$repo/docs/plans/risk.md.bak"
+    if [[ "$(sed -n 5,6p "$repo/docs/plans/risk.md")" == "risk_phases: "*$'\n'"risk_checked: true" ]]; then
+        pass "fixture carries risk_phases + risk_checked right after status"
+    else
+        fail "fixture carries risk_phases + risk_checked right after status"
+    fi
+    expect_contains "plan with risk_phases + risk_checked lines is parsed" "$(run_hook "$repo")" \
+        "risk.md — current phase: Ф2"
+    rm "$repo/docs/plans/risk.md"
+
     write_plan "$repo/docs/plans/crlf.md" in-progress in-progress pending
     sed -i.bak 's/$/\r/' "$repo/docs/plans/crlf.md" && rm "$repo/docs/plans/crlf.md.bak"
     expect_contains "CRLF plan file is parsed" "$(run_hook "$repo")" "crlf.md — current phase: Ф1"
@@ -234,6 +250,56 @@ main() {
     else
         fail "/dev loads dev-orchestrator by Read, not the Skill tool"
     fi
+
+    # --- static: writer-emitted risk tags agree across the plan-format docs ---
+    local writer="$REPO_ROOT/skills/dev-orchestrator/opus-plan-writer-prompt.md"
+    local reviewer="$REPO_ROOT/skills/dev-orchestrator/codex-plan-reviewer-prompt.md"
+    local plans="$REPO_ROOT/skills/writing-plans/SKILL.md"
+    local orchestrator="$REPO_ROOT/skills/dev-orchestrator/SKILL.md"
+    local reference="" block count
+    for f in "$writer" "$plans" "$reviewer"; do
+        count="$(grep -c '^<!-- risk-tag checklist' "$f" || true)"
+        block="$(awk '/^<!-- risk-tag checklist/{on=1} on{print} /^<!-- \/risk-tag checklist -->$/{on=0}' "$f")"
+        if [[ "$count" -ne 1 || "$block" != *"<!-- /risk-tag checklist -->" ]]; then
+            fail "exactly one closed risk-tag checklist in ${f#$REPO_ROOT/}"
+            continue
+        fi
+        pass "exactly one closed risk-tag checklist in ${f#$REPO_ROOT/}"
+        if [[ -z "$reference" ]]; then
+            reference="$block"
+        elif [[ "$block" == "$reference" ]]; then
+            pass "risk-tag checklist in ${f#$REPO_ROOT/} matches the writer prompt"
+        else
+            fail "risk-tag checklist in ${f#$REPO_ROOT/} matches the writer prompt"
+            diff <(printf '%s\n' "$reference") <(printf '%s\n' "$block") | sed 's/^/    /' || true
+        fi
+    done
+    # The writer rules are copied between the writer prompt and writing-plans only.
+    local rules=()
+    for f in "$writer" "$plans"; do
+        count="$(grep -c '^<!-- risk-tag rules' "$f" || true)"
+        block="$(awk '/^<!-- risk-tag rules/{on=1} on{print} /^<!-- \/risk-tag rules -->$/{on=0}' "$f")"
+        if [[ "$count" -eq 1 && "$block" == *"<!-- /risk-tag rules -->" ]]; then
+            rules+=("$block")
+        else
+            fail "exactly one closed risk-tag rules block in ${f#$REPO_ROOT/}"
+        fi
+    done
+    if [[ "${#rules[@]}" -eq 2 && "${rules[0]}" == "${rules[1]}" ]]; then
+        pass "risk-tag rules match between the writer prompt and writing-plans"
+    else
+        fail "risk-tag rules match between the writer prompt and writing-plans"
+        [[ "${#rules[@]}" -eq 2 ]] && { diff <(printf '%s\n' "${rules[0]}") <(printf '%s\n' "${rules[1]}") | sed 's/^/    /' || true; }
+    fi
+    for f in "$writer" "$plans" "$orchestrator"; do
+        # Plan templates: the line after `status: in-progress  # ...` is risk_phases.
+        if awk '/^status: in-progress  +# in-progress [|] done [|] abandoned$/ { getline nxt; if (nxt ~ /^risk_phases: \{ .* \}/) ok = 1 }
+                END { exit !ok }' "$f"; then
+            pass "plan template in ${f#$REPO_ROOT/} puts risk_phases right after status"
+        else
+            fail "plan template in ${f#$REPO_ROOT/} puts risk_phases right after status"
+        fi
+    done
 
     echo ""
     if [[ "$FAILURES" -ne 0 ]]; then

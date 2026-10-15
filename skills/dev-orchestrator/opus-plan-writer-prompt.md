@@ -64,6 +64,7 @@ YAML frontmatter + markdown body:
 slug: <short-kebab-slug>
 created: YYYY-MM-DD
 status: in-progress          # in-progress | done | abandoned
+risk_phases: { Ф1: [], Ф2: [], Ф3: [] }   # one key per phases[] id — see "Risk tags"
 phases:
   - id: Ф1
     scope: "<one-line>"
@@ -88,7 +89,7 @@ Body must have these H2 sections, in order:
 2. `## Files` — paths to create/modify, grouped by phase. Each file: one-line responsibility.
 3. `## Contracts` — function signatures, data shapes, API surface. Exact enough that the implementer can build without guessing.
 4. `## Test strategy` — what proves correctness, per phase. Test types (unit/integration/e2e), key cases, what NOT to test.
-5. `## Risks / unknowns / assumptions` — named explicitly. Anything you are guessing at.
+5. `## Risks / unknowns / assumptions` — named explicitly. Anything you are guessing at. It opens with the risk-tag lines (see "Risk tags" below).
 6. `## Phases` — per phase an H2 `## Ф1: <title>`, `## Ф2: <title>`, ... with the detailed steps inside each.
 
 For sections 1a, 1b, and 1c, use this template body verbatim (replace bullets with the plan's actual content):
@@ -122,8 +123,40 @@ The `**Interfaces:**` block is mandatory in EVERY phase — an empty side is wri
 - **Right-sizing (lower bound)**: a phase is the smallest unit that carries its own test cycle and is worth a fresh reviewer's gate. When drawing phase boundaries: fold setup, configuration, scaffolding, and documentation steps into the phase whose deliverable needs them; split only where a reviewer could meaningfully reject one phase while approving its neighbor. Each phase ends with an independently testable deliverable.
 - Prefer 2–5 phases. More than 5 is a signal to split into multiple plans.
 - Put risky / blocking decisions as early as possible so later phases can assume they're settled.
-- **Backend / frontend split (required for full-stack work)**: if a candidate phase would touch BOTH backend (.py, .rs, .go, .java, server-side .ts/.js, SQL, protobuf, etc.) AND frontend (.tsx, .jsx, .vue, .svelte, .css, .scss), split it into two phases — one BE, one FE — with an explicit contract between them (API endpoint shape, request/response schema, event names, data types). Reason: the orchestrator routes BE phases to Codex and FE phases to a Claude subagent; mixed phases cannot be dispatched cleanly.
+- **Backend / frontend split (required for full-stack work)**: if a candidate phase would touch BOTH backend (.py, .rs, .go, .java, server-side .ts/.js, SQL, protobuf, etc.) AND frontend (.tsx, .jsx, .vue, .svelte, .css, .scss), split it into two phases — one BE, one FE — with an explicit contract between them (API endpoint shape, request/response schema, event names, data types). Reason: the orchestrator routes BE phases to the backend implementer (GLM via ZCode by default, Codex Sol for risk-tagged phases) and FE phases to a Claude subagent; mixed phases cannot be dispatched cleanly.
 - **Parallel groups (optional)**: mark exactly two phases with the same `parallel_group: G<n>` in the frontmatter `phases[]` ONLY when ALL of: (a) their file sets are fully disjoint; (b) neither depends on the other's *implementation* — only on contracts frozen in `## Contracts` (a BE+FE pair with an explicit contract is the canonical case); (c) each phase still commits independently. The orchestrator builds a marked group concurrently in separate git worktrees and merges afterwards — overlapping files or an implementation dependency guarantee a failed merge. When in doubt, do NOT mark: sequential is always correct.
+
+## Risk tags (`risk_phases`) — required in every plan
+
+The orchestrator picks each backend phase's implementer from the frontmatter `risk_phases` map, never from prose: a phase with a non-empty value runs on Codex Sol inside the Codex sandbox; a phase with `[]` normally runs on GLM, which is **not sandboxed** (it can touch any file of the user and reach the network). A tag also raises the code reviewer's effort for that phase. Follow these rules mechanically:
+
+<!-- risk-tag rules — keep byte-identical in dev-orchestrator/opus-plan-writer-prompt.md and writing-plans/SKILL.md (tests/test-pipeline-context.sh compares them) -->
+1. Write `risk_phases` as ONE line directly after the top-level `status:` line — one key per `phases[]` id, in the same order, no other keys: `risk_phases: { Ф1: [], Ф2: [DATA_LOSS], Ф3: [SECURITY, DATA_LOSS] }`.
+2. A value is exactly one of `[]`, `[SECURITY]`, `[DATA_LOSS]`, `[SECURITY, DATA_LOSS]` — upper case, nothing else. `[]` means "checked, no risk"; it is never a default you skip checking.
+3. Tag every phase, frontend phases included: walk each of its steps through the checklist below; a step that matches adds that kind.
+4. For each tag, `## Risks / unknowns / assumptions` opens with one line `- <id> — <KIND>: <the matching step and why>`, e.g. `- Ф2 — DATA_LOSS: Step 3 rewrites stored config files in place.` No phase tagged → the section's first line is literally `- Risk tags: none.` Never name `SECURITY` or `DATA_LOSS` for a phase anywhere in the plan without the tag in the map.
+5. Before returning, check: the map's keys equal the `phases[]` ids; each tag has exactly one risk-tag line and each risk-tag line has its tag.
+6. Never write a `risk_checked:` line — the orchestrator adds it after its own check.
+<!-- /risk-tag rules -->
+
+<!-- risk-tag checklist — keep byte-identical in dev-orchestrator/opus-plan-writer-prompt.md, writing-plans/SKILL.md, dev-orchestrator/codex-plan-reviewer-prompt.md (tests/test-pipeline-context.sh compares them) -->
+**SECURITY** — the phase has a step that:
+- adds or changes authentication, authorization, sessions, tokens, or a permission check;
+- reads, stores, logs, or sends secrets, credentials, API keys, or tokens;
+- adds or changes cryptography, signing, or randomness used for security;
+- builds a shell command, SQL query, file path, URL, HTML/template, or deserialized object from input the code does not control;
+- adds or changes a listening endpoint, CORS / CSP / TLS settings, or an outbound call that carries credentials;
+- changes a sandbox, file permissions, process isolation, or the environment passed to a child process.
+
+**DATA_LOSS** — the phase has a step that:
+- deletes, overwrites, truncates, or moves persisted data (user or project files, database rows, stored state);
+- adds or changes a schema or data migration, or a stored format that existing data must still load from;
+- runs, or ships code that runs, a destructive filesystem or git operation (`rm -rf`, `git reset --hard`, `git clean`, force-push, branch deletion);
+- changes backup, retention, cleanup, or garbage-collection logic;
+- changes how writes reach storage (atomic rename, locking, transactions, write order) so that a crash or a concurrent write could lose data.
+
+Steps that touch only documentation, or only test code working inside a temporary directory the test itself creates, do not match. Unsure whether a step matches → tag it: an extra tag only moves the phase to the slower sandboxed implementer; a missing tag runs a risky phase unsandboxed.
+<!-- /risk-tag checklist -->
 
 ## Discipline
 
@@ -201,6 +234,17 @@ so the orchestrator can extend the ledger before you continue.
 
 Preserve the existing frontmatter structure; update only what this revision actually changes.
 
+## Risk tags stay current (bookkeeping — needs no ledger item)
+
+The frontmatter `risk_phases` map decides which implementer runs each phase (a tagged phase runs sandboxed; an untagged one normally does not). After your edits:
+
+1. `risk_phases` has exactly one key per `phases[]` id, in the same order, no other keys — add keys for new ids, drop keys of removed ids, rename keys of renamed ids. A plan without the key gets it now, as ONE line directly after the top-level `status:` line, and then rules 2–3 apply to every phase, not only the ones you touched.
+2. For every phase you created, split, renamed, or changed: its value follows the risk-tag checklist below, and `## Risks / unknowns / assumptions` has one line `- <id> — <KIND>: <the matching step and why>` per tag (`- Risk tags: none.` when no phase is tagged). A phase split from a tagged phase starts with its parent's tags.
+3. Never remove a tag unless the step that matched was removed by an ACCEPTED / PARTIALLY_ACCEPTED ledger item — name that ledger id in your output line 5. Adding a tag is always allowed, and a ledger item that asks you to add a tag is never `rejected` — apply it.
+4. If the frontmatter has a `risk_checked:` line, delete it. It is the orchestrator's record that it checked the map; your revision voids that check, and the orchestrator re-runs it.
+
+<paste the risk-tag checklist from Mode A "Risk tags" verbatim, between and including its two HTML comment lines>
+
 ## Output
 
 Return to the orchestrator:
@@ -210,5 +254,6 @@ Return to the orchestrator:
    `<id>: fixed | rejected | already_fixed | needs_authorization — <one-line note + sections_changed list>`
 3. `no_nits_applied: true|false` (MUST be `true` unless the orchestrator explicitly authorized a NIT in the ledger).
 4. `deferred_observations: [<unrelated issue you noticed but did NOT edit>, ...]` — empty list if none.
-5. One-sentence summary of the revision shape (e.g., "fixed Ф2 contract gap; deferred two cosmetic observations").
+5. `risk_phases: unchanged` or `risk_phases: <old line> → <new line>`, followed by `(removed by <ledger id>)` for every removed tag.
+6. One-sentence summary of the revision shape (e.g., "fixed Ф2 contract gap; deferred two cosmetic observations").
 ```
