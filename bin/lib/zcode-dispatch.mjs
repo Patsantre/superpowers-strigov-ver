@@ -95,6 +95,8 @@ const TIMEOUT_KILL_GRACE_MS = 10_000;
 const CANCEL_GRACE_MS = 5_000;
 const CLOSE_WAIT_MS = 5_000;
 const STARTUP_GRACE_MS = 60_000;
+const BOOT_SLACK_MS = 30_000;
+const REBOOT_NOTE = "system rebooted since the job started";
 const DEFAULT_TIMEOUT_MIN = 60;
 const ID_RE = /^zt-\d{4,}$/;
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
@@ -558,8 +560,9 @@ function isAlive(pid) {
   }
 }
 
+// pid 1 is never a CLI process group, and kill(-1) would signal every process of the user.
 function groupAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (!Number.isInteger(pid) || pid <= 1) return false;
   try {
     process.kill(-pid, 0);
     return true;
@@ -569,7 +572,7 @@ function groupAlive(pid) {
 }
 
 function killGroup(pid, signal) {
-  if (!Number.isInteger(pid) || pid <= 0) return;
+  if (!Number.isInteger(pid) || pid <= 1) return;
   try {
     process.kill(-pid, signal);
   } catch {
@@ -578,6 +581,100 @@ function killGroup(pid, signal) {
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ---------- boot identity: pids recorded in an earlier boot belong to nobody of ours ----------
+// After a reboot the runnerPid / childPid / holderPid in the state files may name unrelated
+// processes (EPERM for another user's process reads as alive), so a record or reservation from
+// an earlier boot is dead without any pid check and is never signalled. Job records and
+// reservations store the boot id they were written in (kern.bootsessionuuid on macOS,
+// /proc/sys/kernel/random/boot_id on Linux); a differing id is an earlier boot, immune to
+// wall-clock steps. State without a boot id (written before this field existed) falls back to
+// its time against the boot time, which follows wall-clock steps (NTP at boot, sleep/wake
+// resync) — BOOT_SLACK_MS keeps a job started right after the boot from looking older than it.
+// Nothing comparable (id unreadable now, or no boot time) → pid checks only.
+// Tests only: ZCODE_TEST_BOOT_ID (a boot id, or "unknown"), ZCODE_TEST_BOOT_TIME (epoch
+// milliseconds, or "unknown").
+let currentBootId;
+let bootTime;
+
+function readBootId() {
+  if (process.platform === "darwin") {
+    const r = spawnSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], { encoding: "utf8" });
+    const id = r.stdout?.trim();
+    if (!r.error && r.status === 0 && id) return id;
+  } else if (process.platform === "linux") {
+    try {
+      const id = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      if (id) return id;
+    } catch {
+      // no boot id: the time rule applies
+    }
+  }
+  return null;
+}
+
+function bootId() {
+  if (currentBootId !== undefined) return currentBootId;
+  const override = process.env.ZCODE_TEST_BOOT_ID;
+  if (override === undefined || override === "") currentBootId = readBootId();
+  else currentBootId = override === "unknown" ? null : override;
+  return currentBootId;
+}
+
+function readBootTimeMs() {
+  if (process.platform === "darwin") {
+    const r = spawnSync("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8" });
+    const match = /\bsec = (\d+), usec = (\d+)/.exec(r.stdout ?? "");
+    if (!r.error && r.status === 0 && match) return Number(match[1]) * 1000 + Math.floor(Number(match[2]) / 1000);
+  } else if (process.platform === "linux") {
+    try {
+      const match = /^btime (\d+)$/m.exec(fs.readFileSync("/proc/stat", "utf8"));
+      if (match) return Number(match[1]) * 1000;
+    } catch {
+      // fall through to the uptime estimate
+    }
+  }
+  const uptime = os.uptime();
+  return Number.isFinite(uptime) && uptime > 0 ? Date.now() - uptime * 1000 : null;
+}
+
+function bootTimeMs() {
+  if (bootTime !== undefined) return bootTime;
+  const override = process.env.ZCODE_TEST_BOOT_TIME;
+  if (override === undefined || override === "") bootTime = readBootTimeMs();
+  else if (override === "unknown") bootTime = null;
+  else if (/^\d+$/.test(override)) bootTime = Number(override);
+  else throw new UsageError(`ZCODE_TEST_BOOT_TIME must be epoch milliseconds or "unknown", got "${override}"`);
+  return bootTime;
+}
+
+// True when state stamped with boot id `storedId` at time `ms` belongs to an earlier boot.
+// Stamped state whose id cannot be compared now (current id unreadable) keeps the pid checks:
+// the time rule would bring back the clock-step false positive the ids avoid.
+function fromEarlierBoot(storedId, ms) {
+  if (typeof storedId === "string" && storedId !== "") {
+    const current = bootId();
+    return current !== null && storedId !== current;
+  }
+  const boot = bootTimeMs();
+  return boot !== null && Number.isFinite(ms) && ms < boot - BOOT_SLACK_MS;
+}
+
+const recordFromEarlierBoot = (record) => fromEarlierBoot(record?.bootId, Date.parse(record?.startedAt));
+
+// A reservation's holder start time is its createdAt, or the file's mtime for one written before
+// createdAt existed (the hand-off rewrite happens in the same boot as the runner).
+function reservationFromEarlierBoot(file, record) {
+  let ms = Date.parse(record?.createdAt);
+  if (!Number.isFinite(ms)) {
+    try {
+      ms = fs.statSync(file).mtimeMs;
+    } catch {
+      ms = NaN;
+    }
+  }
+  return fromEarlierBoot(record?.bootId, ms);
+}
 
 const reservationBase = (jobsDir) => path.join(path.dirname(jobsDir), "active.lock");
 const reservationFile = (jobsDir, generation) => `${reservationBase(jobsDir)}.${generation}`;
@@ -632,15 +729,17 @@ function refuseUnavailableReservation(jobsDir, workspaceRoot) {
     reservationGuard(record);
   }
   if (readJson(`${file}.released`)?.token === record.token) return;
-  if (isAlive(record.holderPid)) reservationGuard(record);
+  const rebooted = reservationFromEarlierBoot(file, record);
+  if (!rebooted && isAlive(record.holderPid)) reservationGuard(record);
+  const reason = rebooted ? "the system rebooted since it was taken" : `runner pid ${record.holderPid} is not alive`;
   throw new UsageError(
-    `workspace reservation generation ${generation} is stale (runner pid ${record.holderPid} is not alive); run zcode-dispatch release-stale --cwd ${JSON.stringify(workspaceRoot)}`,
+    `workspace reservation generation ${generation} is stale (${reason}); run zcode-dispatch release-stale --cwd ${JSON.stringify(workspaceRoot)}`,
   );
 }
 
 function createReservation(file, reservation) {
   const temp = `${file}.tmp-${process.pid}-${randomUUID()}`;
-  fs.writeFileSync(temp, `${JSON.stringify(reservation)}\n`, { flag: "wx", mode: 0o600 });
+  fs.writeFileSync(temp, `${JSON.stringify(reservation)}\n`, { flag: "wx", mode: 0o600, flush: true });
   try {
     fs.linkSync(temp, file);
     return true;
@@ -652,27 +751,19 @@ function createReservation(file, reservation) {
   }
 }
 
+// Hands the reservation to the runner. The task process is the only writer of its generation
+// file, so a temp file renamed over it replaces it atomically: a process crash or ENOSPC never
+// leaves the highest generation empty or half-written, and the temp file is flushed before the
+// rename (as in createReservation) against an empty file after a power loss.
 function updateReservation(file, token, holderPid) {
-  let fd;
+  const current = readJson(file);
+  if (current?.token !== token) return false;
+  const temp = `${file}.tmp-${process.pid}-${randomUUID()}`;
   try {
-    fd = fs.openSync(file, "r+");
-  } catch (error) {
-    if (error.code === "ENOENT") return false;
-    throw error;
-  }
-  try {
-    let current;
-    try {
-      current = JSON.parse(fs.readFileSync(fd, "utf8"));
-    } catch {
-      return false;
-    }
-    if (current.token !== token) return false;
-    const contents = Buffer.from(`${JSON.stringify({ ...current, holderPid })}\n`);
-    fs.ftruncateSync(fd, 0);
-    fs.writeSync(fd, contents, 0, contents.length, 0);
+    fs.writeFileSync(temp, `${JSON.stringify({ ...current, holderPid })}\n`, { flag: "wx", mode: 0o600, flush: true });
+    fs.renameSync(temp, file);
   } finally {
-    fs.closeSync(fd);
+    fs.rmSync(temp, { force: true });
   }
   const updated = readJson(file);
   return updated?.token === token && updated.holderPid === holderPid;
@@ -692,7 +783,7 @@ function acquireReservation(jobsDir, jobId, workspaceRoot) {
     if (current) refuseUnavailableReservation(jobsDir, workspaceRoot);
 
     const file = reservationFile(jobsDir, generation);
-    const reservation = { holderPid: process.pid, jobId, token: randomUUID(), generation };
+    const reservation = { holderPid: process.pid, jobId, token: randomUUID(), generation, createdAt: new Date().toISOString(), bootId: bootId() };
     if (createReservation(file, reservation)) return { file, token: reservation.token };
     // Another task created this generation. Re-read the highest generation before deciding.
   }
@@ -711,12 +802,15 @@ function cmdReleaseStale(args) {
   if (readJson(`${file}.released`)?.token === record.token) {
     throw new UsageError(`workspace reservation generation ${generation} is already released`);
   }
-  if (isAlive(record.holderPid)) {
+  // Taken in an earlier boot: its holder and the job's CLI are gone whatever their pids show now.
+  const rebooted = reservationFromEarlierBoot(file, record);
+  if (!rebooted && isAlive(record.holderPid)) {
     throw new UsageError(`workspace reservation generation ${generation} is held by live runner pid ${record.holderPid}`);
   }
 
   const job = ID_RE.test(record.jobId ?? "") ? readRecord(jobFile(ws.jobsDir, record.jobId)) : null;
-  if (job?.childPid && groupAlive(job.childPid)) {
+  const jobRebooted = rebooted || (job !== null && recordFromEarlierBoot(job));
+  if (!jobRebooted && job?.childPid && groupAlive(job.childPid)) {
     throw new UsageError(`workspace reservation generation ${generation} still has live CLI process group ${job.childPid}`);
   }
 
@@ -732,7 +826,7 @@ function cmdReleaseStale(args) {
     finalizeRecord(jobFile(ws.jobsDir, record.jobId), {
       status: "failed",
       errorClass: "crash",
-      note: "stale reservation released",
+      note: jobRebooted ? REBOOT_NOTE : "stale reservation released",
     });
   }
   if (!createReservation(`${file}.released`, { holderPid: process.pid, token: record.token })) {
@@ -758,6 +852,12 @@ function reapDeadRunners(jobsDir) {
   for (const record of listRecords(jobsDir)) {
     if (record.status !== "running") continue;
     const file = jobFile(jobsDir, record.id);
+    if (recordFromEarlierBoot(record)) {
+      // Its runnerPid / childPid may now be unrelated processes: finalize without any signal.
+      const after = finalizeRecord(file, { status: "failed", errorClass: "crash", note: REBOOT_NOTE });
+      if (after?.note === REBOOT_NOTE) appendLog(logFile(jobsDir, record.id), `${REBOOT_NOTE}; liveness check marked the job failed/crash, no process signalled`);
+      continue;
+    }
     if (record.runnerPid == null) {
       if (Date.now() - Date.parse(record.startedAt) > STARTUP_GRACE_MS) {
         finalizeRecord(file, { status: "failed", errorClass: "crash", note: "runner never started" });
@@ -1057,6 +1157,7 @@ async function cmdTask(args) {
       runnerPid: null,
       childPid: null,
       startedAt: new Date().toISOString(),
+      bootId: bootId(),
       finishedAt: null,
       exitCode: null,
       signal: null,
@@ -1232,7 +1333,7 @@ function cmdResult(args) {
 async function cmdCancel(args) {
   const { values, positionals } = parse(args, { cwd: { type: "string" } }, 1, 1);
   const ws = requireWorkspace(values.cwd);
-  reapDeadRunners(ws.jobsDir);
+  reapDeadRunners(ws.jobsDir); // finalizes a job from an earlier boot, so its pids are never signalled below
   const record = requireJob(ws.jobsDir, positionals[0]);
   const file = jobFile(ws.jobsDir, record.id);
   // The cancelled record is written first, so a runner finishing meanwhile cannot overwrite it.
