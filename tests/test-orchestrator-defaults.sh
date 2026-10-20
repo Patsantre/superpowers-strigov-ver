@@ -109,6 +109,40 @@ expect_row() {
     fi
 }
 
+# expect_new <file> <needle> <description> — a rule written after df96a8a to
+# keep the no-config behaviour of df96a8a (no self-check against the base).
+expect_new() {
+    local file=$1 needle=$2 desc=$3
+    if [[ "$(current "$file")" == *"$needle"* ]]; then
+        pass "$desc"
+    else
+        fail "$desc — missing from $file: $needle"
+    fi
+}
+
+# expect_new_count <file> <needle> <n> <description> — exactly <n> occurrences
+# of a rule written after df96a8a.
+expect_new_count() {
+    local file=$1 needle=$2 want=$3 desc=$4 n
+    n="$(count_of "$(current "$file")" "$needle")"
+    if (( n == want )); then
+        pass "$desc ($n == $want)"
+    else
+        fail "$desc — $file has $n occurrence(s) of $needle, expected exactly $want"
+    fi
+}
+
+# expect_absent <file> <needle> <description> — a wording that changed the
+# no-config pipeline must not come back.
+expect_absent() {
+    local file=$1 needle=$2 desc=$3
+    if [[ "$(current "$file")" == *"$needle"* ]]; then
+        fail "$desc — $file still contains: $needle"
+    else
+        pass "$desc"
+    fi
+}
+
 echo "Model split — every role keeps its built-in model and effort"
 expect_row 'Main thread (orchestrator)' 'all' 'Sonnet · `medium` (intended default — the rules hold whatever model the user runs)'
 expect_row 'Plan writer' '1' 'Claude `opus` · `xhigh`'
@@ -217,6 +251,101 @@ expect_text skills/brainstorming/SKILL.md '`--model gpt-6-astra --effort xhigh`'
 expect_text skills/writing-plans/SKILL.md '--model gpt-6-astra --effort xhigh' 'writing-plans: Astra xhigh flags'
 expect_text skills/requesting-code-review/SKILL.md '`--model gpt-6-astra --effort high`, no `--write`' 'requesting-code-review: Astra high flags'
 expect_text skills/systematic-debugging/SKILL.md '`--model gpt-6-astra --effort high`, no `--write`, no `--resume-last`, cap=1' 'systematic-debugging: Astra high flags'
+
+# Scenario pins: the transitions the review of f6332f1 found changed with no
+# config.json. Each pins the rule sentence that keeps df96a8a's behaviour.
+echo ""
+echo "Scenario pins — no-config transitions stay as at $BASE_REV"
+# 1. Frontend phases never escalate to implementer.escalation (Sol).
+expect_text "$ORCH" 'For a frontend-only phase, dispatch the Claude frontend implementer'"'"'s follow-up template instead (fresh Agent call, same ledger-derived list, same `[REPORT_FILE]` rules) — never GLM or Codex.' 'frontend fix rounds stay with the Claude frontend implementer'
+expect_text "$ORCH" 'Claude path: upgrade from Sonnet `medium` to Opus `high`; if already Opus, hand back to user.' 'frontend BLOCKED: Sonnet → Opus upgrade, then the user'
+expect_text "$ORCH" '**Frontend-only phases** keep the old cap: 2 consecutive gate-fix rounds without `GATE_OK` → escalate to the user' 'frontend gate stall: the user, no diagnosis escalation'
+expect_new "$ORCH" '5. **Escalation** — non-frontend phases only' 'Routing item 5 is limited to non-frontend phases'
+expect_new "$ORCH" 'A frontend-only phase never escalates here: its fixes stay with the Claude frontend implementer' 'Routing item 5 names the frontend exception'
+expect_new "$ORCH" '**Review stall (non-frontend phases not yet on an escalation profile — built-in: GLM and Luna phases):**' 'review stall escalation only on non-frontend phases'
+expect_new "$ORCH" 'A frontend-only phase has no review-stall escalation: its fix rounds stay with the Claude frontend implementer up to the round cap.' 'frontend review stall: fix rounds up to the cap'
+expect_absent "$ORCH" 'any phase not yet on an escalation profile' 'no review-stall escalation for "any phase"'
+# 2. A switch follows the chain the ladder selected: under the kill switch never implementer.risk.
+expect_new "$ORCH" 'An implementer switches only inside the **phase'"'"'s chain** — the one the ladder actually selected, re-derived each time from inputs that survive compaction (kill switch, `risk_phases`, the highest-seq sidecar'"'"'s profile)' 'switches follow the phase'"'"'s derived chain'
+expect_new "$ORCH" '"через Luna" / an `SP_IMPLEMENTER` profile: that profile alone (never `implementer.risk`, even on a risk-marked phase)' 'kill switch: the named profile alone'
+expect_new "$ORCH" 'Luna, Sol and Astra stand last — a failed Codex job plus one `--fresh` retry → the user, never an implicit Luna → Sol hop.' 'built-in Codex channels: retry once, then the user'
+expect_absent "$ORCH" 'A kill-switch profile outside the chain stands before all of it' 'no kill-switch profile prepended to the risk chain'
+expect_new "$ORCH" 'then the next profile of the phase'"'"'s chain ("## Routing" item 4 — the chain the ladder selected, never `implementer.risk` under the kill switch)' 'Codex failure rule: never implementer.risk under the kill switch'
+# 3. SP_IMPLEMENTER: with no config.json only luna activates the kill switch (df96a8a: "no other values of
+#    SP_IMPLEMENTER"), silently ignoring the rest; a config.json profile opts in. The same rule in recovery.
+expect_new "$ORCH" 'empty or `glm` → no kill switch; `luna` → the kill switch, as always; the name of a profile that the user'"'"'s `config.json` defines (a `source=config` row of `"$AD" channels`) whose harness is not `inproc` → the kill switch on that profile for every non-frontend phase' 'SP_IMPLEMENTER rule: empty/glm, luna, a config.json profile outside the session'
+expect_new "$ORCH" 'any other value — a built-in profile other than `luna` (`sol`, `astra`, …), an unknown name, an `inproc` profile, garbage, or `$AD` not running — is ignored, as before 0.12.0: no kill switch, GLM stays.' 'SP_IMPLEMENTER rule: built-in sol/astra and any other value are ignored'
+expect_new "$ORCH" 'Silently when `"$AD" channels` lists no `source=config` profile or `$AD` does not run (no `config.json`: exactly as before); otherwise one announcement line at skill start, never repeated after compaction.' 'SP_IMPLEMENTER rule: silent without config.json, never re-announced after compaction'
+expect_new "$ORCH" '`SP_IMPLEMENTER=<p>` (a `config.json` profile — the rule below) → profile `p`' 'ladder item 1: SP_IMPLEMENTER=<p> only for a config.json profile'
+expect_new "$ORCH" '`echo "${SP_IMPLEMENTER:-}"`, and the `SP_IMPLEMENTER` rule (Step 3 "Kill switch") activates the kill switch → `off`' 'compaction recovery applies the SP_IMPLEMENTER rule'
+expect_new "$ORCH" 'at skill start, `echo "${SP_IMPLEMENTER:-}"` → the `SP_IMPLEMENTER` rule' 'skill start applies the SP_IMPLEMENTER rule'
+expect_absent "$ORCH" 'the name of a known profile other than `luna` / `glm` whose harness is not `inproc`' 'built-in sol/astra do not activate the kill switch'
+expect_absent "$ORCH" 'built-in or `config.json`, as `"$AD" channels` lists it' 'no built-in profile names the SP_IMPLEMENTER implementer'
+expect_absent "$ORCH" 'one announcement line at skill start, no kill switch, GLM stays.' 'no unconditional announcement for an ignored SP_IMPLEMENTER'
+expect_absent "$ORCH" 'non-empty value other than `glm`' 'no kill switch for every non-empty SP_IMPLEMENTER'
+expect_absent "$ORCH" 'non-empty `SP_IMPLEMENTER` other than `glm`' 'Durable copies: no off re-write for every non-empty SP_IMPLEMENTER'
+expect_absent "$ORCH" '`SP_IMPLEMENTER` is non-empty and not `glm`' 'ladder item 1 does not fire on any non-empty SP_IMPLEMENTER'
+expect_absent skills/zcode-invocation/SKILL.md 'non-empty `SP_IMPLEMENTER` other than `glm`' 'zcode-invocation: same SP_IMPLEMENTER rule'
+expect_absent skills/zcode-invocation/SKILL.md 'another known profile whose harness is not `inproc`' 'zcode-invocation: no built-in profile activates the kill switch'
+expect_new skills/zcode-invocation/SKILL.md 'the name of a profile the user'"'"'s agent-dispatch `config.json` defines whose harness is not `inproc`' 'zcode-invocation: a config.json profile opts in'
+expect_absent PLUGIN_README.md 'any non-empty value other than `glm`' 'PLUGIN_README: no kill switch for every non-empty SP_IMPLEMENTER'
+expect_absent PLUGIN_README.md 'another known profile' 'PLUGIN_README: no built-in profile activates the kill switch'
+expect_new PLUGIN_README.md '(`luna`, or a profile of the user'"'"'s agent-dispatch `config.json` that does not run in the session; other values are ignored, as before;' 'PLUGIN_README: luna or a config.json profile'
+expect_absent README.md 'makes that profile the implementer for every phase.' 'README: SP_IMPLEMENTER is not the implementer for every phase'
+expect_absent README.md 'built-in or yours' 'README: no built-in profile activates the kill switch'
+expect_new README.md '`SP_IMPLEMENTER=<profile>`, where the profile is one you defined in `config.json` and it runs outside the session' 'README: a config.json profile opts in'
+expect_new README.md 'Any other value is ignored, as before: a built-in name such as `sol`' 'README: built-in sol is ignored'
+expect_absent README.ru.md 'делает этот профиль имплементером для всех фаз.' 'README.ru: SP_IMPLEMENTER is not the implementer for every phase'
+expect_absent README.ru.md 'встроенным или вашим' 'README.ru: no built-in profile activates the kill switch'
+expect_new README.ru.md '`SP_IMPLEMENTER=<профиль>` с профилем, который вы сами задали в `config.json`' 'README.ru: a config.json profile opts in'
+expect_new README.ru.md 'Любое другое значение, как и раньше, игнорируется: встроенное имя вроде `sol`' 'README.ru: built-in sol is ignored'
+# 4. The GLM doctor/probe runs only for a glm candidate.
+expect_new "$ORCH" 'When the state line still shows `glm=unprobed` and the candidate — item 5'"'"'s profile, the first non-down profile of the `implementer` chain (built-in: `glm`) — is `glm`, run item 4 above now' 'ladder item 3 probes only a glm candidate'
+expect_new "$ORCH" '(only when the ladder'"'"'s candidate at item 3 is `glm` with `glm=unprobed`, or a route answers `glm` while `glm=unprobed`; a chain without `glm` never probes GLM)' 'Step 3 probe condition'
+expect_new_count "$ORCH" 'the candidate — the first non-down `implementer` profile — is `glm` (built-in: it is; a chain without `glm` never probes GLM)' 2 'Step 5 fix wave and integration repair probe only a glm candidate'
+# 6. In-session roles: in-session profiles first; route --all compares effective chains.
+expect_new "$ORCH" '`"final-review": ["astra"]` alone prints `routes: default` plus a stderr note' 'route --all compares effective chains (SKILL.md)'
+expect_new skills/agent-invocation/SKILL.md '`"final-review": ["astra"]` alone prints `routes: default` plus a stderr note' 'route --all compares effective chains (agent-invocation)'
+expect_absent skills/agent-invocation/SKILL.md 'is not filtered' 'agent-invocation: no unrestricted final-review order'
+expect_absent README.md 'its chain runs in order' 'README: no unrestricted final-review order'
+expect_absent README.ru.md 'его цепочка идёт по порядку' 'README.ru: no unrestricted final-review order'
+expect_new skills/agent-invocation/SKILL.md 'A chain whose order this changes gets one note line on stderr' 'agent-invocation: the note comes with every reordered final-review chain'
+expect_absent skills/agent-invocation/SKILL.md 'A chain that does not start in-session gets one note line' 'agent-invocation: no note promise narrower than the CLI'
+# 5. Merged status lists what the wrappers' own status lists (df96a8a ran "$DISPATCH" status and "$ZDISPATCH" status).
+expect_new skills/agent-invocation/SKILL.md 'The ZCode and Codex lines are what that wrapper'"'"'s own `status` lists (Codex: only this session'"'"'s jobs while `$CODEX_COMPANION_SESSION_ID` is set).' 'agent-invocation: merged status keeps the wrappers'"'"' session scope'
+# Under routes: default no route call and the built-in announcements, word for word.
+expect_text "$ORCH" 'use the template'"'"'s Codex Astra xhigh fallback' 'Step 5: Opus unavailable → the Astra xhigh fallback'
+expect_new "$ORCH" 'under `routes: default` (no `route` call — "## Routing" item 1), use the template'"'"'s Codex Astra xhigh fallback' 'Step 5 fallback: no route call under routes: default'
+expect_new skills/dev-orchestrator/codex-plan-reviewer-prompt.md 'skipped under `routes: default`' 'plan-reviewer template: no route call under routes: default'
+expect_new skills/dev-orchestrator/codex-control-review-prompt.md 'skipped under `routes: default`' 'control-review template: no route call under routes: default'
+expect_new skills/dev-orchestrator/final-review-prompt.md '(under `routes: default` no call' 'final-review template: no route call under routes: default'
+expect_text "$ORCH" '`ZCode doctor failed (<first FAIL line>) — implementer for this session: Luna max.`' 'failed doctor: the built-in announcement'
+expect_text "$ORCH" '`GLM channel failed (errorClass=<class>) — Ф<id> falls back to Luna max; GLM is off for this session.`' 'GLM job down: the built-in announcement'
+expect_absent "$ORCH" '<next implementer profile; built-in Luna max>' 'no profile-name placeholder in the doctor announcement'
+expect_absent "$ORCH" 'falls back to <profile> (built-in: Luna max)' 'no profile-name placeholder in the GLM-down announcement'
+expect_new "$ORCH" 'between built-in profiles, word for word the built-in line of "## Reporting cadence"' 'built-in switches: the old line, no Channel line beside it'
+# "без <profile>": GLM keeps its own kill switch; any other profile leaves its chains even under routes: default.
+expect_new "$ORCH" '("без GLM" is the GLM kill switch above and writes no `channels` line)' '"без GLM" writes no channels line'
+expect_new "$ORCH" 'while the marker holds an `off` line, "## Routing" items 2 and 4 call `route` with the skips' '"без <profile>" turns route calls back on under routes: default'
+expect_new "$ORCH" 'skipped for the session while the `channels` marker holds no `off` line' 'Routing item 1: the routes: default shortcut ends with an off line'
+
+# The documented route --all example, run against the CLI (no harness runs: route only).
+echo ""
+echo "Documented route example (bin/agent-dispatch)"
+if command -v node >/dev/null 2>&1 && [[ -x "$REPO_ROOT/bin/agent-dispatch" ]]; then
+    ex_dir="$(mktemp -d)"
+    printf '%s\n' '{ "version": 1, "roles": { "final-review": ["astra"] } }' >"$ex_dir/config.json"
+    ex_out="$(AGENT_DISPATCH_STATE_DIR="$ex_dir" "$REPO_ROOT/bin/agent-dispatch" route --all 2>"$ex_dir/stderr")" && ex_rc=0 || ex_rc=$?
+    ex_err="$(cat "$ex_dir/stderr")"
+    rm -rf "$ex_dir"
+    if [[ $ex_rc -eq 0 && "$ex_out" == "routes: default" && "$(grep -c . <<<"$ex_err")" -eq 1 && "$ex_err" == "agent-dispatch: note: route final-review: "* ]]; then
+        pass '"final-review": ["astra"] → route --all prints exactly routes: default plus one stderr note'
+    else
+        fail "\"final-review\": [\"astra\"] → route --all: rc=$ex_rc out: $ex_out err: $ex_err"
+    fi
+else
+    echo "  [SKIP] node or bin/agent-dispatch not available"
+fi
 
 # The built-in route table, when the CLI side ships it, must match the table
 # above role for role (spec §5.1). Skipped while the file is absent.

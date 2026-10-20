@@ -14,7 +14,9 @@
 //
 // Like the real wrappers, `status --json` answers for one workspace: the tree of --cwd, else of the stub's own cwd.
 // A canned store ({ running, recent, latestFinished }) may hold records of several trees: only the records whose
-// workspaceRoot is that tree are printed, under that tree's workspaceRoot.
+// workspaceRoot is that tree are printed, under that tree's workspaceRoot. Like the companion, codex-dispatch's
+// `status --json` also keeps only the records whose sessionId equals $CODEX_COMPANION_SESSION_ID when it is set.
+// Every call appends "<verb> <$CODEX_COMPANION_SESSION_ID or ->" to <name>.session.
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
@@ -34,6 +36,8 @@ fs.mkdirSync(dir, { recursive: true });
 fs.appendFileSync(path.join(dir, `${name}.argv`), `${JSON.stringify(argv)}\n`);
 
 const verb = argv[0] ?? "";
+const session = process.env.CODEX_COMPANION_SESSION_ID || null;
+fs.appendFileSync(path.join(dir, `${name}.session`), `${verb} ${session ?? "-"}\n`);
 const canned = (suffix) => {
   try {
     return fs.readFileSync(path.join(dir, `${name}.${verb}.${suffix}`), "utf8");
@@ -81,7 +85,8 @@ function statusOf(text) {
   }
   if (!data || typeof data !== "object" || !(Array.isArray(data.running) || Array.isArray(data.recent))) return text;
   const root = askedRoot();
-  const here = (record) => record && (typeof record.workspaceRoot !== "string" || real(record.workspaceRoot) === root);
+  const mine = (record) => name !== "codex-dispatch" || !session || record.sessionId === session;
+  const here = (record) => record && (typeof record.workspaceRoot !== "string" || real(record.workspaceRoot) === root) && mine(record);
   const store = { ...data, workspaceRoot: root };
   for (const list of ["running", "recent"]) if (Array.isArray(data[list])) store[list] = data[list].filter(here);
   if ("latestFinished" in data) store.latestFinished = here(data.latestFinished) ? data.latestFinished : null;

@@ -154,7 +154,7 @@ main() {
     export AGENT_DISPATCH_CODEX="$TEST_ROOT/bin/codex-dispatch"
     export WRAPPER_STUB_DIR="$TEST_ROOT/wrappers"
     export AGENT_DISPATCH_ADAPTER_DIR="$FIX/dispatch-adapters"
-    unset AGENT_TEST_BOOT_ID CLAUDE_CONFIG_DIR TEST_KEY_VAR SP_IMPLEMENTER
+    unset AGENT_TEST_BOOT_ID CLAUDE_CONFIG_DIR TEST_KEY_VAR SP_IMPLEMENTER CODEX_COMPANION_SESSION_ID
     unset AGENT_STUB_MODE AGENT_STUB_RECORD AGENT_STUB_DELAY_MS AGENT_STUB_MESSAGE AGENT_STUB_CLASS AGENT_STUB_EXIT
     unset AGENT_STUB_RESPONSE AGENT_STUB_SECRET_VAR AGENT_STUB_DIALECT
     export AGENT_ENV_PASSTHROUGH="AGENT_STUB_MODE,AGENT_STUB_RECORD,AGENT_STUB_DELAY_MS,AGENT_STUB_MESSAGE,AGENT_STUB_CLASS,AGENT_STUB_EXIT,AGENT_STUB_RESPONSE,AGENT_STUB_SECRET_VAR"
@@ -829,6 +829,40 @@ EOF
     run_ad task --profile glm --background --write --prompt-file "$prompt"
     [[ "$RC" -eq 0 && "$(calls_of zcode-dispatch task)" -eq 1 && "$(grep -c . <<<"$ERR")" -eq 1 && "$ERR" == *"WARN write check: task-dead1"*"not alive; not blocking"* ]]
     verdict "10 a companion write job with a dead worker does not block: one warning line, the task starts" $? "rc=$RC err: $ERR"
+
+    # A live companion write job of ANOTHER Claude session. The companion (and the stub) filters `status --json` by
+    # $CODEX_COMPANION_SESSION_ID: the write check queries the store without it; merged status, real dispatches and
+    # id-addressed pass-through keep it (merged status lists what `codex-dispatch status` lists).
+    reset_wrappers
+    node -e 'setTimeout(() => {}, 120000)' -- "$TEST_ROOT/live-worker-a" &
+    local live_a=$!
+    can codex-dispatch status stdout "{\"workspaceRoot\":\"$repo\",\"running\":[{\"id\":\"task-sessa1\",\"status\":\"running\",\"write\":true,\"pid\":$live_a,\"sessionId\":\"sess-A\",\"workspaceRoot\":\"$repo\",\"request\":{\"model\":\"gpt-6-luna\",\"effort\":\"max\"}}],\"latestFinished\":null,\"recent\":[]}"
+    export CODEX_COMPANION_SESSION_ID=sess-B
+    local filtered
+    filtered="$("$AGENT_DISPATCH_CODEX" status --json --cwd "$repo" | jfield running)"
+    : >"$WRAPPER_STUB_DIR/codex-dispatch.session"
+    run_ad task --profile glm --background --write --prompt-file "$prompt"
+    ok=$RC
+    local sess_err="$ERR"
+    run_ad status
+    local sess_status="$OUT" sess_status_rc=$RC
+    run_ad task --profile luna --background --write --prompt-file "$prompt"
+    local luna_rc=$RC
+    run_ad status task-sessa1
+    run_ad result task-sessa1
+    run_ad cancel task-sessa1
+    unset CODEX_COMPANION_SESSION_ID
+    [[ "$filtered" == '[]' && "$ok" -eq 2 && "$sess_err" == "agent-dispatch: job task-sessa1 (luna) is still running in this workspace; one write task per working tree" \
+        && "$(calls_of zcode-dispatch task)" -eq 0 ]]
+    verdict "10 a live companion write job of another session (CODEX_COMPANION_SESSION_ID differs) blocks a glm write task" $? "stub's own filtered view: $filtered" "rc=$ok err: $sess_err"
+    [[ "$sess_status_rc" -eq 0 && "$sess_status" != *task-sessa1* ]]
+    verdict "10 merged status stays scoped to this session, like codex-dispatch status: the other session's job is not listed" $? "$sess_status"
+    local expected_sessions
+    expected_sessions="$(printf '%s\n' 'status -' 'status sess-B' 'task sess-B' 'status sess-B' 'result sess-B' 'cancel sess-B')"
+    [[ "$luna_rc" -eq 0 && "$(cat "$WRAPPER_STUB_DIR/codex-dispatch.session")" == "$expected_sessions" ]]
+    verdict "10 only the write check drops CODEX_COMPANION_SESSION_ID; merged status, the codex task and status/result/cancel <task-…> keep it" $? "luna rc=$luna_rc" "$(cat "$WRAPPER_STUB_DIR/codex-dispatch.session")"
+    kill "$live_a" 2>/dev/null
+    wait "$live_a" 2>/dev/null
 
     # --- 11. status without an id merges the three stores ---
     reset_wrappers

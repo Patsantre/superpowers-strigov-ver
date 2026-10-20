@@ -611,11 +611,15 @@ function runWrapper(pass, argv) {
   return 128 + (os.constants.signals[r.signal] ?? 0);
 }
 
-// One wrapper store through `<wrapper> status --json`: { jobs } or { error }.
-function queryStore(pass, state, { cwd, all = false } = {}) {
+// One wrapper store through `<wrapper> status --json`: { jobs } or { error }. The companion filters its snapshot by
+// $CODEX_COMPANION_SESSION_ID. Merged status keeps the variable, so it lists what `<wrapper> status` lists; the write
+// check (allSessions) leaves it out, so a live writer of another session still blocks.
+function queryStore(pass, state, { cwd, all = false, allSessions = false } = {}) {
   const file = wrapperPath(pass);
   const argv = ["status", "--json", ...(cwd !== undefined ? ["--cwd", cwd] : []), ...(all ? ["--all"] : [])];
-  const r = spawnSync(file, argv, { encoding: "utf8", env: process.env, timeout: STORE_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 });
+  const { CODEX_COMPANION_SESSION_ID: _session, ...unscoped } = process.env;
+  const env = allSessions ? unscoped : process.env;
+  const r = spawnSync(file, argv, { encoding: "utf8", env, timeout: STORE_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 });
   if (r.error) return { error: `cannot run ${file}: ${r.error.code ?? r.error.message}` };
   if (r.status !== 0) {
     const first = (r.stderr ?? "").trim().split("\n")[0];
@@ -635,7 +639,7 @@ function queryStore(pass, state, { cwd, all = false } = {}) {
 // spec §3.9: before a write task, the stores other than the task's own must hold no running write job in the same
 // tree. A companion job blocks only while its worker pid lives (the companion never reaps a dead worker); a store
 // that cannot be read is reported and does not block. Each store is asked about this tree only: the core by its
-// workspace, the wrappers with `status --json --cwd <the tree's root>`.
+// workspace, the wrappers with `status --json --cwd <the tree's root>`, for every session.
 function refuseForeignWriteJobs(state, { cwd, own }) {
   const ws = core.resolveWorkspace(path.resolve(cwd ?? process.cwd()));
   if (!ws) return; // not a git work tree: the task itself refuses
@@ -646,7 +650,7 @@ function refuseForeignWriteJobs(state, { cwd, own }) {
   }
   for (const pass of Object.values(PASS_THROUGH)) {
     if (pass.id === own) continue;
-    const store = queryStore(pass, state, { cwd: ws.root });
+    const store = queryStore(pass, state, { cwd: ws.root, allSessions: true });
     if (store.error) {
       errOut(`${CLI_NAME}: WARN write check: ${store.error}; its jobs were not checked\n`);
       continue;
