@@ -28,7 +28,7 @@ Dispatch via `Agent(subagent_type="general-purpose", model="opus", effort=..., p
 
 The main thread never writes the spec directly — dispatch Opus. Exception: the main thread runs `git add` / `git commit` after Codex Astra returns APPROVED (mechanical orchestrator work — see "Codex Astra Spec Review" below).
 
-**Codex Astra xhigh is invoked for spec review** (loop cap=4) after Opus finishes writing. Before dispatch, `Read` `../codex-invocation/SKILL.md` (manual-only — never through the Skill tool); dispatch via `companion.mjs --background` because standard Agent paths auto-reject on this machine. See "Codex Astra Spec Review" below for the loop procedure.
+**Codex Astra xhigh is invoked for spec review** (loop cap=4) after Opus finishes writing. Before dispatch, `Read` `../codex-invocation/SKILL.md` (manual-only — never through the Skill tool); dispatch via `companion.mjs --background` because standard Agent paths auto-reject on this machine. See "Codex Astra Spec Review" below for the loop procedure. The reviewer is the profile of the `spec-reviewer` role (`"$AD" route spec-reviewer`, per `../agent-invocation/SKILL.md`, also manual-only); by default Astra, the same command.
 
 ## Anti-Pattern: "This Is Too Simple To Need A Design"
 
@@ -218,7 +218,7 @@ Instruct Opus: "After writing the spec, review it with fresh eyes and fix inline
 
 **Codex Astra Spec Review (after Opus returns):**
 
-Dispatch Codex Astra xhigh (`--model gpt-6-astra --effort xhigh`) using `./spec-reviewer-prompt.md`. Read-only, no `--write`. Loop cap=4.
+Dispatch the `spec-reviewer` profile (`"$AD" route spec-reviewer`; by default Codex Astra xhigh, the same command: `--model gpt-6-astra --effort xhigh`) using `./spec-reviewer-prompt.md`. Read-only, no `--write`. Loop cap=4.
 
 Verdict handling:
 - `APPROVED` → commit the spec file from main thread (`git add <path>` + `git commit` with subject `docs(specs): add <topic>`, Co-Authored-By trailer). Then User Review Gate.

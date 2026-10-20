@@ -14,13 +14,15 @@ Use when dispatching a plan review to Codex. The plan was written by an Opus sub
 
 `$DISPATCH` is the `codex-dispatch` wrapper — first `Read` `../codex-invocation/SKILL.md` (manual-only; never through the Skill tool), then resolve it once per session. Write the filled prompt to a scratch file first and pass it via `--prompt-file`; inline multi-line prompts break silently.
 
+**Profile.** This is the `plan-reviewer` role: run `"$AD" route plan-reviewer` first (SKILL.md "## Routing"). By default it is `astra` — exactly the command above. Another `codex` profile → the same command with its `--model` / `--effort`; `zcode` (`glm`) → `"$ZDISPATCH" task --background --prompt-file …` (no model flags; GLM has no read-only mode — `route` warns); a core harness → `"$AD" task --profile <p> --role plan-reviewer --background --prompt-file …` (no `--write`); on `zcode` and core harnesses the reviewer preamble from `../agent-invocation/SKILL.md` opens the prompt file; `inproc` → the Agent tool at the profile's model and effort. On a non-default profile, name its model in the prompt's opening line instead of "Codex (GPT-6 Astra, effort xhigh)"; everything else stays.
+
 **No `--write`.** This is a read-only review: Codex must not touch the plan file. Revisions go back to the Opus writer (`./opus-plan-writer-prompt.md` Mode B) through the ledger — that separation is what makes the review independent.
 
 **Effort is `xhigh` — never `max` or `ultra` unless the user EXPLICITLY asked for that level in their own words.** Do not propose a higher level yourself — not as a question, not as a recommendation. (`max` bills noticeably more; `ultra` is the parallel-subagent mode at ~4× the tokens; the user opts in when they want them.)
 
 **Every round is a FRESH task — never `--resume-task`.** Reviewer freshness is a bias decision, exactly as for the Step 4.2 control review: a reviewer that remembers its own prior rounds anchors on them. The AUTHORIZED_CHANGE_LEDGER, not thread memory, carries the round history. Rounds 2+ use the follow-up template below.
 
-Poll with Monitor using the terminal-only filter from `../codex-invocation/SKILL.md` (`Read` it — manual-only). Fetch via `"$DISPATCH" result task-XXXX`.
+Poll with Monitor using the terminal-only filter from `../codex-invocation/SKILL.md` (`Read` it — manual-only). Fetch via `"$DISPATCH" result task-XXXX` (core ids: `"$AD" result <id>`, loop in `../agent-invocation/SKILL.md`).
 
 Do NOT paste the full plan text in any round — always point at the file; Codex reads it from the working tree.
 

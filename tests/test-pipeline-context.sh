@@ -11,7 +11,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 HOOK="$REPO_ROOT/bin/pipeline-context"
 MARKER='Manual-only pipeline skill (superpowers-strigov-ver)'
 
-PIPELINE_SKILLS="architecture-memory brainstorming codex-invocation dev-orchestrator dispatching-parallel-agents executing-plans finishing-a-development-branch requesting-code-review using-git-worktrees writing-plans writing-skills zcode-invocation"
+PIPELINE_SKILLS="agent-invocation architecture-memory brainstorming codex-invocation dev-orchestrator dispatching-parallel-agents executing-plans finishing-a-development-branch requesting-code-review using-git-worktrees writing-plans writing-skills zcode-invocation"
 DISCIPLINE_SKILLS="receiving-code-review systematic-debugging test-driven-development verification-before-completion"
 
 FAILURES=0

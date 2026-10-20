@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="Версия 0.11.1" src="https://img.shields.io/badge/version-0.11.1-7c8cff?style=flat-square">
+  <img alt="Версия 0.12.0" src="https://img.shields.io/badge/version-0.12.0-7c8cff?style=flat-square">
   <img alt="Плагин Claude Code" src="https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square">
   <img alt="Лицензия MIT" src="https://img.shields.io/badge/license-MIT-35d6a6?style=flat-square">
 </p>
@@ -134,6 +134,156 @@ Companion runtime уже вендорится. Отдельный Claude Code-п
 
 `max` зарезервирован за имплементерами GLM и Luna (или по явному запросу пользователя); `ultra` никогда не выбирается автоматически — только по явному запросу пользователя. Квота GLM: 2026-10-14 бонус 1.5× для ZCode по замеру не определён (ожидаемые/списанные кредиты = 3.02 по стандартному тарифу или 1.51, если окно пришлось на непиковые часы; подробности в docs/zcode-cli-findings.md).
 
+Эта таблица — встроенная схема: без `config.json` работает ровно она. Любую роль можно переназначить на свой профиль — см. [Свои харнессы и API](#свои-харнессы-и-api).
+
+## Свои харнессы и API
+
+`bin/agent-dispatch` назначает ролям пайплайна **профили**. Профиль — это харнесс, способ оплаты (собственный вход харнесса или API-ключ), модель и effort. У роли **цепочка** профилей: первый — основной, остальные — запасные, по порядку. Без файла настроек ничего не меняется.
+
+В этом выпуске (0.12.0) есть слой маршрутизации: профили, ключи, `route`, `doctor`, статус задач и сквозной вызов ZCode и Codex. Уже сейчас роли, которые исполняются в сессии, можно перевести на другую модель или effort Claude, а внешние роли — на другие модели Codex. Адаптеры для `claude -p`, DeepSeek Harness (`dsh`), OpenCode и pi появятся в следующих выпусках. До тех пор профиль на таком харнессе получает отказ `harness <h> is not available in this version`, и оркестратор переходит к следующему профилю цепочки.
+
+`agent-dispatch` лежит в каталоге `bin/` плагина. В своём терминале вызывайте его по абсолютному пути — Claude подскажет его.
+
+### Профиль за три шага
+
+```bash
+agent-dispatch preset list                                          # что можно скопировать
+agent-dispatch profile add deepseek-claude --from claude-deepseek   # 1. профиль из пресета
+agent-dispatch key set deepseek                                     # 2. ключ, скрытым вводом
+agent-dispatch doctor --profile deepseek-claude --probe             # 3. проверки без модели + один короткий платный запрос
+```
+
+1. `profile add <имя> --from <пресет> [--model M] [--key K] [--set k=v]` копирует пресет в `config.json`. Если в пресете есть заполнитель `<…>`, его нужно заполнить флагом, иначе профиль не запишется.
+2. Ключ вы кладёте сами, в своём терминале: `key set <имя>` запрашивает его скрытым вводом. Из сессии Claude Code ключ можно передать через pipe: `! pbpaste | agent-dispatch key set <имя>`, на Linux — `wl-paste` или `xclip -o -selection clipboard`. Ключ, переданный аргументом, отвергается. Профиль с `login` пользуется собственным входом харнесса. Для профиля с отдельным изолированным каталогом сначала выполните `eval "$(agent-dispatch profile env <имя>)"`.
+3. `doctor --profile <имя>` проверяет всё, что можно проверить без вызова модели. `--probe` добавляет один короткий платный запрос на вашем ключе или подписке; его запускаете вы, пайплайн — никогда.
+
+В 0.12.0 все пресеты рассчитаны на `claude`, `dsh`, OpenCode или pi, поэтому шаг 3 этого примера пока заканчивается строкой `harness claude is not available in this version`: он пройдёт, когда выйдет адаптер этого харнесса. Профили, которые работают уже сейчас, пишутся вручную: другая модель или effort Codex либо другая модель Claude в сессии. Например, более дешёвое контрольное ревью и автор плана на Sonnet:
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "astra-medium": { "harness": "codex",  "model": "gpt-6-astra", "effort": "medium" },
+    "sonnet-high":  { "harness": "inproc", "model": "sonnet",      "effort": "high" }
+  },
+  "roles": {
+    "control-review": ["astra-medium"],
+    "plan-writer":    ["sonnet-high"]
+  }
+}
+```
+
+**Где это лежит.** Ваши профили и роли хранятся в `~/.claude/plugins/data/superpowers-strigov-ver-agents/config.json`. У каталога права 0700, а в файле нет секретов: ключи лежат в `keys/<имя>` с правами 0600.
+
+- В файле обязательно поле `"version": 1`.
+- Ваши профили добавляются к встроенным. Встроенные профили переопределить нельзя: `glm`, `luna`, `sol`, `astra`, `astra-high`, `opus-xhigh`, `opus-high` и `sonnet-medium`. Чтобы изменить такой профиль, скопируйте его под новым именем.
+- Роль из файла, `"roles": { "<роль>": ["<профиль>", …] }`, целиком заменяет встроенную цепочку этой роли. Остальные роли остаются встроенными.
+- Неизвестное поле или роль со ссылкой на несуществующий профиль отвергаются с их именем, так что опечатка вроде `efort` не пройдёт молча. О битом файле сообщает одна строка `config:`, и оркестратор задаёт вам один вопрос.
+
+**Ключи из других мест.**
+
+- По умолчанию (`{"key": "<имя>"}`) ключ читается из хранилища выше.
+- Ключ, уже экспортированный в вашем шелле, передаётся только как `{"keyEnv": "VAR"}`. Без этого белый список окружения его срежет.
+- Менеджер паролей подключается через `{"keyCmd": [...]}`:
+  - macOS: `["security", "find-generic-password", "-w", "-s", "deepseek"]`
+  - Linux: `["secret-tool", "lookup", "service", "deepseek"]`
+  - любая ОС: `["op", "read", "op://…"]`
+
+Ключ попадает только в окружение процесса харнесса — не в его argv, не в файлы настроек и не в чат. Пайплайн никогда не запускает `key set` и не просит у вас ключ.
+
+Профили с общим ключом, общим входом харнесса (вход OpenCode или pi считается отдельно для каждого провайдера) или общей меткой `shares` выбывают вместе при `auth` или `quota`. У встроенного `glm` метка `zai-coding-plan`, поэтому запасной профиль с API Z.ai и той же меткой не упрётся в ту же исчерпанную квоту.
+
+### Маршрутизация ролей
+
+| Роль (имя в `config.json`) | Где в пайплайне | По умолчанию | Исполнение |
+|---|---|---|---|
+| `plan-writer` | автор плана | `opus-xhigh` | в сессии (Agent tool) |
+| `plan-reviser` | правки плана | `opus-high` | в сессии |
+| `plan-reviewer` | ревью плана (цикл до 4) | `astra` | внешний харнесс |
+| `spec-reviewer` | ревью спецификации в brainstorming | `astra` | внешний харнесс |
+| `implementer` | не-фронтенд фазы, fix, gate-fix, финальная волна фиксов, починка интеграции | `glm`, `luna` | внешний харнесс |
+| `implementer.risk` | фазы SECURITY/DATA_LOSS | `sol` | внешний харнесс |
+| `implementer.escalation` | эскалация на более глубокое рассуждение | `sol` | внешний харнесс |
+| `frontend.new-ui` | фронтенд-фазы с новым UI | `opus-high` | в сессии |
+| `frontend.tweak` | правки существующего фронтенда | `sonnet-medium` | в сессии |
+| `gate` | lint, typecheck, затронутые тесты | `sonnet-medium` | в сессии |
+| `phase-review` | ревью фазы 4.1 | `opus-high` | в сессии |
+| `phase-review.escalated` | ревью фазы 4.1 на рисковых фазах и в раунде 4 | `opus-xhigh` | в сессии |
+| `control-review` | контрольное ревью 4.2 | `astra-high` | внешний харнесс |
+| `synthesis` | сводка ревью | `sonnet-medium` | в сессии |
+| `final-review` | финальное ревью ветки | `opus-xhigh`, `astra` | в сессии, затем внешний харнесс |
+| `diagnosis` | BLOCKED, застрявший гейт | `opus-high` | в сессии |
+| `quickfix` | тривиальные правки | `sonnet-medium` | в сессии |
+| `integration-check` | проверка интеграции параллельной группы | `sonnet-medium` | в сессии |
+| `adhoc-review` | `requesting-code-review`, второе мнение в `systematic-debugging` | `astra-high` | внешний харнесс |
+
+`frontend.new-ui` и `frontend.tweak` — две роли, а не цепочка: между ними, как и раньше, выбирает триаж.
+
+Пример для тех, у кого нет OpenAI:
+
+```json
+"roles": {
+  "implementer":            ["glm", "deepseek-dsh"],
+  "implementer.risk":       ["claude-sub"],
+  "implementer.escalation": ["claude-sub"],
+  "plan-reviewer":          ["deepseek-claude", "oc-copilot"],
+  "spec-reviewer":          ["deepseek-claude"],
+  "control-review":         ["deepseek-claude", "glm-api"],
+  "final-review":           ["opus-xhigh", "deepseek-claude"],
+  "adhoc-review":           ["deepseek-claude"]
+}
+```
+
+- При сбое GLM фаза уходит на `deepseek-dsh`, а не на Luna.
+- Рисковые фазы и эскалации идут на Opus через подписку Claude.
+- Ревьюеры работают на DeepSeek, а запасные — Copilot и API GLM.
+
+Ещё о маршрутизации:
+
+- **Роли в сессии.** Их можно назначить на свои `inproc`-профили, то есть на другую модель или effort Claude. Например, на Claude Pro можно задать `"sonnet-high": { "harness": "inproc", "model": "sonnet", "effort": "high" }` и `"plan-writer": ["sonnet-high"]`. Запуск этих ролей на внешних харнессах появится в одном из следующих выпусков. До тех пор `route` берёт из такой цепочки только профили для сессии (а если их нет — встроенный профиль) и печатает одну строку-пояснение. На `final-review` это не распространяется: его цепочка идёт по порядку.
+- **Как пайплайн читает маршруты.**
+  - При старте и после сжатия контекста оркестратор вызывает `agent-dispatch route --all`. Ответ `routes: default` не объявляется. Иначе вы получите одну строку с вашими отличиями.
+  - Перед каждой отправкой ревьюеру, при первой отправке фазы имплементеру и при каждой смене профиля он вызывает `route <роль>`, поэтому ничего не нужно помнить. Повторы и раунды исправлений фазы остаются на её текущем профиле.
+  - Переход на следующий профиль цепочки объявляется одной строкой, например `Channel implementer: glm-api → deepseek-dsh (glm-api: quota).`
+- **Kill switch.**
+  - «без GLM» и «через Luna» работают как раньше.
+  - «без <профиль>» исключает любой профиль из всех цепочек до конца сессии. В примере выше «без GLM» отправит все фазы, включая рисковые, на `deepseek-dsh`.
+  - `SP_IMPLEMENTER=<профиль>` делает этот профиль имплементером для всех фаз. `SP_IMPLEMENTER=luna` работает как раньше, а `SP_IMPLEMENTER=glm` называет профиль по умолчанию и ничего не меняет.
+- **Правило семейств.** Во встроенной схеме автор и ревьюер артефакта принадлежат разным модельным семействам. `agent-dispatch` вашу маршрутизацию на это не проверяет. Ревьюер должен быть из другого семейства моделей, чем автор плана и имплементер.
+
+### Что разрешают провайдеры — для справки, по состоянию на 2026-10-20; ответственность ваша
+
+| Подписка / ключ | Разрешено официально | Серая зона | Не разрешено |
+|---|---|---|---|
+| Claude Pro/Max | Claude Code, включая `claude -p` [AN1, AN4] | — | OAuth в сторонних харнессах (OpenCode, pi и др.) |
+| ChatGPT Plus/Pro | Codex; OpenCode, pi («Sign in with ChatGPT»), Kilo [OA1, OA6] | харнессы, которых OpenAI не называет | ChatGPT Business/Enterprise в сторонних харнессах |
+| GLM Coding Plan | ZCode, Claude Code, Codex, OpenCode, pi, Crush, Kilo, Cline | — | инструменты, которых нет в списке Z.ai (Qwen Code, Kimi CLI, dsh) |
+| GitHub Copilot | OpenCode [GH1] | Crush, Kilo, Cline | вход pi (pi представляется VS Code) |
+| OpenCode Go | Claude Code, Codex, ZCode, pi, OpenCode, Kilo | — | — |
+| OpenCode Zen | OpenCode | вне OpenCode | — |
+| Kimi Code | интерактивная работа | неинтерактивный (headless) запуск (правила Kimi: «только интерактивно», хотя документация CLI показывает `kimi -p`) | — |
+| MiniMax M Plan | любой совместимый инструмент | неинтерактивный (headless) запуск (подписка задумана для интерактивной работы) | — |
+| Alibaba Coding Plan | интерактивная работа | — | неинтерактивный (headless) запуск [AL1] |
+| Alibaba / QwenCloud Token Plan | — | неинтерактивный (headless) запуск | — |
+| Google AI (Gemini, Antigravity) | инструменты Google | — | OAuth в сторонних харнессах; запуск `agy` из стороннего харнесса |
+| Ollama Cloud | — | автоматизация (в условиях явно не разрешена) | — |
+| Любой PAYG-ключ (DeepSeek, Z.ai Standard, Kimi Platform, MiniMax API, Alibaba PAYG, OpenRouter) | любой харнесс | — | — |
+| Локальная модель | любой харнесс | — | — |
+
+`claude -p` со сторонним эндпоинтом не нарушает условия Anthropic, но Anthropic такую конфигурацию не поддерживает.
+
+ID источников в квадратных скобках ведут в [docs/research/universal-dispatchers/07-tos-matrix.md](./docs/research/universal-dispatchers/07-tos-matrix.md).
+
+### Если что-то сломалось
+
+Соберите три вещи и приложите их к issue или к сообщению владельцу:
+
+- вывод `agent-dispatch doctor --profile <p>`;
+- вывод `agent-dispatch status <id> --json`;
+- лог задачи — `state/<workspace>/jobs/<id>.log` в каталоге данных выше. Секреты в нём вычищены.
+
+Если эндпоинт отвергает beta-поля запроса, добавьте в `env` профиля `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`.
+
 ## Защитные механизмы
 
 - **Ручной запуск** — у pipeline-скиллов стоит `disable-model-invocation: true`: модель не видит их описания и не загружает их самостоятельно. Пайплайн запускается только по вашей команде, скиллы переходят друг к другу через чтение файлов `SKILL.md`, а незавершённый план возобновляется только по вашей просьбе. Discipline-скиллы (`systematic-debugging`, `test-driven-development`, `verification-before-completion`, `receiving-code-review`) по-прежнему включаются автоматически.
@@ -155,12 +305,14 @@ Companion runtime уже вендорится. Отдельный Claude Code-п
 | `dev-orchestrator` | Полный протокол планирования, реализации, верификации, ревью, коммитов и возобновления |
 | `codex-invocation` | Надёжный фоновый dispatch Codex через вендорный companion runtime |
 | `zcode-invocation` | Фоновый dispatch GLM-5.3-Flash через ZCode CLI от Z.ai: настройка, doctor/probe, цикл Monitor, обработка сбоев |
+| `agent-invocation` | Маршрутизация ролей через профили `agent-dispatch`: `route`, задачи по префиксу id, классы сбоев, headless-преамбулы |
 | `architecture-memory` | Компактная персистентная карта архитектуры в `docs/ARCHI.md` |
 | `/dev` | Явная точка входа в полный протокол; без задачи — продолжение незавершённого плана |
 | `bin/pipeline-context` | SessionStart-хук: называет незавершённый план и скилл, который нужно перечитать после компакции; в остальных случаях молчит |
 | `bin/review-package` | Генерирует готовые для ревьюера пакеты коммитов и diff |
 | `bin/sdd-workspace` | Резолвит изолированные scratch-workspace для каждого плана |
 | `bin/zcode-dispatch` | Обёртка задач ZCode CLI: task/status/result/cancel/release-stale/doctor/api-key с закреплёнными моделью, режимом и идентификацией клиента; `release-stale` освобождает резервацию рабочего дерева, оставленную упавшей задачей, после проверки, что та мертва |
+| `bin/agent-dispatch` | Профили, ключи и маршруты ролей (`route`, `channels`, `doctor`); один `status` по задачам ZCode, Codex и своим; сквозной вызов `zcode-dispatch` и `codex-dispatch` |
 
 ### Адаптированные скиллы Superpowers
 
@@ -177,14 +329,20 @@ Upstream-скилл `subagent-driven-development` заменён на `dev-orche
 ├── commands/dev.md                  # Точка входа команды /dev
 ├── hooks/hooks.json                 # SessionStart → bin/pipeline-context
 ├── bin/
+│   ├── agent-dispatch               # Профили, ключи, маршруты ролей, отправка задач
 │   ├── codex-dispatch               # Обёртка вендорного companion
 │   ├── pipeline-context             # Незавершённый план / подсказка перечитать скилл
 │   ├── review-package               # Генератор diff-пакета для ревьюеров
 │   ├── sdd-workspace                # Резолвер scratch-workspace для плана
 │   ├── zcode-dispatch               # Обёртка задач ZCode CLI (shim)
-│   └── lib/zcode-dispatch.mjs       # Раннер задач ZCode, записи, doctor
+│   ├── lib/zcode-dispatch.mjs       # Раннер задач ZCode, записи, doctor
+│   ├── lib/agent-core.mjs           # Общее ядро задач agent-dispatch
+│   ├── lib/agent-dispatch.mjs       # CLI agent-dispatch, конфигурация, маршруты
+│   ├── lib/agents-defaults.json     # Встроенные профили, роли, пресеты
+│   └── lib/adapters/                # Адаптеры харнессов
 ├── skills/
 │   ├── dev-orchestrator/            # Протокол и шаблоны промптов ролей
+│   ├── agent-invocation/
 │   ├── codex-invocation/
 │   ├── zcode-invocation/
 │   ├── architecture-memory/
@@ -192,6 +350,9 @@ Upstream-скилл `subagent-driven-development` заменён на `dev-orche
 ├── tests/test-sdd-scripts.sh        # Интеграционные тесты workspace/package
 ├── tests/test-pipeline-context.sh   # SessionStart-хук и проверки manual-only скиллов
 ├── tests/test-zcode-dispatch.sh     # Тесты обёртки ZCode (CLI-заглушка)
+├── tests/test-agent-core.sh         # Тесты ядра задач (тривиальный адаптер)
+├── tests/test-agent-dispatch.sh     # Тесты agent-dispatch (заглушки обёрток)
+├── tests/test-orchestrator-defaults.sh  # Встроенные роли, команды и лимиты не изменились
 └── vendor/codex-companion/          # Вендорный companion runtime OpenAI
 ```
 
@@ -214,6 +375,9 @@ Upstream-база записана в `vendor/codex-companion/VERSION`. Лока
 bash tests/test-sdd-scripts.sh
 bash tests/test-pipeline-context.sh
 bash tests/test-zcode-dispatch.sh
+bash tests/test-agent-core.sh
+bash tests/test-agent-dispatch.sh
+bash tests/test-orchestrator-defaults.sh
 ```
 
 Для выпуска синхронизируйте версию в `.claude-plugin/plugin.json`, обоих README, `PLUGIN_README.md` и записи плагина во внешнем [каталоге marketplace `strigov-cc-plugins`](https://github.com/strigov/strigov-cc-plugins). Обновление только этого репозитория не публикует новую marketplace-версию.

@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.11.1" src="https://img.shields.io/badge/version-0.11.1-7c8cff?style=flat-square">
+  <img alt="Version 0.12.0" src="https://img.shields.io/badge/version-0.12.0-7c8cff?style=flat-square">
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square">
   <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-35d6a6?style=flat-square">
 </p>
@@ -134,6 +134,156 @@ Every role runs on a pinned model + effort pair. Claude subagents receive an exp
 
 `max` is reserved for the implementers GLM and Luna (or used when the user asks for it by name); `ultra` is never chosen automatically — only when the user explicitly asks for it. GLM quota: on 2026-10-14 the 1.5× ZCode quota bonus measured inconclusive (expected/measured credits = 3.02 at the standard rate, or 1.51 if the window was off-peak; details in docs/zcode-cli-findings.md).
 
+This table is the built-in scheme: with no `config.json` it is exactly what runs. Any role can be rebound to a profile of your own — see [Your own harnesses and APIs](#your-own-harnesses-and-apis).
+
+## Your own harnesses and APIs
+
+`bin/agent-dispatch` binds pipeline roles to **profiles**. A profile is a harness, a way to pay (the harness's own login or an API key), a model and an effort. A role takes a **chain** of profiles: the first is the primary, the others are fallbacks in order. Without a configuration file nothing changes.
+
+This release (0.12.0) ships the routing layer: profiles, keys, `route`, `doctor`, job status, and the pass-through to ZCode and Codex. You can already move the in-session roles to another Claude model or effort, and the external roles to other Codex models. Adapters for `claude -p`, DeepSeek Harness (`dsh`), OpenCode and pi come in the next releases. Until then, a profile on one of those harnesses is refused with `harness <h> is not available in this version`, and the orchestrator moves on to the next profile in the chain.
+
+`agent-dispatch` lives in the plugin's `bin/`. In your own terminal, call it by its absolute path; Claude can print it for you.
+
+### A profile in three steps
+
+```bash
+agent-dispatch preset list                                          # what can be copied
+agent-dispatch profile add deepseek-claude --from claude-deepseek   # 1. a profile from a preset
+agent-dispatch key set deepseek                                     # 2. the key, at a hidden prompt
+agent-dispatch doctor --profile deepseek-claude --probe             # 3. offline checks + one short paid request
+```
+
+1. `profile add <name> --from <preset> [--model M] [--key K] [--set k=v]` copies a preset into `config.json`. A preset with a `<…>` placeholder needs it filled by a flag; otherwise nothing is written.
+2. Store the key yourself, in your own terminal. `key set <name>` asks for it at a hidden prompt. From a Claude Code session you can pipe it instead: `! pbpaste | agent-dispatch key set <name>`, or on Linux `wl-paste` / `xclip -o -selection clipboard`. A key passed as an argument is refused. A `login` profile uses the harness's own login. For a profile with its own isolated directory, run `eval "$(agent-dispatch profile env <name>)"` first.
+3. `doctor --profile <name>` checks everything that can be checked without a model call. `--probe` adds one short paid request on your key or subscription; you run it, the pipeline never does.
+
+In 0.12.0 every preset targets `claude`, `dsh`, OpenCode or pi, so step 3 of this example ends in `harness claude is not available in this version` until that harness's adapter ships. The profiles that work today are written by hand: another Codex model or effort, or another Claude model in the session. For example, a cheaper control review and a Sonnet plan writer:
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "astra-medium": { "harness": "codex",  "model": "gpt-6-astra", "effort": "medium" },
+    "sonnet-high":  { "harness": "inproc", "model": "sonnet",      "effort": "high" }
+  },
+  "roles": {
+    "control-review": ["astra-medium"],
+    "plan-writer":    ["sonnet-high"]
+  }
+}
+```
+
+**Where it lives.** Your profiles and roles are in `~/.claude/plugins/data/superpowers-strigov-ver-agents/config.json`. The directory has mode 0700, and the file holds no secrets: keys sit in `keys/<name>` with mode 0600.
+
+- The file needs `"version": 1`.
+- Your profiles are added to the built-in ones. The built-in profiles cannot be redefined: `glm`, `luna`, `sol`, `astra`, `astra-high`, `opus-xhigh`, `opus-high` and `sonnet-medium`. To change one, copy it under a new name.
+- A role in the file, `"roles": { "<role>": ["<profile>", …] }`, replaces that role's whole built-in chain. Every other role stays built-in.
+- An unknown field, or a role that names a missing profile, is refused with its name, so a typo like `efort` cannot pass silently. A broken file is reported in one `config:` line, and the orchestrator asks you one question.
+
+**Keys from elsewhere.**
+
+- The default, `{"key": "<name>"}`, reads the key from the store above.
+- A key already exported in your shell is passed only as `{"keyEnv": "VAR"}`. Without it, the environment allowlist strips the variable.
+- A password manager works through `{"keyCmd": [...]}`:
+  - macOS: `["security", "find-generic-password", "-w", "-s", "deepseek"]`
+  - Linux: `["secret-tool", "lookup", "service", "deepseek"]`
+  - any OS: `["op", "read", "op://…"]`
+
+A key reaches only the harness process's environment, never its argv, a settings file or the chat. The pipeline never runs `key set` and never asks you for a key.
+
+Profiles that share a key, a harness login (an OpenCode or pi login counts per provider) or a `shares` label drop out together on `auth` or `quota`. The built-in `glm` carries `zai-coding-plan`, so a Z.ai API fallback with that label is not tried against the same exhausted quota.
+
+### Role routing
+
+| Role (name in `config.json`) | Where in the pipeline | Default | Runs |
+|---|---|---|---|
+| `plan-writer` | plan writer | `opus-xhigh` | in the session (Agent tool) |
+| `plan-reviser` | plan revisions | `opus-high` | in the session |
+| `plan-reviewer` | plan review (loop up to 4) | `astra` | external harness |
+| `spec-reviewer` | spec review in brainstorming | `astra` | external harness |
+| `implementer` | non-frontend phases, fix, gate-fix, final fix wave, integration repair | `glm`, `luna` | external harness |
+| `implementer.risk` | SECURITY/DATA_LOSS phases | `sol` | external harness |
+| `implementer.escalation` | escalation to deeper reasoning | `sol` | external harness |
+| `frontend.new-ui` | frontend phases with new UI | `opus-high` | in the session |
+| `frontend.tweak` | tweaks to existing frontend | `sonnet-medium` | in the session |
+| `gate` | lint, typecheck, affected tests | `sonnet-medium` | in the session |
+| `phase-review` | phase review 4.1 | `opus-high` | in the session |
+| `phase-review.escalated` | phase review 4.1 on risk-marked phases and in round 4 | `opus-xhigh` | in the session |
+| `control-review` | control review 4.2 | `astra-high` | external harness |
+| `synthesis` | review synthesis | `sonnet-medium` | in the session |
+| `final-review` | final whole-branch review | `opus-xhigh`, `astra` | in the session, then external |
+| `diagnosis` | BLOCKED, stalled gate | `opus-high` | in the session |
+| `quickfix` | trivial edits | `sonnet-medium` | in the session |
+| `integration-check` | parallel-group integration check | `sonnet-medium` | in the session |
+| `adhoc-review` | `requesting-code-review`, the second opinion in `systematic-debugging` | `astra-high` | external harness |
+
+`frontend.new-ui` and `frontend.tweak` are two roles, not a chain: triage picks one, as before.
+
+An example for someone without OpenAI:
+
+```json
+"roles": {
+  "implementer":            ["glm", "deepseek-dsh"],
+  "implementer.risk":       ["claude-sub"],
+  "implementer.escalation": ["claude-sub"],
+  "plan-reviewer":          ["deepseek-claude", "oc-copilot"],
+  "spec-reviewer":          ["deepseek-claude"],
+  "control-review":         ["deepseek-claude", "glm-api"],
+  "final-review":           ["opus-xhigh", "deepseek-claude"],
+  "adhoc-review":           ["deepseek-claude"]
+}
+```
+
+- When GLM fails, a phase goes to `deepseek-dsh` instead of Luna.
+- Risk-marked phases and escalations run on Opus through the Claude subscription.
+- Reviewers run on DeepSeek, with Copilot and the GLM API as fallbacks.
+
+More about routing:
+
+- **In-session roles.** These roles can be bound to your own `inproc` profiles, that is, to another Claude model or effort. For example, on Claude Pro you can define `"sonnet-high": { "harness": "inproc", "model": "sonnet", "effort": "high" }` and set `"plan-writer": ["sonnet-high"]`. Running these roles on external harnesses comes in a later release. Until then, `route` uses only the in-session profiles of such a chain (with none left, the built-in one) and prints one note. `final-review` is not limited this way: its chain runs in order.
+- **How the pipeline reads routes.**
+  - At start and after a compaction, the orchestrator runs `agent-dispatch route --all`. The answer `routes: default` is not announced. Otherwise you get one line with your differences.
+  - Before every reviewer dispatch, at a phase's first implementer dispatch and at every switch it runs `route <role>`, so nothing has to be remembered. A phase's retries and fix rounds stay on its current profile.
+  - A switch to the next profile in a chain is one announced line, for example `Channel implementer: glm-api → deepseek-dsh (glm-api: quota).`
+- **Kill switch.**
+  - "без GLM" and "через Luna" work as before.
+  - "без <profile>" drops any profile from every chain until the session ends. With the example above, "без GLM" sends every phase, risk-marked ones included, to `deepseek-dsh`.
+  - `SP_IMPLEMENTER=<profile>` makes that profile the implementer for every phase. `SP_IMPLEMENTER=luna` works as before; `SP_IMPLEMENTER=glm` names the default and changes nothing.
+- **Family rule.** In the built-in scheme the writer and the reviewer of an artifact come from different model families. `agent-dispatch` does not check your routing for this. Keep each reviewer in a different family from the plan writer and the implementer.
+
+### What providers allow — for reference, as of 2026-10-20; your responsibility
+
+| Subscription / key | Officially allowed | Grey zone | Not allowed |
+|---|---|---|---|
+| Claude Pro/Max | Claude Code, including `claude -p` [AN1, AN4] | — | OAuth in third-party harnesses (OpenCode, pi and others) |
+| ChatGPT Plus/Pro | Codex; OpenCode, pi ("Sign in with ChatGPT"), Kilo [OA1, OA6] | harnesses OpenAI does not name | ChatGPT Business/Enterprise in third-party harnesses |
+| GLM Coding Plan | ZCode, Claude Code, Codex, OpenCode, pi, Crush, Kilo, Cline | — | tools missing from Z.ai's list (Qwen Code, Kimi CLI, dsh) |
+| GitHub Copilot | OpenCode [GH1] | Crush, Kilo, Cline | pi's login (pi presents itself as VS Code) |
+| OpenCode Go | Claude Code, Codex, ZCode, pi, OpenCode, Kilo | — | — |
+| OpenCode Zen | OpenCode | outside OpenCode | — |
+| Kimi Code | interactive use | headless runs (Kimi's terms say interactive only, although the CLI docs show `kimi -p`) | — |
+| MiniMax M Plan | any compatible tool | headless runs (the plan is meant for interactive use) | — |
+| Alibaba Coding Plan | interactive use | — | headless runs [AL1] |
+| Alibaba / QwenCloud Token Plan | — | headless runs | — |
+| Google AI (Gemini, Antigravity) | Google's tools | — | OAuth in third-party harnesses; running `agy` from a third-party harness |
+| Ollama Cloud | — | automation (not explicitly allowed by the terms) | — |
+| Any pay-as-you-go key (DeepSeek, Z.ai Standard, Kimi Platform, MiniMax API, Alibaba PAYG, OpenRouter) | any harness | — | — |
+| Local model | any harness | — | — |
+
+`claude -p` with a third-party endpoint does not breach Anthropic's terms, but Anthropic does not support that configuration.
+
+The source IDs in brackets refer to [docs/research/universal-dispatchers/07-tos-matrix.md](./docs/research/universal-dispatchers/07-tos-matrix.md).
+
+### If something breaks
+
+Collect three things and attach them to an issue or a message to the owner:
+
+- the output of `agent-dispatch doctor --profile <p>`;
+- the output of `agent-dispatch status <id> --json`;
+- the job log, `state/<workspace>/jobs/<id>.log` in the data directory above. Secrets are redacted in it.
+
+If an endpoint rejects the request's beta fields, add `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` to the profile's `env`.
+
 ## Guardrails
 
 - **Manual start** — pipeline skills carry `disable-model-invocation: true`: the model neither sees nor loads them on its own. They run only after you start them, chain into each other by reading `SKILL.md` files, and resume an in-progress plan only when you ask to continue. The discipline skills (`systematic-debugging`, `test-driven-development`, `verification-before-completion`, `receiving-code-review`) still trigger automatically.
@@ -155,12 +305,14 @@ Every role runs on a pinned model + effort pair. Claude subagents receive an exp
 | `dev-orchestrator` | Complete planning, implementation, verification, review, commit, and resume protocol |
 | `codex-invocation` | Reliable background Codex dispatch through the vendored companion runtime |
 | `zcode-invocation` | Background GLM-5.3-Flash dispatch through Z.ai's ZCode CLI: setup, doctor/probe, Monitor loop, failure handling |
+| `agent-invocation` | Role routing through `agent-dispatch` profiles: `route`, jobs by id prefix, failure classes, headless preambles |
 | `architecture-memory` | Compact persistent architecture map in `docs/ARCHI.md` |
 | `/dev` | Explicit entry point for the full delivery protocol; with no task, resumes an in-progress plan |
 | `bin/pipeline-context` | SessionStart hook: names an in-progress plan and the skill to re-read after compaction, otherwise silent |
 | `bin/review-package` | Generates reviewer-ready commit and diff packages |
 | `bin/sdd-workspace` | Resolves isolated per-plan scratch workspaces |
 | `bin/zcode-dispatch` | ZCode CLI job wrapper: task/status/result/cancel/release-stale/doctor/api-key with pinned model, mode and client identification; `release-stale` frees a workspace reservation left by a crashed job, after verifying it is dead |
+| `bin/agent-dispatch` | Profiles, keys and role routes (`route`, `channels`, `doctor`); one `status` across ZCode, Codex and its own jobs; pass-through to `zcode-dispatch` and `codex-dispatch` |
 
 ### Adapted Superpowers skills
 
@@ -177,14 +329,20 @@ The upstream `subagent-driven-development` skill is replaced by `dev-orchestrato
 ├── commands/dev.md                  # /dev command entry point
 ├── hooks/hooks.json                 # SessionStart → bin/pipeline-context
 ├── bin/
+│   ├── agent-dispatch               # Profiles, keys, role routes, job dispatch
 │   ├── codex-dispatch               # Vendored companion wrapper
 │   ├── pipeline-context             # In-progress plan / re-read hint for the session
 │   ├── review-package               # Reviewer-ready diff package generator
 │   ├── sdd-workspace                # Per-plan scratch workspace resolver
 │   ├── zcode-dispatch               # ZCode CLI job wrapper (shim)
-│   └── lib/zcode-dispatch.mjs       # ZCode job runner, records, doctor
+│   ├── lib/zcode-dispatch.mjs       # ZCode job runner, records, doctor
+│   ├── lib/agent-core.mjs           # Shared job core for agent-dispatch
+│   ├── lib/agent-dispatch.mjs       # agent-dispatch CLI, config, routes
+│   ├── lib/agents-defaults.json     # Built-in profiles, roles, presets
+│   └── lib/adapters/                # Harness adapters
 ├── skills/
 │   ├── dev-orchestrator/            # Protocol and role prompt templates
+│   ├── agent-invocation/
 │   ├── codex-invocation/
 │   ├── zcode-invocation/
 │   ├── architecture-memory/
@@ -192,6 +350,9 @@ The upstream `subagent-driven-development` skill is replaced by `dev-orchestrato
 ├── tests/test-sdd-scripts.sh        # Workspace/package integration tests
 ├── tests/test-pipeline-context.sh   # SessionStart hook + manual-only skill checks
 ├── tests/test-zcode-dispatch.sh     # ZCode wrapper tests (stubbed CLI)
+├── tests/test-agent-core.sh         # Job core tests (trivial adapter)
+├── tests/test-agent-dispatch.sh     # agent-dispatch tests (stubbed wrappers)
+├── tests/test-orchestrator-defaults.sh  # Built-in roles, commands and caps unchanged
 └── vendor/codex-companion/          # Vendored OpenAI companion runtime
 ```
 
@@ -214,6 +375,9 @@ Run the test suites:
 bash tests/test-sdd-scripts.sh
 bash tests/test-pipeline-context.sh
 bash tests/test-zcode-dispatch.sh
+bash tests/test-agent-core.sh
+bash tests/test-agent-dispatch.sh
+bash tests/test-orchestrator-defaults.sh
 ```
 
 For a release, synchronize the version in `.claude-plugin/plugin.json`, both README files, `PLUGIN_README.md`, and the plugin entry in the external [`strigov-cc-plugins` marketplace catalog](https://github.com/strigov/strigov-cc-plugins). Updating this repository alone does not publish a marketplace release.

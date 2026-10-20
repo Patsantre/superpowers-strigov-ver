@@ -1,6 +1,6 @@
 # Opus Subagent — Code Review (Step 4.1)
 
-Use when Sonnet orchestrator needs Opus to review the implementer's work on a phase (GLM, Codex Luna or Sol, or the Claude frontend implementer — do not assume the family). Fresh subagent each round (no bias from previous review rounds).
+Use when Sonnet orchestrator needs Opus to review the implementer's work on a phase (GLM, Codex Luna or Sol, the Claude frontend implementer, or any rebound implementer profile — do not assume the family). Fresh subagent each round (no bias from previous review rounds).
 
 ## Invocation
 

@@ -93,7 +93,7 @@ Reuse the template at `../dev-orchestrator/codex-control-review-prompt.md`. Adap
 - Fill "Implementer report:" with `none — standalone review` and "Verify additionally" with `none`.
 - Ledger references (`AUTHORIZED_CHANGE_LEDGER`, `docs/plans/<slug>.ledger.json`): no ledger exists in standalone use — delete those sentences from the filled prompt.
 
-Invocation is read-only (`--model gpt-6-astra --effort high`, no `--write`). Poll via Monitor per `../codex-invocation/SKILL.md` (`Read` it; manual-only skill).
+Invocation is read-only (`--model gpt-6-astra --effort high`, no `--write`). The reviewer is the profile of the `adhoc-review` role (`"$AD" route adhoc-review`, per `../agent-invocation/SKILL.md`); by default Astra, the same command. Another profile is dispatched by its `harness=` as that skill's step 3 says (`zcode` via `$ZDISPATCH`, no model flags; a core harness via `"$AD" task --profile <p> --role adhoc-review`, no `--write`), with its reviewer preamble on `zcode` and core harnesses. Poll via Monitor per `../codex-invocation/SKILL.md` (`Read` it; manual-only skill; core ids per `../agent-invocation/SKILL.md`).
 
 **Combined verdict handling (same loop as dev-orchestrator Step 4, cap=4):**
 
