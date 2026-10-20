@@ -4,8 +4,8 @@
 # Resolves zcode-dispatch.mjs regardless of install layout (marketplace cache,
 # newest version first, then the local dev tree), pins ZCODE_STATE_DIR so job
 # state lives under ~/.claude/plugins/data/superpowers-strigov-ver-zcode, and
-# execs node. The .mjs drives Z.ai's own ZCode CLI (embedded in
-# /Applications/ZCode.app) headless — never the Z.ai API directly.
+# execs node. The .mjs drives Z.ai's own ZCode CLI (embedded in the ZCode app:
+# /Applications/ZCode.app on macOS, /opt/ZCode on Linux) headless — never the Z.ai API directly.
 #
 # Usage: zcode-dispatch <task|status|result|cancel|release-stale|doctor|api-key> [args...]
 set -eu

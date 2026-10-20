@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.10.2" src="https://img.shields.io/badge/version-0.10.2-7c8cff?style=flat-square">
+  <img alt="Version 0.11.0" src="https://img.shields.io/badge/version-0.11.0-7c8cff?style=flat-square">
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square">
   <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-35d6a6?style=flat-square">
 </p>
@@ -35,7 +35,25 @@ npm install -g @openai/codex
 codex login
 ```
 
-Optional — the default implementer, **GLM-5.3-Flash via Z.ai's ZCode**: install [ZCode.app](https://github.com/zai-org/ZCode) into `/Applications`, then store a GLM Coding Plan API key from <https://z.ai/manage-apikey/apikey-list> once: run `zcode-dispatch api-key set` in a terminal and paste the key at the hidden prompt. The key becomes a provider of ZCode's own "Z.ai Coding Plan" template in the wrapper's private config and does not expire. There is no OAuth login: the CLI's `zcode login` keeps no refresh token and lasts about an hour (details in the `zcode-invocation` skill, "One-time setup"). Without a key, `zcode-dispatch doctor` fails and the pipeline implements on Codex Luna `max` instead — announced, never silent. Behind a local proxy, export `ZCODE_HTTP_PROXY=http://<host>:<port>` if headless runs fail with a network error (the CLI ignores `HTTP(S)_PROXY` and the macOS system proxy; the wrapper passes this variable via the allowlist). The CLI receives an allowlisted environment; explicitly pass extra names with `ZCODE_ENV_PASSTHROUGH="NAME1,NAME2"`.
+Optional — the default implementer, **GLM-5.3-Flash via Z.ai's ZCode**: install [ZCode](https://github.com/zai-org/ZCode) — macOS: ZCode.app into `/Applications`; Linux: see [Linux: ZCode for the GLM channel](#linux-zcode-for-the-glm-channel) below; Windows is not supported yet — then store a GLM Coding Plan API key from <https://z.ai/manage-apikey/apikey-list> once: run `zcode-dispatch api-key set` in a terminal and paste the key at the hidden prompt. The key becomes a provider of ZCode's own "Z.ai Coding Plan" template in the wrapper's private config and does not expire. There is no OAuth login: the CLI's `zcode login` keeps no refresh token and lasts about an hour (details in the `zcode-invocation` skill, "One-time setup"). Without a key, `zcode-dispatch doctor` fails and the pipeline implements on Codex Luna `max` instead — announced, never silent. Behind a local proxy, export `ZCODE_HTTP_PROXY=http://<host>:<port>` if headless runs fail with a network error (the CLI ignores `HTTP(S)_PROXY` and the macOS system proxy; the wrapper passes this variable via the allowlist). The CLI receives an allowlisted environment; explicitly pass extra names with `ZCODE_ENV_PASSTHROUGH="NAME1,NAME2"`.
+
+#### Linux: ZCode for the GLM channel
+
+Z.ai publishes no Linux build of ZCode, but its embedded CLI is plain JavaScript and runs on Linux under Node. The wrapper needs three things from a ZCode desktop install (the same version on every machine): `glm/` (the CLI), `config/provider/zcode-builtin.json`, and `app.asar` (the version source). Checked with ZCode 3.15.1 on Debian bookworm, Node 26.
+
+Steps for your agent (Claude Code on the Linux machine):
+
+1. Check the prerequisites: `node --version` (major ≥ 26), `flock --version` (util-linux; install it if missing), `git --version`.
+2. Choose the install root. Default: `/opt/ZCode` (needs sudo, ask the user). Without sudo: `~/.local/opt/ZCode`, and set `"env": { "ZCODE_APP": "/home/<user>/.local/opt/ZCode" }` in `~/.claude/settings.json` so every `zcode-dispatch` call sees it.
+3. Get the files into `<root>/resources/`. Pick the first source that is available:
+   - **A macOS install** (the user runs this on the Mac, or gives you SSH access): copy `/Applications/ZCode.app/Contents/Resources/{glm,config,app.asar}`, for example `rsync -a mac:/Applications/ZCode.app/Contents/Resources/{glm,config,app.asar} <root>/resources/`.
+   - **A Windows install**: copy `glm\`, `config\` and `app.asar` from the `resources\` folder of the ZCode install directory (usually `%LOCALAPPDATA%\Programs\ZCode\resources`; confirm by looking for `resources\glm\zcode.cjs`).
+   - **The official installer** from <https://github.com/zai-org/ZCode/releases> (ask the user before downloading). Unpack it with `7z x` (p7zip). A Windows `.exe` holds a nested `app-64.7z` that also needs `7z x`. Then copy the directory that contains `glm/zcode.cjs`, `config/` and `app.asar` (`find . -path '*/glm/zcode.cjs'`). A release older than the wrapper's verified version only makes `doctor` warn `app-version`. If `doctor` fails `auth: ZCode template incompatible`, that version cannot be used.
+   - **The source** at <https://github.com/zai-org/ZCode> (Apache-2.0): build the desktop app for Linux and use its `resources/`. This is the heaviest route, and the plugin has not tested it.
+4. Verify: `node <root>/resources/glm/zcode.cjs --version` prints the CLI version, and `zcode-dispatch doctor` shows `ok platform: linux (config lock: flock(1))` and `ok app: <root> <version>`. At this point only `personal-config` and `auth` may fail, because no key is stored yet.
+5. Hand the API key step to the user. Never ask for the key in the chat. Give the user one exact command line for their own terminal: the absolute path of `zcode-dispatch` and, if the install root is not `/opt/ZCode`, a `ZCODE_APP=<root>` prefix (their shell does not see Claude Code's `settings.json`), e.g. `ZCODE_APP=~/.local/opt/ZCode /path/to/bin/zcode-dispatch api-key set`. The user runs it and pastes the key at the hidden prompt. Then run `zcode-dispatch doctor --probe` (one short request): `probe: ok` means the GLM channel is up.
+
+Do not install third-party ZCode CLI packages (for example `zcode-app-cli` from npm). Use only files from Z.ai's own app or source. Behind a proxy, export `ZCODE_HTTP_PROXY` (see above).
 
 ### 2. Install the plugin
 
