@@ -1,0 +1,831 @@
+# Универсальные диспетчеры: харнессы, профили и маршрутизация ролей — проектное решение
+
+- **Дата:** 2026-10-20
+- **Статус:** утверждена владельцем; реализация — ветка `feat/universal-dispatchers`
+- **Ветка:** `research/universal-dispatchers` (от `main` после PR #10, HEAD `3b996bb`)
+- **Исследование:** `docs/research/universal-dispatchers/` — отчёты `00`–`10`, проектные заметки `design/D1`–`D4`, `design/judgments.md`
+- **Заменяет:** `docs/research/2026-10-20-universal-dispatchers.md` (английский синтез). Он остаётся архивом; его рекомендации по политикам, уровням и гейтам отменены (§1.2).
+
+Ссылки вида [01 §9] ведут в `docs/research/universal-dispatchers/01-claude-code-headless.md`, раздел 9. Номера отчётов: 00 — текущая архитектура и точки связности C1–C25; 01 — `claude -p`; 02 — OpenCode; 03 — pi; 04 — обзор харнессов; 04b — DeepSeek Harness (`dsh`); 05 — сторонние модели в Codex; 06 — провайдеры и подписки; 07 — условия провайдеров; 08 — локальные модели; 09 — песочницы и учётные данные; 10 — ACP как универсальный транспорт. [D2], [D4] — файлы в `design/`; [J1] — раздел J1-feasibility в `design/judgments.md`.
+
+### Термины
+
+- **Харнесс** — агентная программа, которая ведёт модель: `claude`, `opencode`, `pi`, `dsh`, ZCode CLI, Codex. **Headless-режим** — неинтерактивный запуск без TUI: промпт на входе, ответ на выходе.
+- **Обёртка** — только скрипты `zcode-dispatch` и `codex-dispatch`, через которые плагин сейчас запускает ZCode и Codex. **companion** — вендорный скрипт OpenAI, через который `codex-dispatch` вызывает Codex.
+- **Профиль** — харнесс + способ подключения + модель (+ effort) + опции (§3.4).
+- **Роль** — место в пайплайне (имплементер, ревьюер плана и т. д.). У роли есть **цепочка** профилей: первый — основной, остальные — запасные, по порядку.
+- **Канал** — профиль, который сейчас исполняет роль. Так в `SKILL.md` и README называют GLM и Luna.
+- **Ключ или вход** — чем профиль оплачивает запросы: API-ключом или входом в харнесс (подпиской). Профили с общим ключом или входом выбывают вместе (§3.5).
+- **Резервация рабочего дерева** — блокировка `active.lock.<generation>`, которая не даёт двум пишущим задачам работать в одном дереве git.
+- **FRESH** — новая задача с нуля вместо продолжения сессии; **повторный бриф (re-brief)** — вводная часть промпта, которая заново объясняет задачу.
+- **Сайдкар** — файл `.id` рядом с файлом отправки; в нём `<профиль>:<id задачи>`.
+- **Kill switch** — ручное отключение канала GLM: фразы «через Luna», «без GLM» или переменная `SP_IMPLEMENTER`.
+- **Сжатие контекста** (context compaction) — Claude Code сжимает историю сессии; состояние оркестратора сохраняется через файлы-маркеры.
+- **Рисковые фазы** — фазы с пометкой SECURITY или DATA_LOSS (Step 2.5).
+- **PAYG-ключ** — API-ключ с оплатой по факту использования.
+
+---
+
+## 1. Решения владельца
+
+### 1.1 Сводка
+
+1. **Отталкиваемся от харнесса, а не от подписки.** Единица настройки — **профиль**: харнесс + способ подключения (вход в харнесс или его подписку либо API-ключ с эндпоинтом) + модель (+ effort) + опции.
+2. **ZCode остаётся** каналом GLM по умолчанию. `zcode-dispatch` и `bin/lib/zcode-dispatch.mjs` в этом проекте не меняются: общее ядро начинается как выделенная копия, дедупликация — потом и отдельно (§3.1).
+3. **Codex остаётся только для моделей OpenAI** (Luna, Sol, Astra) — через тот же `codex-dispatch` и companion, как сейчас. `agent-dispatch` не проверяет `model` у профилей `codex` и передаёт его companion как есть. Сторонних провайдеров в конфигурации Codex мы не документируем и не поддерживаем; если пользователь настроит их сам, это его дело.
+4. **`claude -p` становится универсальным.** Он работает и с подпиской Claude (обычный вход в `claude`), и с любым числом API-профилей к любому Anthropic-совместимому эндпоинту: GLM, DeepSeek, API Kimi, MiniMax и Qwen, OpenRouter, локальные модели.
+5. **Новые харнессы:** OpenCode, pi и DeepSeek Harness (`dsh`). DeepSeek доступен двумя путями: через `claude -p` и через `dsh`.
+6. **Подписки Kimi Code и MiniMax не поддерживаем.** API-ключи этих провайдеров работают как любой API. Antigravity не поддерживаем: у него нет headless-режима для стороннего запуска.
+7. **Схема пайплайна владельца работает по умолчанию и не меняется.** Без пользовательской конфигурации всё работает в точности как сейчас.
+8. **Любую роль можно переназначить** на любой профиль. Ограничений по харнессам, провайдерам и ролям нет, в том числе для рисковых фаз и ревьюеров. Роли субагентов Claude с инкремента 1 переназначаются на другую модель или effort внутри сессии, а внешнее исполнение получают в инкременте 6 (§5.1, §8).
+9. **Риски несёт пользователь.** Код ничего не запрещает и не проверяет условия провайдеров. В документации есть справочная таблица.
+10. **Песочница — опция профиля**, по умолчанию выключена у всех харнессов, включая `dsh`. Как её включить, описано в документации; остальное пользователь настраивает сам.
+11. **Способ передачи ключа для `claude -p` владелец не выбирает:** он выбран в этой спецификации (§3.5).
+12. **Живых проверок и покупки токенов нет.** Тесты идут на заглушках; дымового прогона в плане нет. Друзья сообщают о проблемах и помогают дорабатывать.
+13. **Без лишних церемоний:** никаких квитанций, гейтов и машин состояний. Каждый сбой заканчивается объявленным переходом на запасной профиль; если цепочка исчерпана, пользователю задаётся ровно один вопрос.
+
+### 1.2 Что отменено из прежних рекомендаций
+
+Отменено из архивного синтеза, D1–D4 и judgments:
+
+- движок условий провайдеров: `policy.json` и белый список троек (подписка, харнесс, режим) с отказом по умолчанию [07, итог п. 5];
+- `allowGray` / `grayOptIn` для серых сочетаний;
+- уровни безопасности T0–T3;
+- гейты `riskEligible`, то есть ограничение, каким профилям можно доверить рисковые фазы;
+- L3-аудиты и поиск секретов (secret scan) в диффах;
+- живые проверки как условие выпуска;
+- `codex exec` для сторонних моделей [05];
+- привязка «подписка ↔ эндпоинт», то есть ключ подписки разрешён только на определённом эндпоинте или харнессе;
+- проверки формы и типа ключа (префиксы `sk-sp-`, тип ключа Z.ai и т. п.);
+- встроенный модуль `srt` (sandbox-runtime) и его настройка кодом;
+- канареечные проверки утечек;
+- песочница `claude -p`, включённая по умолчанию с набором deny-правил;
+- запрет режима `danger-full-access` у `dsh` [04b] и отказ запуска на непроверенной версии харнесса.
+
+Из исследования остаются: факты о харнессах; интерфейс адаптера [D4] без политик; формат конфигурации [D2] в упрощённом виде; обязательные внутренние настройки (§3.6).
+
+---
+
+## 2. Поддерживаемые харнессы
+
+| Харнесс | Подключение | Продолжение сессии (resume) | Режим только чтения (ревьюер) | Своя песочница | Особенности |
+|---|---|---|---|---|---|
+| `zcode` (ZCode CLI, GLM) | ключ GLM Coding Plan через `zcode-dispatch api-key set` | `--resume-task zt-…` | нет: обёртка всегда запускает `--mode yolo` | нет | сквозной вызов `zcode-dispatch`. Модель закреплена обёрткой: GLM-5.3-Flash `max`. Промпт передаётся через argv, поэтому действует `MAX_PROMPT_BYTES` [00 §1] |
+| `codex` (companion) | вход Codex (ChatGPT) или ключ OpenAI в конфигурации Codex | `--resume-task task-…` (нить Codex) | да, без `--write` | да, песочница Codex | сквозной вызов. `model` не проверяется и уходит companion как есть. У companion нет резервации дерева, таймаута и `errorClass` — так и остаётся [00 §1] |
+| `claude`, подписка | подписка Claude (Pro/Max); вход хранится в `$CLAUDE_CONFIG_DIR` пользователя, если он задан, иначе в `~/.claude` | `--session-id` задаётся при старте, `--resume <uuid>` — при продолжении. Сессия привязана к каталогу конфигурации и `cwd` [01] | да: Read, Glob, Grep и команды git только на чтение (§3.6) | да, только для Bash [01; 09 §3] | тратит те же лимиты подписки, что и сессия оркестратора [07 AN4] |
+| `claude`, API | API-ключ и эндпоинт (любой Anthropic-совместимый) или `none` для локальной модели | как в строке выше | как в строке выше | как в строке выше | ровно одна переменная с ключом; все уровни моделей закреплены на модели профиля [01 §6, §9; 06 §1] |
+| `opencode` (v1.19.x) | вход `opencode auth login` (Copilot, ChatGPT Plus/Pro, OpenCode Go, GLM Coding Plan) или API-ключ провайдера | `-s <sessionID>`; id берётся из JSON-событий; нужны тот же `--dir` и тот же каталог профиля [02] | да: агент `sp-reviewer` с полным явным набором прав (§3.6) | нет | stdin закрывается после промпта. Оставшийся запрос разрешения в headless-режиме автоматически отклоняется → `blocked`. `--auto` и `--attach` не используются. Дочерние процессы bash отсоединены [02] |
+| `pi` (1.3.x) | API-ключ провайдера (40+ встроенных провайдеров, `models.json` для своих эндпоинтов) или «Sign in with ChatGPT» (`/login` в TUI) | `--session-id`; нужны тот же `cwd` и файл сессии, иначе pi молча начнёт новую [03] | да: `--tools read,grep,find,ls` (без git) | нет | при ошибке провайдера выходит с кодом 0, поэтому исход определяется по событиям. `--mode json` обязателен: без TTY включается print-режим. Дочерние процессы bash отсоединены [03] |
+| `dsh` (0.2.x) | API-ключ DeepSeek: из хранилища `agent-dispatch` или из `~/.dsh/.env`; подписки у DeepSeek нет | `--session-id <id>` из события `session`, только в том же `cwd`; задать id заранее нельзя [04b] | да: `DSH_PERMISSION_MODE=read-only` (песочница ОС) | да, ограничивает только запись (`workspace-write`) [04b; 09] | на SIGTERM выходит с кодом 0. Модель и effort задаются только строками patch-файла. Ставится из npm (`@deepseek-ai/dsh`); `dsh` из Homebrew — другая программа [04b] |
+
+**Как адаптер запускает харнесс** (полный набор флагов и переменных — в §3.6):
+
+```
+zcode     zcode-dispatch task --background … --prompt-file F
+            (внутри обёртки: zcode -p <prompt> --output-format json --mode yolo)
+codex     codex-dispatch task --background [--write] --model M --effort E … --prompt-file F
+claude    claude -p --output-format json --setting-sources user|"" --settings <наложение> --model M --effort E
+            --tools <набор роли> --strict-mcp-config --disable-slash-commands
+            --append-system-prompt-file <job>/system.md --session-id <uuid> --permission-mode <режим роли> < prompt
+opencode  opencode run --format json --title <id> --agent sp-implementer|sp-reviewer -m <provider/model>
+            [--variant V] --dir <W> < prompt
+pi        pi --mode json --model <provider/id> --thinking <lvl> --session-dir <D> --session-id <id>
+            --no-approve -ne -ns -np --no-mcp [--tools …] < prompt
+dsh       dsh --profile headless --patch <job>/dsh.patch.yml --json - < prompt
+```
+
+**OpenCode 2.x.** Адаптер поддерживает v1 (`opencode-ai` 1.19.x). У v2 другой CLI: нужен `--standalone`, модель задаётся как `-m p/m#variant`, флага `--dir` нет [02]. `doctor` распознаёт v2 по версии и сообщает об этом одной строкой; задача на v2 получает класс `launch` с подсказкой поставить v1. Поддержку v2 добавим, когда она понадобится кому-нибудь из пользователей.
+
+**Не поддерживаем:**
+
+- Antigravity (`agy`): нет headless-режима для стороннего запуска, а запускать `agy` из стороннего харнесса на потребительских подписках Google не разрешает [04 §B; 07 GO2].
+- Qwen Code, Kimi Code CLI и остальные харнессы из обзора [04 §B]. Владелец их не выбрал; их модели доступны через API в `claude -p`, OpenCode и pi.
+- Подписки Kimi Code и MiniMax (M Plan). API-ключи Kimi Platform и MiniMax работают как любой API [06].
+- Сторонние модели в Codex [05]: не документируем и не поддерживаем, но и не запрещаем (§1.1 п. 3).
+- Входы pi в Anthropic и Copilot: для них нет ни пресетов, ни документации, потому что при таком входе pi представляется чужим клиентом (Claude Code, VS Code) [03; 07]. Код их специально не блокирует.
+
+---
+
+## 3. Архитектура
+
+### 3.1 Общее ядро
+
+```
+bin/agent-dispatch                    скрипт запуска по образцу bin/zcode-dispatch: находит node и запускает lib
+bin/lib/agent-core.mjs                общее ядро: выделенная копия общей части zcode-dispatch.mjs, дальше развивается само
+bin/lib/agent-dispatch.mjs            CLI: подкоманды, конфигурация, маршрутизация, ключи
+bin/lib/agents-defaults.json          встроенные профили и роли — текущая схема владельца
+bin/lib/adapters/claude.mjs           новые адаптеры (через ядро)
+bin/lib/adapters/opencode.mjs
+bin/lib/adapters/pi.mjs
+bin/lib/adapters/dsh.mjs
+bin/lib/adapters/zcode.mjs            сквозной: вызывает bin/zcode-dispatch
+bin/lib/adapters/codex.mjs            сквозной: вызывает bin/codex-dispatch
+bin/lib/zcode-dispatch.mjs            не меняется
+```
+
+Около 70% `zcode-dispatch.mjs` (1673 строки) общие [00 §2]. В ядро копируется:
+
+- хранилище задач `state/<basename>-<sha1(root)[:8]>/jobs/`, нумерация id и записи задач;
+- резервация рабочего дерева (`active.lock.<generation>`), уборка мёртвых раннеров по boot-id, `release-stale`;
+- `runCli`: отсоединённая группа процессов, stdin из файла, логи stdout/stderr, таймаут по общей длительности задачи, корректная склейка UTF-8;
+- `killGroup`;
+- `readSecretLine` (скрытый ввод) для `key set`;
+- белый список окружения (`ENV_ALLOW`, `ENV_ALLOW_PREFIXES`, `ENV_DENY`) без записей `ZCODE_*` и сборка env;
+- подкоманды `status`, `result`, `cancel`, `release-stale`, таксономия `errorClass`, каркас `doctor`/`--probe`.
+
+Новое в ядре, а не перенос:
+
+- снимок потомков (`ps -A -o pid=,ppid=,pgid=`) и сигнал их группам: сейчас `killGroup` (`zcode-dispatch.mjs:669`) шлёт сигнал только группе, а для OpenCode, pi и dsh от снимка зависит корректная отмена;
+- `redactor(values[])` вместо `keyRedactor(file, …)` (`zcode-dispatch.mjs:391`), который привязан к персональному конфигу ZCode;
+- лестница сигналов по адаптеру, классы ошибок новых харнессов, маршрутизация и ключи.
+
+**`zcode-dispatch.mjs` в этом проекте не трогаем.** Ядро не импортируется обёрткой ZCode; 110 тестов `tests/test-zcode-dispatch.sh` и строки обёртки остаются как есть. Цена — временное дублирование около 1100 строк; зато канал по умолчанию не затронут. Дедупликация — потом и отдельно, если понадобится.
+
+Профили `zcode` и `codex` обслуживаются **сквозными** адаптерами: `agent-dispatch` запускает существующую обёртку по таблице «Сквозные вызовы» (§3.3) и отдаёт её stdout, stderr и код выхода без изменений. Поэтому id `zt-…` и `task-…`, хранилища задач, отказы и закрепление модели остаются прежними.
+
+### 3.2 Интерфейс адаптера
+
+```js
+export default {
+  id: "claude",                        // значение поля harness в профиле
+  idPrefix: "ct",                      // ct- claude, oc- opencode, pi- pi, dt- dsh
+  manifest: {
+    sessionId: "preassign",            // preassign (claude, pi) | first-event (opencode, dsh)
+    cancel: { ladder: [["SIGTERM", 5000], ["SIGKILL", 0]] },   // dsh: [["SIGINT", 7000], ["SIGKILL", 0]]
+    helpArgv: ["--help"],              // opencode: ["run", "--help"]; dsh — команда, печатающая аргументы headless
+    requiredFlags: ["--output-format", "--setting-sources", "--session-id", "--tools"],
+    homeEnv: ["CLAUDE_CONFIG_DIR"],    // родная переменная каталога харнесса
+  },
+  discover(ctx),                       // → { bin, version } или ошибка класса launch
+  prepareHome(profile, ctx),           // → { env, files: [{ path, mode, content }] }: изолированный каталог и settings
+  invocation(req, ctx),                // → { argv, env, stdinPath, cwd, secretEnv: [имена], files: [{ path, mode, content }] }
+  reduce(io),                          // → { ok, response, sessionId, usage, reportedModel, errorClass | null, errorText }
+  finalize(job, ctx),                  // необязательный: второй процесс после завершения (opencode export <sid>)
+  resumeCheck(prev, profile, req, ctx),// → null | причина отказа (тогда exit 2 и FRESH)
+  patterns: { auth: [], quota: [], "model-not-selected": [], context: [], blocked: [], "resume-lost": [], transient: [] },
+  doctorChecks(profile, ctx),          // → [{ name, level: "ok" | "WARN" | "FAIL", hint }], без вызова модели
+  probe(profile, ctx),                 // → invocation для одного запроса «Reply with exactly: PONG»
+};
+```
+
+Структуры:
+
+- `req = { profile, role, write, job: { id, dir, cwd, workspaceRoot }, prompt: { path, bytes }, sessionId, resume: { sessionId, prev } | null }`. `sessionId` выдаёт ядро: UUID для `claude`, id задачи для pi, `null` для dsh и OpenCode (у них id приходит в первом событии).
+- `io = { events | stdout, stderrTail, exit: { code, signal }, timedOut, cancelled }`.
+
+Правила:
+
+- **Побочными эффектами владеет ядро:** процессы, файлы, сигналы, чтение ключей. Адаптер возвращает данные. `discover`, `doctorChecks`, `finalize` и `resumeCheck` запускают процессы и читают ФС только через `ctx.exec` и `ctx.fs`; в тестах они подменяются.
+- **Успех определяет только `reduce()`** по выводу харнесса. Код выхода — справочная информация: `claude -p`, pi и dsh могут вернуть 0 при ошибке, а OpenCode — 1 при валидном ответе [01; 02; 03; 04b].
+- **Порядок окружения:** белый список ядра → `env` адаптера (значения по умолчанию, §3.6 Б) → `profile.env` → обязательные настройки (§3.6 А; не переопределяются) → `secretEnv`. Адаптер не задаёт переменных, которые меняют идентификацию клиента.
+- **Версия и флаги.** Каждая задача читает `<bin> --version`; вывод `<bin> <helpArgv>` кешируется в каталоге состояния по паре (bin, version). Класс `launch` бывает только в трёх случаях: бинарника нет; это не тот бинарник (`dsh` из Homebrew, OpenCode 2.x); в справке нет обязательного флага. Если флаг в справке не виден (так бывает у dsh, где аргументы headless идут после флагов лаунчера), проверяется только версия. Непроверенную версию отмечает только `doctor` — одной строкой «версия X не проверялась, проверена Y»; запуск она не блокирует. Так ловятся несовместимые изменения CLI: у `claude` релизы выходят почти ежедневно [01].
+
+### 3.3 Команда `agent-dispatch`
+
+| Подкоманда | Назначение |
+|---|---|
+| `task --profile P [--role R] --background [--write] [--cwd W] [--resume-task ID \| --fresh] --prompt-file F` | Запускает задачу и печатает `agent-dispatch: P task started in the background as ct-0001` (id — последнее слово строки). `--write` означает пишущую роль; без него харнесс работает в режиме только чтения. Для `zcode` и `codex` выполняется сквозной вызов (таблица ниже), и их строка запуска печатается как есть: у `zcode` id — последнее слово, у `codex` — токен `task-…` внутри строки, как сегодня. Для профиля с `"harness": "inproc"` — отказ (exit 2): такую роль исполняет сама сессия через Agent tool. Перед запуском проверяются резервация и `maxParallel` (§3.9), ключ (§3.5) и resume (§3.6 А12) |
+| `status [ID] [--json]` | Без ID — задачи дерева во всех трёх хранилищах (ядра, zcode и companion): одна строка на задачу, `<id> <профиль> <статус> write=<yes\|no> cwd=<корень>`; `--json` даёт `{"jobs":[…]}` с теми же полями. С ID — по префиксу: для `ct-`, `oc-`, `pi-`, `dt-` JSON той же формы, что у `zcode-dispatch` (`job.status` ∈ {running, completed, failed, cancelled}, `job.errorClass`), плюс `job.profile` и `job.harness`; для `zt-` и `task-` — вывод обёртки как есть |
+| `result ID` | При `completed` — финальное сообщение харнесса дословно в stdout (строка 1 — токен вердикта или статуса от модели), exit 0. При любом другом состоянии — stderr `job <id> is <status> errorClass=<class>` и последние 20 строк лога, exit 1, как у `zcode-dispatch`. Поток событий хранится в логе задачи. Для `zt-` и `task-` — вывод обёрток, как сейчас |
+| `cancel ID` | Отмена с уничтожением всего дерева процессов (§3.6 А8). `zt-` и `task-` уходят в обёртку |
+| `release-stale [--cwd W]` | Снимает зависшую резервацию ядра (задачи `ct-`, `oc-`, `pi-`, `dt-`). Резервацию ZCode снимает `"$ZDISPATCH" release-stale`, как сейчас |
+| `route ROLE [--skip p[:класс],…] [--json]` | Одна строка: `route <роль>: <профиль> harness=<h> model=<m> effort=<e> readOnly=<os\|tools\|rules\|none> maxParallel=<n> (chain: a, b; skipped: c=down)`. `--skip` исключает профили; при классе `auth` или `quota` вместе с профилем исключаются связанные с ним (§3.5), и они перечисляются в `skipped`. Если профилей не осталось — exit 2 и строка `route <роль>: no profile left (skipped: …)` |
+| `route --all [--json]` | По строке на каждую роль, которая отличается от встроенной схемы. Если объединённые роли совпадают со встроенными (файла нет или он ничего не меняет), печатается одна строка `routes: default` |
+| `channels` | Все профили: харнесс, модель, источник ключа или входа и с какими профилями он общий |
+| `doctor [--profile P] [--probe]` | Проверки без вызова модели (§5.4). `--probe` делает один платный запрос «PONG» и запускается самим пользователем |
+| `key set NAME`, `key list`, `key rm NAME` | Ключи (§3.5) |
+| `profile list`, `profile show P`, `profile add NAME --from PRESET [--model M] [--key K] [--set k=v]`, `profile env P` | `add` копирует пресет в `config.json`; профиль с незаполненным `<…>` не записывается (exit 2). `env` печатает строки `export …`, чтобы войти в харнесс в изолированном каталоге профиля |
+| `preset list` | Встроенные пресеты (§4.2) |
+
+Коды выхода такие же, как у `zcode-dispatch`: 0 — успех, 1 — ошибка, 2 — отказ без запуска [00 §1]. Пока задача идёт, оркестратор опрашивает её тем же Monitor-циклом с `sleep 25`, что и сейчас.
+
+**Сквозные вызовы: профиль → argv обёртки.** Эта таблица — эталон теста инкремента 1.
+
+| Профиль | Команда |
+|---|---|
+| `glm` | `zcode-dispatch task --background [--cwd W] [--resume-task zt-N \| --fresh] --prompt-file F`. `--write`, `--profile` и `--role` не передаются: `zcode-dispatch` разбирает аргументы строго (`parseArgs({strict: true})`) и ответил бы отказом. Задача без `--write` уходит той же командой и печатает одну строку WARN: у `glm` нет режима только чтения |
+| профили `codex` (`luna`, `sol`, `astra`, `astra-high` и пользовательские) | `codex-dispatch task --background [--write] --model <model профиля> --effort <effort профиля> [--cwd W] [--resume-task task-… \| --fresh] --prompt-file F` |
+| `status`, `result`, `cancel` | по префиксу id: `zt-` → `zcode-dispatch`, `task-` → `codex-dispatch`. stdout, stderr и коды выхода обёрток не меняются |
+
+### 3.4 Конфигурация
+
+Данные лежат в `~/.claude/plugins/data/superpowers-strigov-ver-agents/` — рядом с `…-zcode` и `…-codex`. Каталог создаётся с правами 0700:
+
+```
+config.json         профили и роли пользователя; секретов здесь нет
+keys/<name>         ключи, права 0600
+homes/<profile>/    изолированные каталоги: CLAUDE_CONFIG_DIR и settings.json API-профилей claude;
+                    при "home": "isolated" — XDG_* (opencode), PI_CODING_AGENT_DIR (pi), DSH_HOME (dsh)
+agents-empty/       пустой каталог для DSH_AGENTS_HOME (§3.6 Б)
+cache/              вывод --help по паре (bin, version)
+state/<ws>/jobs/    задачи ct-, oc-, pi-, dt-
+```
+
+Формат — JSON, без зависимостей: TOML-парсер отклонён [J1]. Правила:
+
+- `"version": 1` обязательно; иначе exit 2.
+- Встроенные профили (`glm`, `luna`, `sol`, `astra`, `astra-high`, `opus-xhigh`, `opus-high`, `sonnet-medium`) переопределить нельзя: exit 2 с подсказкой «скопируйте профиль под новым именем». Имена `claude`, `inproc` и `default` зарезервированы (`claude` уже занято в строке состояния: `impl=claude`). Пользовательские профили добавляются к встроенным.
+- Роли объединяются по имени роли: роль из `config.json` целиком заменяет встроенную цепочку.
+- Имя профиля и имя ключа задаются по шаблону `^[a-z][a-z0-9-]{0,31}$`: они попадают в имена файлов.
+- Неизвестное поле профиля или неизвестная опция — exit 2 с её именем, чтобы опечатка (`efort`) не потерялась молча. Роль, которая ссылается на несуществующий профиль, — тоже exit 2.
+- Битый `config.json`: все подкоманды, кроме `doctor`, `profile` и `key`, выходят с exit 2 и строкой `agent-dispatch: config: <path>: <problem>`. Оркестратор передаёт её пользователю и задаёт один вопрос.
+- Если файла нет, поведение совпадает с текущим.
+
+| Поле профиля | Значения | Смысл |
+|---|---|---|
+| `harness` | `zcode`, `codex`, `claude`, `opencode`, `pi`, `dsh`, `inproc` | `inproc` — субагент Claude внутри сессии (Agent tool) |
+| `auth` | `"login"`, `"native"`, `"none"`, `{"key": NAME}`, `{"keyEnv": VAR}`, `{"keyCmd": [argv]}` | §3.5 |
+| `model` | строка харнесса | codex и claude — `--model`; opencode — `-m`; pi — `--model`; dsh — строки patch-файла; inproc — `model` Agent tool; zcode — игнорируется (модель закреплена обёрткой) |
+| `effort` | строка харнесса | codex — `--effort`; claude — `--effort` и `CLAUDE_CODE_EFFORT_LEVEL` (§3.6 А7); opencode — `--variant`; pi — `--thinking`; dsh — `reasoningEffort` в обеих строках patch-файла (словарь `off\|low\|high\|max`); inproc — `effort` Agent tool; zcode — игнорируется |
+| `endpoint` | URL | claude и dsh. У API-профилей claude попадает в `ANTHROPIC_BASE_URL`; у dsh — в `baseURL` patch-файла (по умолчанию `https://api.deepseek.com/anthropic`) |
+| `authHeader` | `"bearer"` (по умолчанию), `"x-api-key"` | для API-профилей claude: ключ уходит в `ANTHROPIC_AUTH_TOKEN` или в `ANTHROPIC_API_KEY`; вторая переменная задаётся пустой строкой |
+| `keyVar` | имя переменной | для opencode и pi: в какую переменную положить ключ. pi: `zai` → `ZAI_API_KEY`, `deepseek` → `DEEPSEEK_API_KEY`, `openrouter` → `OPENROUTER_API_KEY`. OpenCode: `zai-coding-plan` → `ZHIPU_API_KEY`, `deepseek` → `DEEPSEEK_API_KEY`, `minimax` → `MINIMAX_API_KEY` [02 §5; 03 §5] |
+| `shares` | метка | необязательно: профили с одной меткой выбывают вместе при `auth` и `quota` (§3.5). У встроенного `glm` — `zai-coding-plan` |
+| `bin` | путь | бинарник харнесса; по умолчанию ищется в `PATH`. Нужен для нестандартных установок и заглушек в тестах |
+| `env` | объект | дополнительные переменные харнесса. Перекрывают значения по умолчанию адаптера, но не обязательные настройки (§3.6 А): при конфликте `doctor` даёт FAIL, `task` — exit 2 |
+| `options` | объект | значения по умолчанию, которые можно поменять (§3.6 Б): claude — `tools`, `settings`, `maxTurns` (по умолчанию не задан); opencode — `permission`, `plugins`; pi — `extensions`; dsh — `sessionLog`, `agentsHome`, `patch` |
+| `home` | `"user"`, `"isolated"` | где харнесс хранит настройки и вход: `user` — обычный каталог пользователя, `isolated` — отдельный каталог профиля в `homes/`. По умолчанию `user` — при `login`, `native`, `none` и у dsh. По умолчанию `isolated` — у opencode и pi с ключом из `agent-dispatch` (`key`, `keyEnv`, `keyCmd`): иначе ключ того же провайдера, сохранённый в харнессе, молча перекрыл бы наш [03 §6; 02 §5]. У API-профилей claude всегда `isolated`; `user` там — exit 2 |
+| `sandbox` | `"off"` (по умолчанию), `"native"` | §3.7 |
+| `wrap` | массив argv | префикс команды, §3.7 |
+| `timeoutMin` | число, по умолчанию 60 | предельная длительность задачи в минутах, как `ZCODE_TASK_TIMEOUT_MIN` |
+| `maxParallel` | число, по умолчанию 2 | сколько задач профиля идёт одновременно (§3.9). У встроенного `glm` — 2 |
+
+Роли задаются так: `"roles": { "<роль>": ["<профиль>", …] }`. Список упорядочен: первый профиль — основной, остальные — запасные, по порядку.
+
+### 3.5 Ключи
+
+**Выбор: по умолчанию `{"key": NAME}`, то есть собственное хранилище `keys/NAME` с правами 0600.**
+
+- Ключ пользователь кладёт сам, в своём терминале: `agent-dispatch key set deepseek` запрашивает его скрытым вводом. Из сессии Claude Code можно так: `! pbpaste | "$AD" key set deepseek`; на Linux вместо `pbpaste` — `wl-paste` или `xclip -o -selection clipboard`. Это тот же приём, что у `zcode-dispatch api-key set` [00 §2]. Ключ, переданный аргументом, отвергается. Проверяется только, что это одна непустая строка без пробелов: так ловится случайная вставка самой команды. Формат провайдера не проверяется. Оркестратор `key set` не запускает.
+- **Где ключ читается.** Все источники (`key`, `keyEnv`, `keyCmd`) читаются в `task`, на переднем плане и в окружении Claude Code: там менеджер паролей может попросить подтверждение. Раннеру значение передаётся через файл 0600 в каталоге задачи; раннер удаляет файл сразу после запуска харнесса. Значение регистрируется в `redactor`.
+- **Пустой ключ — без запуска.** Если ключ разрешился в пустую строку или `keyCmd` упал (таймаут 10 с, ненулевой код), харнесс не запускается: exit 2 и строка `agent-dispatch: <P>: key unavailable (<причина>) errorClass=auth` с подсказкой. Оркестратор обрабатывает это как сбой класса `auth` (§3.8). Так при пустом ключе не уйдёт вход claude.ai из каталога профиля [01 §6].
+- Ключ попадает только в окружение дочернего процесса, после белого списка. Его нет ни в argv (там его видно в `ps`), ни в файлах настроек, ни в чате.
+- Куда кладётся ключ: claude — в `ANTHROPIC_AUTH_TOKEN` (или в `ANTHROPIC_API_KEY` при `authHeader: "x-api-key"`), вторая переменная — пустая строка; dsh — в `DEEPSEEK_API_KEY` (строка `apiKeyEnv` в patch-файле); opencode и pi — в переменную из `keyVar`.
+- **Почему так.** Один механизм работает для всех адаптеров и всех ОС; Keychain есть только на macOS. Он повторяет уже работающий `api-key set`. Ключ не лежит в окружении основной сессии Claude Code, где его видят все её инструменты. `apiKeyHelper` отклонён: с ним `claude` отправляет оба заголовка авторизации [01 §6], и такой механизм есть только у одного харнесса.
+- Альтернативы для тех, кто хранит ключи иначе:
+  - `{"keyEnv": "VAR"}` — ключ берётся из окружения, в котором запущен Claude Code. Ключ, экспортированный в шелле, передаётся только так: белый список окружения его срезает (§3.6 А10);
+  - `{"keyCmd": [...]}` — ключ берётся из stdout команды менеджера паролей: на macOS `["security", "find-generic-password", "-w", "-s", "deepseek"]`, на Linux `["secret-tool", "lookup", "service", "deepseek"]`, на любой ОС `["op", "read", "op://…"]`. stdout не логируется.
+- Видят ли ключ инструменты модели: у `claude` его прячет `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` — ключ убирается из окружения Bash [01]. dsh сам чистит `*KEY*`/`*TOKEN*` у дочерних процессов [04b]. У OpenCode и pi ключ виден их bash; в README об этом одна строка, и кому это важно, может использовать `wrap`.
+- **Общий ключ или вход.** Профили с одним `key`, с одним `login` одного харнесса или с одной меткой `shares` связаны: при `auth` или `quota` у одного выбывают все (§3.8). У встроенного `glm` метка `zai-coding-plan`, и пресеты Z.ai предлагают ту же метку. Поэтому после `glm: quota` запасной `glm-api` не упрётся в ту же исчерпанную квоту.
+- Остальные значения `auth`:
+  - `login` — вход самого харнесса: подписка `claude`, `codex login`, `opencode auth login`, `/login` в pi;
+  - `native` — собственная конфигурация харнесса: для `zcode` — конфигурация `zcode-dispatch` (`api-key set`); для `dsh` — `$DSH_HOME/.env` (по умолчанию `~/.dsh/.env`), и тогда адаптер не задаёт `DEEPSEEK_API_KEY` [04b §6]. Учтите: в headless-режиме dsh раньше `$DSH_HOME/.env` читает `.env` в `cwd`, так что ключ из `.env` репозитория победит;
+  - `none` — без ключа, для локальной модели. Адаптер подставляет `ANTHROPIC_API_KEY=local-dummy` [08 §5].
+
+### 3.6 Обязательные внутренние настройки и значения по умолчанию
+
+Настройки делятся на две группы.
+
+- **А — обязательные.** Они действуют всегда; ни включать, ни выключать их не нужно, и пользователь их не видит. Это вопрос корректности: ключ не уходит не туда, запуск не зависает, исход определяется верно.
+- **Б — значения по умолчанию.** Адаптер задаёт их сам, а пользователь меняет через `options` или `env` профиля.
+
+#### А. Обязательные
+
+1. **`claude`, API-профиль.** Используется отдельный `CLAUDE_CONFIG_DIR` в `homes/<p>/claude` без входа claude.ai, ровно одна переменная с ключом и `--setting-sources ""` вместе с `--settings homes/<p>/settings.json`. Это даёт две гарантии. Токен входа claude.ai не будет отправлен на сторонний эндпоинт (если задать только `ANTHROPIC_BASE_URL`, он туда уходит) [01 §6; 07, итог п. 4]. Файл `.claude/settings.json` в репозитории не сможет перенаправить ключ: его `env.ANTHROPIC_BASE_URL` срабатывает даже с `--bare` [01 §9, E9]. `doctor` запускает `claude auth status --json` в этом каталоге и ожидает `loggedIn: true` и `authMethod` ∈ {`oauth_token`, `api_key`} при заданном ключе; вход claude.ai в каталоге профиля — FAIL.
+2. **`claude`, профиль со входом.** Используется каталог входа пользователя (`$CLAUDE_CONFIG_DIR`, если задан, иначе `~/.claude`) и `--setting-sources user`, чтобы проектные настройки не участвовали. Из унаследованного окружения удаляются все `ANTHROPIC_*`, `CLAUDE_CODE_ENTRYPOINT` и `CLAUDECODE`; иначе ломается атрибуция или подменяется эндпоинт [01]. В обоих режимах задаётся `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`: ключ и токены убираются из окружения Bash [01 E13].
+3. **Промпт всегда передаётся через stdin;** у `claude` предел 10 МБ [01]. `MAX_PROMPT_BYTES` остаётся только у `zcode`.
+4. **Явные права в headless-режиме** — чтобы запуск не останавливался на запросе разрешения:
+   - `claude`, пишущая роль: `--permission-mode bypassPermissions` (при `sandbox: "native"` — `acceptEdits`, §3.7). По умолчанию `-p` молча отклоняет запросы разрешений и выходит с кодом 0 [01]; этот режим — аналог `--mode yolo` у ZCode.
+   - `claude`, ревьюер: `--tools "Read,Glob,Grep,Bash" --allowedTools "Bash(git show:*)" "Bash(git diff:*)" "Bash(git log:*)" "Bash(git status:*)" --permission-mode dontAsk`. Шаблоны ревью велят пользоваться `git show/diff/log`, а `dontAsk` отклоняет всё, что не разрешено заранее. Если `permission_denials` не пуст, это попадает в отчёт как замечание.
+   - OpenCode: адаптер задаёт собственных primary-агентов через `OPENCODE_CONFIG_CONTENT` (источник 6 — после глобального и проектного конфигов) и всегда передаёт `--agent sp-implementer` или `--agent sp-reviewer`. Набор прав каждого агента полный и явный. Явный `deny` возвращает модели ошибку инструмента, и цикл продолжается; в `blocked` уходит только оставшийся `ask` [02 §7]:
+     ```json
+     {"agent": {
+       "sp-implementer": {"mode": "primary", "permission": {"*": "allow",
+         "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"},
+         "external_directory": "deny", "doom_loop": "deny", "question": "deny", "webfetch": "deny", "websearch": "deny"}},
+       "sp-reviewer": {"mode": "primary", "permission": {"*": "deny",
+         "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"},
+         "grep": "allow", "glob": "allow", "list": "allow", "edit": "deny", "task": "deny",
+         "bash": {"*": "deny", "git show*": "allow", "git diff*": "allow", "git log*": "allow", "git status*": "allow"},
+         "external_directory": "deny", "webfetch": "deny", "websearch": "deny"}}}}
+     ```
+     Для `external_directory` временные каталоги остаются разрешены, как в наборе OpenCode по умолчанию. Тот же набор дублируется в `OPENCODE_PERMISSION`: эта переменная перекрывает верхнеуровневый `permission` конфигов, но не `agent.<name>.permission`, поэтому сама по себе она ничего не гарантирует. Строка `auto-rejecting` в stderr означает класс `blocked`.
+   - pi: набор `--tools` по роли; у ревьюера `read,grep,find,ls`, без git.
+   - dsh, пишущая роль: `DSH_PERMISSION_MODE=danger-full-access` — аналог `--mode yolo` у ZCode и `bypassPermissions` у claude; с `sandbox: "native"` — `workspace-write` (§3.7). Ревьюер всегда работает в `read-only`: это режим роли, а не песочница. В headless-режиме у dsh нет ответчика на запросы прав, и в `workspace-write` любая запись вне `cwd` отклоняется [04b §7, §8].
+5. **Репозиторий не может перенаправить ключ или эндпоинт:**
+   - claude: см. п. 1–2 (источник настроек `project` не участвует);
+   - OpenCode: `OPENCODE_DISABLE_PROJECT_CONFIG=1` — проектный `opencode.json` не меняет провайдера, права и агентов;
+   - pi: `--no-approve` — проектные ресурсы `.pi/*` не принимаются;
+   - dsh: адаптер всегда задаёт `baseURL` явно — из поля `endpoint`, по умолчанию `https://api.deepseek.com/anthropic`. Поэтому `DEEPSEEK_BASE_URL` из `.env` репозитория его не перенаправит [04b]. Строки patch-файла собираются целиком: строка patch-файла заменяет весь `config` строки и не сливается глубоко [04b §2]. Адаптер пишет `agent-default-model {provider: deepseek-official, model, reasoningEffort}` и `llm-deepseek {apiKeyEnv: DEEPSEEK_API_KEY, baseURL, reasoningEffort}`. Поля из `options.patch` для тех же строк вливаются в них, но `apiKeyEnv` и `baseURL` там перекрыть нельзя (`baseURL` задаётся через `endpoint`). Effort ставится в обе строки: какая побеждает в headless-режиме, не проверено [04b, вопрос 3].
+6. **Проектные инструкции доходят до модели в каждом харнессе:**
+   - claude: источник `project` отключён, поэтому адаптер собирает в один файл задачи `<job>/system.md` headless-преамбулу и `CLAUDE.md` проекта и передаёт его одним `--append-system-prompt-file` (повторяемость флага не проверена [01]);
+   - OpenCode: существующие `<repo>/AGENTS.md` и `<repo>/CLAUDE.md` передаются через `instructions: [...]` в `OPENCODE_CONFIG_CONTENT`; `OPENCODE_DISABLE_CLAUDE_CODE_PROMPT=1` — чтобы личный `~/.claude/CLAUDE.md` не подменял правила проекта [02 §9];
+   - pi: читает файлы контекста сам (`-nc` не передаётся);
+   - dsh: сам читает `AGENTS.md` и `CLAUDE.md` проекта [04b].
+7. **Effort у `claude`** передаётся и флагом `--effort`, и как `CLAUDE_CODE_EFFORT_LEVEL=<effort>` в `env` наложения `--settings`. `CLAUDE_CODE_EFFORT_LEVEL` сильнее флага [01 §5, E10], а настройки из `--settings` сильнее пользовательских; иначе `env` в `~/.claude/settings.json` друга молча перекрыл бы effort профиля. Если в `env` профиля задан `CLAUDE_CODE_EFFORT_LEVEL` (например, скопированный рецепт DeepSeek с `max`), он перекрывает поле `effort`.
+8. **Отмена убивает всё дерево процессов.** Ядро делает снимок потомков и шлёт сигналы по лестнице адаптера:
+
+   | Харнесс | Первый сигнал | Ожидание | Затем |
+   |---|---|---|---|
+   | `claude` | SIGTERM (выход 143). SIGINT не посылается: на него `claude` выходит с кодом 0 и пустым stdout [01] | 5 с | SIGKILL |
+   | `opencode` | SIGTERM группе и группам потомков из снимка: своего обработчика нет, дочерние bash отсоединены [02] | 5 с | SIGKILL |
+   | `pi` | SIGTERM: pi сам убивает группы своих bash и выходит с кодом 143. SIGINT не посылается никогда: его pi не обрабатывает, и группы bash остаются сиротами [03 §10] | 5 с | SIGKILL |
+   | `dsh` | SIGINT (выход 130); на SIGTERM dsh выходит с кодом 0 | не меньше 7 с: корректное завершение dsh ограничено 5 с [04b §10] | SIGKILL |
+
+   После SIGKILL ядро повторно зачищает группы из снимка. Задача помечается `cancelled` по записи диспетчера, независимо от кода выхода. Не проверено: на Linux dsh кладёт инструменты в user-systemd scopes, а не в группы процессов, и снимок потомков может их не увидеть [04b §10].
+9. **Успех и ответ определяются по выводу харнесса** (`reduce()`); `result` печатает `response` дословно:
+   - `claude`: ответ — поле `result`; ошибки — `is_error`, `subtype`, `terminal_reason`, `api_error_status` (при `error_max_turns` `result` равен `null`);
+   - OpenCode: ответ — текстовые части последнего сообщения (последний `messageID`) или `opencode export <sid>` через `finalize`; exit 1 при валидном тексте ошибкой не считается;
+   - pi: ответ — текст последнего assistant `message_end`; ошибки — `stopReason`, `errorMessage`, `agent_settled.aborted`;
+   - dsh: ответ — событие `final`; ошибки — причина `turn_end` и строка `dsh: <CODE>:` [01; 02; 03; 04b].
+10. **Белый список окружения ядра** берётся из `zcode-dispatch` (`ENV_ALLOW`, `ENV_ALLOW_PREFIXES` с `LC_` и `XDG_`, `ENV_DENY`) без записей `ZCODE_*`. В нём есть `TZ`, `NODE_OPTIONS`, переменные CA и каталоги тулчейнов (`JAVA_HOME`, `NVM_DIR`, `CARGO_HOME` и др.), без которых ломаются тесты имплементера. Явный проброс — переменная `AGENT_ENV_PASSTHROUGH`, как `ZCODE_ENV_PASSTHROUGH`. `ENV_DENY` срезает `CLAUDE_*` и суффиксы `_KEY`/`_TOKEN`, поэтому при `home: "user"` адаптер отдельно пропускает родную переменную каталога харнесса, если она задана: `CLAUDE_CONFIG_DIR` (claude со входом), `PI_CODING_AGENT_DIR`, `DSH_HOME`. Всё остальное приходит только из профиля.
+11. **Секреты вычищаются** из логов, `status`, `result` и сообщений об ошибках.
+12. **Resume проверяется до запуска.** Для задач ядра исходная задача должна быть `completed` и иметь `sessionId`, её `job.profile` должен совпадать с `--profile`, а `resumeCheck` — проходить. Продолжение использует снимок профиля из записи задачи; если он расходится с текущим `config.json` (модель, эндпоинт, каталог), — exit 2. По харнессам:
+    - `claude`: тот же каталог конфигурации и тот же `cwd`; stderr `No conversation found with session ID` с exit 1 → `resume-lost`;
+    - OpenCode: тот же `--dir` и тот же каталог профиля (сессии лежат в SQLite в `XDG_DATA_HOME` [02 §4]); `Session not found` с exit 1 → `resume-lost`;
+    - pi: тот же `cwd` (с `--session-dir` поиск сессии фильтруется по `cwd` из заголовка) и файл сессии с совпадающим `id` в заголовке [03 §4]. pi не сообщает «сессия не найдена»: он печатает предупреждение `No project session found with id …` и создаёт новую. Если это предупреждение всё же появилось в stderr, задача получает `resume-lost`;
+    - dsh: тот же `cwd`; ошибка неизвестного id → `resume-lost`.
+
+    При отказе (exit 2) и при `resume-lost` оркестратор делает FRESH с повторным брифом на том же профиле, как сегодня при отказе resume [00 §1]. Для `zt-` и `task-` условия прежние: у ZCode продолжается только `completed` задача с сессией, у companion — любая неактивная задача с нитью [00 §6 Q3].
+
+#### Б. Значения по умолчанию
+
+- **`claude`:**
+  - пишущая роль получает `--tools "Bash,Read,Edit,Write,Glob,Grep"` (меняется через `options.tools`); плюс `--strict-mcp-config` и `--disable-slash-commands`;
+  - settings: `disableAllHooks: true` — это отключает в том числе хуки самого плагина;
+  - у API-профилей: `permissions.deny: ["WebSearch", "WebFetch"]` и `skipWebFetchPreflight: true`. WebSearch недоступен на шлюзах к не-Anthropic моделям, а preflight WebFetch ходит на `api.anthropic.com` [01 §9, §15]. У профиля со входом веб-инструменты работают;
+  - `options.settings` — объект, который накладывается на наложение `--settings` (кроме группы А);
+  - env: `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `DISABLE_AUTOUPDATER=1`, `CLAUDE_CODE_MAX_RETRIES=2` (по умолчанию 10 повторов, это около 3 мин), `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`;
+  - у API-профилей: `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL` и `CLAUDE_CODE_SUBAGENT_MODEL` равны модели профиля, если `env` не задаёт иное. Фоновые вызовы идут на модель уровня haiku, и сервер должен её знать; без `FABLE` вызов `claude-fable-*` мог бы уйти к провайдеру [01 §5; 06 §1; 08].
+- **OpenCode:** `OPENCODE_DISABLE_AUTOUPDATE=1`, `OPENCODE_DISABLE_EXTERNAL_SKILLS=1`, `OPENCODE_PURE=1`. PURE не загружает внешние плагины из `~/.config/opencode/plugins` (на машине владельца там плагин Orca); встроенные входы Copilot и ChatGPT — плагины по умолчанию, и PURE их не трогает [02 §6, §9]. `options.plugins: true` снимает PURE. `options.permission` — дополнительные правила, которые вливаются в набор `sp-`агента роли.
+- **pi:** `-ne -ns -np --no-mcp`, `PI_TELEMETRY=0`, `PI_SKIP_VERSION_CHECK=1`, `PI_OFFLINE=1`. Без `PI_OFFLINE` инструменты grep и find скачивают fd и rg с GitHub, если их нет в `PATH`; `doctor` проверяет, что они есть [03 §9]. `options.extensions: ["builtin:llama.cpp", "<путь>"]` даёт по `-e <x>` на каждое расширение; они загружаются и при `-ne` [03 §9]. Так друг подключает расширение-провайдер (`pi.registerProvider`).
+- **dsh:** patch-файл выключает `session-log-deepseek` (включается через `options.sessionLog: true`) и `plugin-package-inventory-deepseek`, задаёт `session-title-llm: disabled: true`; плюс `DSH_TELEMETRY_DISABLED=1`. `DSH_AGENTS_HOME` указывает на пустой каталог `agents-empty/`: иначе dsh читает общий `~/.agents` со skills и `AGENTS.md` других инструментов [04b §9]; `options.agentsHome: "user"` возвращает обычное поведение. `options.patch` — дополнительные строки patch-файла (с ограничением из А5).
+
+### 3.7 Песочница (по желанию)
+
+**`"sandbox": "native"`** включает родную песочницу харнесса:
+
+- `claude`: в settings профиля записывается
+  `{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false,"autoAllowBashIfSandboxed":true,"credentials":{"envVars":[{"name":"<переменная с ключом>","mode":"deny"}]}}}`.
+  В `credentials` пишется та переменная, в которую адаптер положил ключ (`ANTHROPIC_AUTH_TOKEN` или `ANTHROPIC_API_KEY`); у профиля со входом блока `credentials` нет. Пишущая роль тогда запускается с `--permission-mode acceptEdits` вместо `bypassPermissions`: правки разрешены только в `cwd`, а Bash в песочнице одобряется автоматически. Песочница покрывает только Bash, и сети у Bash нет, пока домены не добавлены в `sandbox.network.allowedDomains` через `options.settings` [01 §8; 09 §2.6].
+- `dsh`: `native` → `workspace-write` — запись только в `cwd` и во временные каталоги. В связанных рабочих деревьях (git worktree) `git commit` может упереться в песочницу, потому что `.git` лежит вне `cwd` [04b]. Без `native` пишущая роль идёт в `danger-full-access` (§3.6 А4).
+- `codex`: как сейчас — песочница Codex (`--write` означает workspace-write).
+- `zcode`, `opencode`, `pi`: своей песочницы нет. `doctor` сообщает об этом и подсказывает `wrap`.
+
+**`"wrap": [...]`** — префикс команды для любого харнесса, например `["srt", "--settings", "/Users/me/.config/srt/pi.json", "--"]` или запуск в контейнере. Ядро не разбирает, что это: оно строит `wrap + argv` и шлёт сигналы группе процессов, запущенной через `wrap`. `doctor` проверяет, что `<wrap> <bin> --version` работает.
+
+**В README:**
+
+- как поставить `srt` (`@anthropic-ai/sandbox-runtime`, бета) и пример его настроек;
+- на macOS нельзя вкладывать одну песочницу Seatbelt в другую: `codex`, `dsh` (кроме `danger-full-access`) и `claude` с `native` под `srt` не запустятся;
+- `claude`, запущенный под `wrap`, — с `sandbox: "off"` [09 §3, §7];
+- `claude` с `native`: у Bash нет сети, пока домены не добавлены в `sandbox.network.allowedDomains` через `options.settings`;
+- `srt` выходит с кодом 0, когда дочерний процесс убит SIGINT или SIGTERM; исход задачи определяется по её записи [09 §7.4];
+- локальная модель под `srt`: в `allowedDomains` нужен `"127.0.0.1:<port>"`, а `NO_PROXY` должен быть пустым — `srt` задаёт `NO_PROXY=localhost,127.0.0.1,…`, а Seatbelt пускает к loopback только порты прокси [09 §2.5, §6];
+- на macOS `allowLocalBinding: false`: иначе открывается `127.0.0.1:1082` (TUN-прокси) и ограничение исходящего трафика снимается [09 §6];
+- `SANDBOX_RUNTIME=1` в окружении означает вложенный запуск: Seatbelt не стартует;
+- `dsh` с `native`: коммиты в связанных рабочих деревьях могут не пройти; тогда параллельные треки на `dsh` не запускаются.
+
+Уровней песочницы и автоматического включения по риску нет.
+
+### 3.8 Ошибки и запасные профили
+
+К семи существующим классам ошибок [00 §1.5] добавляются `rate-limit`, `server`, `context`, `blocked` и `resume-lost`. Признаки ошибки для каждого харнесса разбирает его адаптер [01; 02 §11; 03; 04b §11]. У `claude` класс определяется по `api_error_status`, а не по тексту: при 401 текст бывает «Not logged in» [01 §11].
+
+| Класс | Примеры признаков | Действие |
+|---|---|---|
+| `timeout` | истекло время задачи (`timeoutMin`); claude `error_max_turns` | один повтор `--fresh`, затем следующий профиль |
+| `crash` | ненулевой выход без разобранной ошибки | так же |
+| `launch` | нет бинарника; не тот бинарник (`dsh` из Homebrew, OpenCode 2.x); нет обязательного флага; dsh: `SANDBOX_UNAVAILABLE`, отказ из-за прокси-переменных в `.env` репозитория, exit 1 до события `session`; pi: `Failed to load extension`; OpenCode: предупреждение `agent … not found` — адаптер считает его ошибкой, хотя сам OpenCode молча переключается на агента build [02] | так же |
+| `malformed` | нет финального ответа или финального события | так же |
+| `rate-limit` | 429 без признаков исчерпания лимита, 529; dsh `RATE_LIMIT`; OpenCode — 429 без признаков квоты из строки `quota` | так же |
+| `server` | 5xx, `ECONNREFUSED`; dsh `TRANSPORT`, `SERVER`, `TIMEOUT`, `HTTP_5xx`, `EMPTY_RESPONSE`, `MALFORMED_RESPONSE`, `STREAM_CLOSED` | так же |
+| `auth` | claude `api_error_status` 401/403; dsh `AUTH`, `MISSING_CREDENTIAL`, `INVALID_CREDENTIAL`; pi `No API key found for`; нет входа; ключ не разрешился (§3.5) | профиль и все связанные с ним профили (§3.5) помечаются `down`; дальше — следующий профиль |
+| `quota` | claude `api_error_status` 402 или 429 с текстом о лимите или балансе; dsh `QUOTA` (DeepSeek: 402 «Insufficient Balance»); OpenCode — только при `insufficient_quota`, `usage_not_included`, `GoUsageLimitError` или `FreeUsageLimitError` в теле: после 5 повторов 429 OpenCode пишет «Quota exceeded…» и без исчерпания [02 §11] | так же |
+| `model-not-selected` | 404 на модель; claude «There's an issue with the selected model»; dsh `INVALID_REQUEST` (неверный id на маршруте `deepseek-official` приходит так), `MODEL_UNSUPPORTED`, `UNSUPPORTED_REASONING_EFFORT`; OpenCode `Model not found:`; pi `Model "…" not found`, `Unknown provider` | профиль помечается `down`; дальше — следующий профиль |
+| `context` | `prompt_too_long`; dsh `CONTEXT_WINDOW_EXCEEDED`; переполнение контекста в pi | следующий профиль для этой задачи |
+| `blocked` | оставшийся `ask` в OpenCode (`auto-rejecting` в stderr); отказ в правах без результата | следующий профиль |
+| `resume-lost` | сессия не найдена (§3.6 А12) | FRESH с повторным брифом на том же профиле; сбоем не считается |
+
+Порядок действий зависит от харнесса задачи:
+
+1. **Задачи `zcode`** (профиль `glm`). Таблица классов GLM (`SKILL.md:422-428`), проба GLM и `glm=down` остаются прежними. Меняется одно: цель «→ Luna max» везде, включая отказ по `MAX_PROMPT_BYTES`, становится «→ следующий не-down профиль цепочки роли (по умолчанию `luna`)». Когда `glm` выбывает с классом `auth` или `quota`, оркестратор кроме `glm-channel` дописывает строку и в `channels`, чтобы `route` вывел из строя связанные профили.
+2. **Задачи `codex`.** Один повтор `--fresh`, затем следующий профиль цепочки; если его нет — вопрос пользователю. Для встроенной схемы это совпадает с сегодняшним поведением (`codex-invocation`: повтор, затем пользователь): Luna, Sol и Astra стоят в своих цепочках последними.
+3. **Задачи ядра** (`claude`, `opencode`, `pi`, `dsh`). Временная ошибка (`timeout`, `crash`, `launch`, `malformed`, `rate-limit`, `server`) — один повтор `--fresh` на том же профиле. Если повтор не помог или ошибка не временная, задача уходит на следующий профиль роли с одной строкой объявления, например: `Канал implementer: glm-api → deepseek-dsh (glm-api: quota).`
+4. **Профиль в `down` или `off` остаётся таким до конца сессии.** Это записывается в `<scratchpad>/dev-orchestrator/channels` строкой `<профиль> <down|off> <класс|kill-switch> <ISO-время>`; `off` пишется по фразе «без <имя профиля>». Маркер сохраняется после сжатия контекста, как `glm-channel`. Перед каждой отправкой оркестратор передаёт эти профили в `route --skip` (§5.3).
+5. **Цепочка исчерпана** — `route` выходит с exit 2 и строкой `no profile left`, и пользователю задаётся ровно один вопрос: подождать, повторить или назвать профиль. Ожиданий в цикле нет.
+
+### 3.9 Параллельность и резервация дерева
+
+- **Одна пишущая задача на рабочее дерево.** Ядро резервирует дерево для задач `ct-`, `oc-`, `pi-` и `dt-`. Перед `task --write` `agent-dispatch` дополнительно запрашивает `status --json` у `zcode-dispatch` и у companion. Пишущая задача companion считается блокирующей, только если её `pid` жив: у companion нет уборки мёртвых воркеров, и задача упавшего воркера навсегда остаётся `running` [00 §1.7]. Иначе выводится одна строка-предупреждение со ссылкой на stale-lock в `codex-invocation`, без отказа. Если в дереве уже идёт пишущая задача, `task` отказывает (exit 2) и называет её id. Собственная резервация `zcode-dispatch` остаётся; у companion её нет, как и сейчас. Проверка по трём хранилищам идёт без общей блокировки, и гонка между ними допустима: оркестратор — единственный участник.
+- **`maxParallel`.** `task` считает идущие задачи профиля во всех рабочих деревьях (задачи ядра). На пределе — exit 2 и строка `agent-dispatch: profile <p> is at maxParallel=<n> (running: …)`. Оркестратор ждёт в Monitor-цикле, а параллельный трек берёт следующий профиль цепочки. Для `glm` предел по-прежнему соблюдает оркестратор по строке `GLM concurrency` в `zcode-invocation` (сейчас 2); в `agents-defaults.json` у `glm` записано `maxParallel: 2`.
+- Задачи только на чтение (ревью) идут параллельно в пределах `maxParallel`. Ревьюер на `glm` всё равно берёт резервацию ZCode и работает в `--mode yolo`; `route` об этом предупреждает.
+- Параллельные треки — как сейчас: до двух деревьев, в каждом один имплементер [00, C19]. Правило `SKILL.md:635` обобщается: если оба трека получили один профиль с `maxParallel: 1` (для `glm` — `GLM concurrency: 1`), второй трек берёт следующий профиль цепочки.
+- Ограничения провайдера пользователь задаёт сам. Например, у Kimi Platform на Tier 0 допускается только один запрос одновременно [06], значит, в профиле нужно `maxParallel: 1`.
+
+### 3.10 Платформы
+
+- Снимок потомков — `ps -A -o pid=,ppid=,pgid=` на обеих ОС: на macOS нет `/proc`.
+- Проверки `doctor` для `native`: `claude` — `/usr/bin/sandbox-exec` на macOS, `bubblewrap` и `socat` на Linux [01 §8]; `dsh` — Seatbelt на macOS, bwrap или Landlock на Linux [04b].
+- Примеры `keyCmd` и буфера обмена для `key set` — в §3.5.
+- На Linux dsh держит инструменты в user-systemd scopes; зачистка потомков может их не увидеть (§3.6 А8).
+- Белый список окружения сохраняет префикс `XDG_*`, как `ENV_ALLOW_PREFIXES` у `zcode-dispatch`: от этого зависит OpenCode с `home: "user"`.
+
+---
+
+## 4. Профили
+
+### 4.1 Встроенные профили (писать не нужно)
+
+```json
+{
+  "profiles": {
+    "glm":           { "harness": "zcode", "auth": "native", "shares": "zai-coding-plan", "maxParallel": 2 },
+    "luna":          { "harness": "codex", "auth": "login", "model": "gpt-6-luna",  "effort": "max" },
+    "sol":           { "harness": "codex", "auth": "login", "model": "gpt-6.1-sol", "effort": "xhigh" },
+    "astra":         { "harness": "codex", "auth": "login", "model": "gpt-6-astra", "effort": "xhigh" },
+    "astra-high":    { "harness": "codex", "auth": "login", "model": "gpt-6-astra", "effort": "high" },
+    "opus-xhigh":    { "harness": "inproc", "model": "opus",   "effort": "xhigh" },
+    "opus-high":     { "harness": "inproc", "model": "opus",   "effort": "high" },
+    "sonnet-medium": { "harness": "inproc", "model": "sonnet", "effort": "medium" }
+  }
+}
+```
+
+### 4.2 Пример пользовательского `config.json`
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "claude-sub": {
+      "harness": "claude", "auth": "login",
+      "model": "opus", "effort": "xhigh"
+    },
+    "sonnet-high": {
+      "harness": "inproc", "model": "sonnet", "effort": "high"
+    },
+    "glm-api": {
+      "harness": "claude", "auth": { "key": "zai" }, "shares": "zai-coding-plan",
+      "endpoint": "https://api.z.ai/api/anthropic",
+      "model": "glm-5.3[1m]", "effort": "max",
+      "env": { "API_TIMEOUT_MS": "3000000", "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000" }
+    },
+    "deepseek-claude": {
+      "harness": "claude", "auth": { "key": "deepseek" },
+      "endpoint": "https://api.deepseek.com/anthropic",
+      "model": "deepseek-v4-pro[1m]", "effort": "high",
+      "env": { "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "786432" }
+    },
+    "deepseek-dsh": {
+      "harness": "dsh", "auth": { "key": "deepseek" },
+      "model": "deepseek-v4-pro", "effort": "high"
+    },
+    "oc-deepseek": {
+      "harness": "opencode", "auth": { "key": "deepseek" }, "keyVar": "DEEPSEEK_API_KEY",
+      "model": "deepseek/deepseek-v4-pro"
+    },
+    "oc-copilot": {
+      "harness": "opencode", "auth": "login",
+      "model": "github-copilot/<model>"
+    },
+    "oc-go": {
+      "harness": "opencode", "auth": "login",
+      "model": "opencode-go/<model>"
+    },
+    "oc-chatgpt": {
+      "harness": "opencode", "auth": "login",
+      "model": "openai/<model>"
+    },
+    "pi-glm": {
+      "harness": "pi", "auth": { "key": "zai" }, "keyVar": "ZAI_API_KEY", "shares": "zai-coding-plan",
+      "model": "zai/glm-5.3", "effort": "high"
+    },
+    "local-qwen": {
+      "harness": "claude", "auth": "none",
+      "endpoint": "http://127.0.0.1:9931",
+      "model": "qwen3.8-27b",
+      "env": {
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "131072",
+        "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "1800000",
+        "API_FORCE_IDLE_TIMEOUT": "0",
+        "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
+      },
+      "maxParallel": 1
+    }
+  },
+  "roles": {}
+}
+```
+
+Пояснения:
+
+- `<model>` у профилей OpenCode — id из `opencode models <provider>`: каталог зависит от подписки. Точный id DeepSeek в `oc-deepseek` тоже сверяется по `opencode models deepseek`.
+- `deepseek-claude`, `deepseek-dsh` и `oc-deepseek` делят один ключ `deepseek`: `quota` у одного выводит из строя все три. Так выглядит сценарий «нашёл OpenCode и поставил туда DeepSeek».
+- `glm-api` и `pi-glm` используют один ключ Coding Plan Z.ai и, вместе со встроенным `glm`, метку `zai-coding-plan`. Оба пути Z.ai перечисляет как разрешённые [06; 07].
+- Суффикс `[1m]` у `deepseek-claude` и `glm-api` сообщает Claude Code окно в 1M: для неизвестного id он считает окно в 200K [01 §5; 08 §6].
+- `sonnet-high` — профиль для ролей, которые исполняются в сессии (§5.1).
+- Порт `local-qwen` зависит от сервера: llama-server — 9931, LM Studio — 1234, Ollama — 11434 [08 §3]. Контекст Ollama по умолчанию — 4k, если у видеокарты меньше 24 ГБ памяти, и всё, что не помещается, молча отбрасывается [08]. Размер контекста увеличивают переменной `OLLAMA_CONTEXT_LENGTH`. `CLAUDE_CODE_ATTRIBUTION_HEADER=0` убирает блок атрибуции, который мешает серверу переиспользовать префиксный KV-кэш между задачами [08].
+
+**Пресеты.** Каждый профиль можно создать командой `agent-dispatch profile add <имя> --from <пресет> [--model M] [--key K] [--set k=v]`. Заполнители `<…>` нужно заполнить флагами, иначе профиль не записывается (exit 2). Эндпоинты и рецепты окружения взяты из [06 §1]:
+
+| Пресет | `harness` | `auth` | `endpoint` | Модель по умолчанию | Прочее |
+|---|---|---|---|---|---|
+| `claude-sub` | claude | `login` | — | `opus`, effort `xhigh` | — |
+| `claude-zai` | claude | `{key: zai}` | `https://api.z.ai/api/anthropic` | `glm-5.3[1m]` | `API_TIMEOUT_MS=3000000`, `CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000`; `shares: zai-coding-plan` |
+| `claude-deepseek` | claude | `{key: deepseek}` | `https://api.deepseek.com/anthropic` | `deepseek-v4-pro[1m]` | `CLAUDE_CODE_AUTO_COMPACT_WINDOW=786432` |
+| `claude-kimi` | claude | `{key: kimi}` | `https://api.moonshot.ai/anthropic` | `kimi-k3[1m]` | — |
+| `claude-minimax` | claude | `{key: minimax}` | `https://api.minimax.io/anthropic` | `MiniMax-M3.1-Flash[1m]` | `CLAUDE_CODE_AUTO_COMPACT_WINDOW=524288` |
+| `claude-alibaba` | claude | `{key: alibaba}` | `https://<WorkspaceId>.<регион>.maas.aliyuncs.com/apps/anthropic` | `<model>` (например, `qwen3.8-max`) | эндпоинт задаётся через `--set endpoint=…` |
+| `claude-openrouter` | claude | `{key: openrouter}` | `https://openrouter.ai/api` | `<model>` | `authHeader: bearer`, `ANTHROPIC_API_KEY=""` |
+| `claude-local` | claude | `none` | `http://127.0.0.1:<port>` | `<model>` | `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000`, `API_FORCE_IDLE_TIMEOUT=0`, `CLAUDE_CODE_ATTRIBUTION_HEADER=0`; `maxParallel: 1` |
+| `dsh-deepseek` | dsh | `{key: deepseek}` | (`https://api.deepseek.com/anthropic`) | `deepseek-v4-pro`, effort `high` | — |
+| `opencode-login` | opencode | `login` | — | `<provider/model>` | — |
+| `opencode-key` | opencode | `{key: <name>}` | — | `<provider/model>` | `keyVar: <VAR>` (таблица §3.4) |
+| `pi-key` | pi | `{key: <name>}` | — | `<provider/id>` | `keyVar: <VAR>` (таблица §3.4) |
+
+### 4.3 Что пользователь делает один раз и как проверить
+
+| Профиль | Разовое действие | Проверка |
+|---|---|---|
+| `glm` | `zcode-dispatch api-key set` (как сейчас) | `zcode-dispatch doctor --probe` |
+| `luna`, `sol`, `astra` | `codex login` (как сейчас) | `agent-dispatch doctor --profile luna` |
+| `claude-sub` | вход в `claude` (`/login`), у владельца уже есть | `agent-dispatch doctor --profile claude-sub` (`claude auth status --json` → `loggedIn`), затем `--probe` |
+| `glm-api` | `agent-dispatch key set zai` | `agent-dispatch doctor --profile glm-api --probe` |
+| `deepseek-claude` | `agent-dispatch key set deepseek` | `… doctor --profile deepseek-claude --probe` |
+| `deepseek-dsh` | `npm i -g @deepseek-ai/dsh@0.2.1-rc.2` (Node `^22.19` или `>=24`); ключ `deepseek` уже сохранён | `doctor` проверяет, что `dsh` — именно DeepSeek Harness, и выполняет `dsh --profile headless --patch <шаблон> --dump-config` (§3.6 Б); затем `--probe` |
+| `oc-deepseek` | `npm i -g opencode-ai@1.19.3` (или `brew install anomalyco/tap/opencode`; не `brew install opencode` — так ставится v2); ключ `deepseek` уже сохранён | `… doctor --profile oc-deepseek --probe` |
+| `oc-copilot`, `oc-go`, `oc-chatgpt` | установка OpenCode, как выше; `opencode auth login` → GitHub Copilot, OpenCode Go или ChatGPT Plus/Pro | `doctor` (`opencode auth list` печатает только имена), затем `--probe` |
+| `pi-glm` | `npm i -g --ignore-scripts @earendil-works/pi-coding-agent@1.3.0` (Node `>=22.19`); ключ `zai` уже сохранён | `… doctor --profile pi-glm --probe` |
+| `local-qwen` | запустить сервер модели (`llama-server … --port 9931`) | `… doctor --profile local-qwen --probe` |
+
+Версии в командах — те, по которым написаны адаптеры. Новее ставить можно: `doctor` одной строкой сообщит, что версия не проверялась.
+
+Если профилю со входом нужен отдельный каталог (`"home": "isolated"`, например для второго аккаунта), вход выполняется так: `eval "$(agent-dispatch profile env oc-copilot)"; opencode auth login`.
+
+`--probe` — один короткий платный запрос на ключе или подписке самого пользователя. Это проверка для самого пользователя, а не условие выпуска.
+
+---
+
+## 5. Роли и маршрутизация
+
+### 5.1 Роли и значения по умолчанию
+
+Значения по умолчанию — это текущая таблица Model split в `SKILL.md`, без изменений.
+
+| Роль (имя в `config.json`) | Где в пайплайне | По умолчанию | Исполнение |
+|---|---|---|---|
+| `plan-writer` | автор плана | `opus-xhigh` | в сессии (Agent tool) |
+| `plan-reviser` | правки плана | `opus-high` | в сессии |
+| `plan-reviewer` | ревью плана (цикл до 4) | `astra` | внешний харнесс |
+| `spec-reviewer` | ревью спецификации в brainstorming | `astra` | внешний харнесс |
+| `implementer` | не-фронтенд фазы, fix, gatefix, final-fix, repair | `glm`, `luna` | внешний харнесс |
+| `implementer.risk` | рисковые фазы (SECURITY/DATA_LOSS) | `sol` (под kill switch — §5.3 п. 4) | внешний харнесс |
+| `implementer.escalation` | эскалация на модель с более глубоким рассуждением | `sol` | внешний харнесс |
+| `frontend.new-ui` | фронтенд-фазы с новым UI | `opus-high` | в сессии |
+| `frontend.tweak` | правки существующего фронтенда | `sonnet-medium` | в сессии |
+| `gate` | проверка lint/typecheck/тестов | `sonnet-medium` | в сессии |
+| `phase-review` | ревью фазы 4.1 | `opus-high` | в сессии |
+| `phase-review.escalated` | ревью фазы 4.1 на рисковых фазах и в раунде 4 | `opus-xhigh` | в сессии |
+| `control-review` | контрольное ревью 4.2 | `astra-high` | внешний харнесс |
+| `synthesis` | сводка ревью | `sonnet-medium` | в сессии |
+| `final-review` | финальное ревью ветки | `opus-xhigh`, `astra` | в сессии, затем внешний харнесс |
+| `diagnosis` | BLOCKED, застрявший гейт | `opus-high` | в сессии |
+| `quickfix` | тривиальные правки | `sonnet-medium` | в сессии |
+| `integration-check` | Step 5 | `sonnet-medium` | в сессии |
+| `adhoc-review` | `requesting-code-review`, второе мнение в `systematic-debugging` | `astra-high` | внешний харнесс |
+
+`frontend.new-ui` и `frontend.tweak` — две роли, а не цепочка: между ними выбирает триаж, как сейчас.
+
+**Роли, исполняемые в сессии.** С инкремента 1 любую такую роль можно переназначить на любой профиль с `"harness": "inproc"`, то есть на другие `model` и `effort`. Оркестратор берёт их из `"$AD" route <роль>` и передаёт в Agent tool. Пример: друг на Claude Pro переводит `plan-writer` и `phase-review` с Opus на `sonnet-high` (§4.2). Внешнее исполнение этих ролей — инкремент 6 (§8). До него схема конфигурации принимает для них внешний профиль, а `route` печатает одну строку: роль пока исполняется в сессии на профиле по умолчанию.
+
+### 5.2 Переназначение: пример для друга без OpenAI
+
+```json
+"roles": {
+  "implementer":            ["glm", "deepseek-dsh"],
+  "implementer.risk":       ["claude-sub"],
+  "implementer.escalation": ["claude-sub"],
+  "plan-reviewer":          ["deepseek-claude", "oc-copilot"],
+  "spec-reviewer":          ["deepseek-claude"],
+  "control-review":         ["deepseek-claude", "glm-api"],
+  "final-review":           ["opus-xhigh", "deepseek-claude"],
+  "adhoc-review":           ["deepseek-claude"]
+}
+```
+
+Что это значит:
+
+- при сбое GLM фаза уходит на `deepseek-dsh` вместо Luna;
+- рисковые фазы и эскалация идут на Opus через подписку Claude;
+- ревьюеры работают на DeepSeek, а запасные — Copilot и GLM API.
+
+Kill switch «без GLM» убирает `glm` из всех цепочек до конца сессии. Тогда все фазы, включая рисковые, идут на `deepseek-dsh` (§5.3 п. 4).
+
+### 5.3 Как оркестратор узнаёт канал
+
+Канал — профиль, который сейчас исполняет роль; так в `SKILL.md` и README называют GLM и Luna.
+
+1. **При старте скилла и после сжатия контекста** оркестратор вызывает `"$AD" route --all`.
+   - Ответ `routes: default` — ничего не меняется и ничего не объявляется.
+   - Иначе пользователь получает одну строку только с отличиями от встроенной схемы, например: «Маршрутизация пользователя: implementer — glm, deepseek-dsh; control-review — deepseek-claude.»
+2. **Перед каждой отправкой** оркестратор вызывает `"$AD" route <роль> --skip <профили из glm-channel и channels>` и отправляет задачу на профиль из ответа. Так после сжатия контекста ничего не нужно помнить. Для ролей в сессии ответ даёт `model` и `effort` для Agent tool. Файл отправки называется `<имя>.<seq>.<профиль>.md`, сайдкар содержит `<профиль>:<id>`, строка состояния — `impl=<профиль>:<id>`.
+3. **Смена профиля** объявляется пользователю одной строкой (§3.8). В промпт для нового профиля добавляется уведомление о смене канала: профиль, харнесс и модель (C18).
+4. **Лестница каналов** (не-фронтенд фазы; первое совпадение побеждает):
+   1. **Kill switch:** в сессии прозвучало «через Luna» или «без GLM», либо `SP_IMPLEMENTER` не пуст. Все фазы, включая рисковые, идут на первый не-down профиль цепочки `implementer` без `glm` (по умолчанию Luna max). «Через Luna» и `SP_IMPLEMENTER=luna` — на `luna`; `SP_IMPLEMENTER=<p>` — на профиль `p`. `glm=off`, кроме `SP_IMPLEMENTER=glm`. Если `SP_IMPLEMENTER` называет неизвестный профиль или профиль с `"harness": "inproc"`, оркестратор объявляет это одной строкой и считает значение равным `luna`.
+   2. **Рисковая фаза** → цепочка `implementer.risk`.
+   3. **GLM выбыл в этой сессии** (`glm=down`) → следующий не-down профиль цепочки `implementer` (по умолчанию Luna max), с объявлением один раз за сессию.
+   4. **Фаза уже передана запасному профилю или на эскалацию** → остаётся там; продолжается та же нить (`--resume-task`).
+   5. **Иначе** → первый не-down профиль цепочки `implementer` (по умолчанию GLM через `$ZDISPATCH`).
+
+   Фраза «без <имя профиля>» исключает профиль из всех цепочек до конца сессии (строка `off` в `channels`). `zcode-dispatch` не меняется: он отказывает только при `SP_IMPLEMENTER=luna`, а при других значениях оркестратор сам не отправляет задачи на `glm`.
+5. **Эскалация** (BLOCKED + «нужно больше рассуждения», раунд 3 ревью с BLOCKING, диагностика гейта `CODE`). Цель — первый не-down профиль цепочки `implementer.escalation`. Если текущий профиль фазы и цель работают на харнессе `codex`, нить продолжается (`--resume-task`, как Luna → Sol сегодня); иначе — FRESH с уведомлением о смене канала (как GLM → Sol). Если фаза уже на профиле из цепочки `implementer.escalation`, решает пользователь: сегодня это правило «выше Sol ничего нет».
+6. **id не переходят между харнессами.** Внутри `codex` нить можно продолжить другим codex-профилем (Luna → Sol, как сегодня). Для харнессов ядра `--resume-task` допустим только с тем же профилем; иначе exit 2 и FRESH.
+
+### 5.4 Что проверяется и что нет
+
+**Проверяется** (`doctor` и `route`, без вызова модели):
+
+- профиль существует, его имя корректно, харнесс известен, неизвестных полей нет;
+- роли ссылаются на существующие профили;
+- бинарник найден и это нужная программа, версия читается, обязательные флаги есть в справке; непроверенная версия — строка в `doctor`, а не отказ;
+- ключ доступен: файл есть, переменная задана или `keyCmd` завершился с кодом 0;
+- вход в харнесс подтверждён там, где есть неинтерактивная проверка: `claude auth status --json`, `opencode auth list`, `pi auth check --provider X --json`;
+- `env` профиля не трогает обязательные настройки (§3.6 А);
+- `wrap` запускается;
+- для `native` песочница доступна на платформе (§3.10).
+
+Если ревьюер назначен на `glm`, который не умеет работать в режиме только чтения, `route` выводит одну строку-предупреждение, но маршрут не блокирует.
+
+**Не проверяется:**
+
+- условия провайдеров: допустимо ли сочетание подписки с харнессом;
+- тип и формат ключа;
+- соответствие ключа эндпоинту;
+- `model` у профилей `codex`;
+- качество модели и её пригодность для роли;
+- **правило семейств** (ревьюер из другого семейства моделей, чем автор). Встроенная схема его соблюдает; для пользовательской маршрутизации оно не проверяется, а в README есть одна строка-совет.
+
+---
+
+## 6. Изменения в оркестраторе и скиллах
+
+### 6.1 По точкам связности [00 §3]
+
+| Точка | Изменение |
+|---|---|
+| C1 переменные диспетчеров и белые списки гейта (`SKILL.md:46`, `:61-72`) | Добавляется `$AD` (`agent-dispatch`); путь к нему находится тем же фрагментом кода, что и к `$DISPATCH`. В белые списки входят `"$AD" status`, `route`, `channels`, `doctor [--profile P] [--probe]` и `cat` маркера `channels`. `$DISPATCH` и `$ZDISPATCH` остаются валидными |
+| C2 карта префиксов (`:109`, `:753`) | Добавляются `ct-`, `oc-`, `pi-`, `dt-` → `$AD`. Правило «id не переходят между диспетчерами» становится правилом §5.3 п. 6: id не переходят между харнессами; внутри `codex` нить можно продолжить другим codex-профилем; у харнессов ядра — только тем же профилем, иначе FRESH |
+| C3 суффикс файла отправки | `<seq>.<glm\|luna\|sol>.md` → `<seq>.<профиль>.md`. Старые имена — это имена встроенных профилей, поэтому разбираются как раньше |
+| C4 строка состояния (`:100`) | `impl=<профиль>:<id> \| claude \| —`. Поле `glm=` остаётся; добавляется `down=<p1,p2 \| —>` |
+| C5 маркер `glm-channel` | Без изменений. Рядом появляется `channels` формата `<профиль> <down\|off> <класс\|kill-switch> <ISO-время>`. Восстановление после сжатия контекста (`:106-108`) читает и его; проверка `SP_IMPLEMENTER` даёт `glm=off` при любом непустом значении, кроме `glm` |
+| C6 kill switch | Пункт 1 лестницы §5.3 п. 4. Строка `:378` («no other values of `SP_IMPLEMENTER`») переписывается: значение — имя профиля |
+| C7 лестница каналов (`:368-376`, Step 5 `:558`, repair `:659`) | Дословно текст §5.3 п. 4: «GLM» → «первый не-down профиль цепочки `implementer`», «Luna» → «следующий профиль цепочки», рисковые фазы — на цепочку `implementer.risk` |
+| C8 эскалация на Sol (`:157`, `:174`, `:416`, `:474`, `:524`) | Правило §5.3 п. 5 |
+| C9 таблица Model split | Добавляется столбец «имя роли»; значения не меняются. Плюс одна фраза: «переназначение — `"$AD" route`» |
+| C10 правило семейств (`:178`) | Для встроенной схемы без изменений; добавляется пометка «для пользовательской маршрутизации не проверяется» |
+| C11 пункты чек-листа 5 и 10 | Формулируются через профиль роли; детали Codex и GLM — в скиллах-справочниках |
+| C12 лестницы сбоев (`:366`, `:422-428`) | Правила по харнессу (§3.8): таблица GLM прежняя, но «→ Luna max» везде, включая `MAX_PROMPT_BYTES`, становится «→ следующий не-down профиль цепочки роли (по умолчанию `luna`)»; плюс один абзац для задач `codex` и ядра |
+| C13 зависшая резервация (`:430-437`) | Та же процедура; для `ct-`, `oc-`, `pi-`, `dt-` — `"$AD" release-stale` |
+| C14 `MAX_PROMPT_BYTES` | Только для `zcode` |
+| C15 проба | Только для GLM, как сейчас. Новые профили отдельно не пробуются: сбой первой задачи переключает на запасной профиль |
+| C16 Verified facts | Факты о новых харнессах — в `agent-invocation` (§6.3) |
+| C17 преамбула ZCode | Для `glm` остаётся дословно. Для имплементеров на `claude`, `opencode`, `pi` и `dsh` — общая headless-преамбула с тем же текстом; в список запретных путей добавлены каталоги харнессов (`~/.claude`, `~/.config/opencode`, `~/.local/share/opencode`, `~/.pi`, `~/.dsh`, данные плагина). Внешние ревьюеры получают короткую преамбулу ревьюера: запуск headless, вопросов не задавать, только чтение, полный отчёт в финальном сообщении (без предела в 15 строк — правило R9 [00 §4.2]) |
+| C18 уведомление о смене канала | `<профиль> (<харнесс>, <модель>)` вместо фиксированных имён |
+| C19 `status` обоих диспетчеров, предел 2 | `"$AD" status` сводит все три хранилища (§3.3) |
+| C20 параллельность GLM (`:635`) | Правило §3.9: при общем профиле с `maxParallel: 1` второй трек берёт следующий профиль цепочки |
+| C21 места отправки Astra (`codex-plan-reviewer-prompt.md`, `codex-control-review-prompt.md`, `final-review-prompt.md`, `brainstorming/spec-reviewer-prompt.md`, `brainstorming/SKILL.md:221`, `writing-plans/SKILL.md:59`, `requesting-code-review/SKILL.md:96`, `systematic-debugging/SKILL.md:276-278`) | `--model gpt-6-astra --effort …` заменяется на «профиль роли (`"$AD" route <роль>`); по умолчанию — Astra, той же командой». На встроенных профилях `$AD` передаёт companion те же флаги. Запасной путь Step 5 в `final-review-prompt.md:19-23` обобщается с «Codex» на «любой внешний профиль в режиме только чтения», включая вынос проверки 6 |
+| C22 Red Flags | «Только GLM/Codex» → «только профиль из `route`» |
+| C23 общий текст | «Канал имплементера» вместо «GLM/Luna», где речь не о встроенной схеме |
+| C24 строки обёрток | `zcode-dispatch`, `bin/lib/zcode-dispatch.mjs` и `codex-dispatch` не меняются (на них опираются 110 тестов) |
+| C25 описание в `plugin.json` | Одна фраза про профили `agent-dispatch` и новые харнессы; ключевые слова `claude-p`, `opencode`, `pi`, `deepseek` |
+| Прочие места `SKILL.md` | `:9`, `:40`, `:62`, `:71` — разрешённый `Read` файла `../agent-invocation/SKILL.md`. `:27` — исключение Rule 1 для `Write` маркера `channels`. `:57`, `:72` — путь подтверждённого возобновления: `"$AD" task\|result\|cancel\|release-stale`, и идущая задача, найденная через `"$AD" status`, снимает гейт. `:137` — повторная отправка при испорченном выводе для профилей ядра (`--resume-task` на том же профиле). `:412`, `:415`, `:452`, `:523` — команды NEEDS_CONTEXT, GATE_FAIL и раундов исправлений с явными флагами Codex идут через профиль из `route` |
+
+Уже обобщённое не трогаем: токены вердиктов, схему seq, `[REPORT_FILE]`, пакеты ревью, ledger, `risk_phases`, роли Claude внутри сессии [00 §3].
+
+### 6.2 Как не раздуть `SKILL.md`
+
+Чистый прирост `skills/dev-orchestrator/SKILL.md` — около 30 строк, не больше. Новый текст — это замены «GLM/Luna/Sol» на «профиль цепочки», текст лестницы §5.3 п. 4 вместо нынешнего, правило эскалации, один абзац правил сбоев и одна строка про `route`. Всё специфичное для харнессов уходит в новый скилл.
+
+### 6.3 Новый скилл `skills/agent-invocation/SKILL.md`
+
+Скилл-справочник: оркестратор читает его через `Read`, а Skill tool его не загружает — как `zcode-invocation`. В шапке `disable-model-invocation: true` и строка-маркер ручного скилла; `tests/test-pipeline-context.sh` получает его в `PIPELINE_SKILLS`. Объём около 200–250 строк. Содержание:
+
+- как найти путь к `$AD`;
+- подкоманды и Monitor-цикл с префиксами id;
+- что печатает `route` и строки объявлений;
+- таблица «класс ошибки → действие» (§3.8);
+- headless-преамбулы имплементера и ревьюера;
+- особенности resume и режима только чтения по харнессам. У ревьюера на pi нет git: единственный источник — пакет ревью;
+- раздел «Факты по исходникам (не запускалось)»: `opencode` 1.19.3, `pi` 1.3.0, `dsh` 0.2.1-rc.2. Эти харнессы на машине владельца не запускались, факты взяты из исходников и документации. Отдельно — проверенный запуском `claude` 2.1.302 [01].
+
+`codex-invocation` и `zcode-invocation` не меняются; в них добавляется только перекрёстная ссылка.
+
+### 6.4 Совместимость с уже идущим `/dev`
+
+- Без `config.json` маршруты встроенные, и поведение идентично текущему.
+- Старые артефакты остаются валидными: файлы `.glm.md`, `.luna.md`, `.sol.md`; сайдкары `glm:zt-…` и `luna:task-…`; маркер `glm-channel`; вызовы через `$DISPATCH` и `$ZDISPATCH`. id маршрутизируются по префиксу.
+- Плагин обновляется между сессиями. После сжатия контекста хук SessionStart просит перечитать `SKILL.md`, и новый текст понимает старые артефакты. Фаза, начатая до обновления, продолжается через `--resume-task` с тем же id.
+
+---
+
+## 7. Документация
+
+В `README.md` и `README.ru.md` после раздела «Роли моделей» (в английском — Model roles) появляется раздел **«Свои харнессы и API»**:
+
+1. **Профиль за три шага:** `agent-dispatch profile add <имя> --from <пресет>` → `key set` или вход в харнесс → `doctor --probe`. Где лежит `config.json` и как устроены роли. Ключ, экспортированный в вашем шелле, передаётся через `{"keyEnv": "VAR"}`.
+2. **Claude Code (`claude -p`):**
+   - подписка (общие лимиты с основной сессией [07 AN4]);
+   - API — таблица эндпоинтов и рецептов из [06 §1]: Z.ai, DeepSeek, Kimi Platform, MiniMax, Alibaba PAYG (по регионам), OpenRouter (`ANTHROPIC_API_KEY=""`);
+   - локальная модель: llama-server, LM Studio, Ollama, контекст по умолчанию у Ollama, «16 ГБ памяти — не для имплементера, 32–48 ГБ — для небольших фаз» [08].
+3. **OpenCode:** установка `npm i -g opencode-ai@1.19.3` (не `brew install opencode`); вход в Copilot, ChatGPT, OpenCode Go или GLM Coding Plan либо API-ключ и `keyVar`; изолированный каталог через `profile env`; `options.permission` и `options.plugins`; поддерживаемая версия — 1.19.x.
+4. **pi:** установка `npm i -g --ignore-scripts @earendil-works/pi-coding-agent@1.3.0`, Node `>=22.19`; ключ через `keyVar` или `models.json` для своего эндпоинта; «Sign in with ChatGPT»; `options.extensions`; у ревьюера нет git.
+5. **DeepSeek Harness:** `npm i -g @deepseek-ai/dsh@0.2.1-rc.2` (не путать с `dsh` из Homebrew), Node `^22.19` или `>=24`; ключ DeepSeek из хранилища или `~/.dsh/.env`; модели `deepseek-v4-pro`, `deepseek-flash` и словарь effort `off|low|high|max`; `endpoint` для своего шлюза; `options.sessionLog` включает выгрузку журнала сессии.
+6. **ZCode и Codex:** ссылки на существующие разделы, без изменений. В Codex документируются только модели OpenAI.
+7. **Маршрутизация ролей:** таблица §5.1, пример §5.2, переназначение ролей в сессии на `inproc`-профили, kill switch, одна строка-совет про правило семейств.
+8. **Песочница:** `native` по харнессам, `wrap` с примером `srt` и списком из §3.7, видимость ключа инструментам у OpenCode и pi.
+9. **Справочная таблица «Что разрешают провайдеры — для справки, по состоянию на 2026-10-20; ответственность ваша»** (из [07], с ID источников):
+
+| Подписка / ключ | Разрешено официально | Серая зона | Не разрешено |
+|---|---|---|---|
+| Claude Pro/Max | Claude Code, включая `claude -p` [AN1, AN4] | — | OAuth в сторонних харнессах (OpenCode, pi и др.) |
+| ChatGPT Plus/Pro | Codex; OpenCode, pi («Sign in with ChatGPT»), Kilo [OA1, OA6] | харнессы, которых OpenAI не называет | ChatGPT Business/Enterprise в сторонних харнессах |
+| GLM Coding Plan | ZCode, Claude Code, Codex, OpenCode, pi, Crush, Kilo, Cline | — | инструменты, которых нет в списке Z.ai (Qwen Code, Kimi CLI, dsh) |
+| GitHub Copilot | OpenCode [GH1] | Crush, Kilo, Cline | вход pi (pi представляется VS Code) |
+| OpenCode Go | Claude Code, Codex, ZCode, pi, OpenCode, Kilo | — | — |
+| OpenCode Zen | OpenCode | вне OpenCode | — |
+| Kimi Code | интерактивная работа | неинтерактивный (headless) запуск (правила Kimi: «только интерактивно», хотя документация CLI показывает `kimi -p`) | — |
+| MiniMax M Plan | любой совместимый инструмент | неинтерактивный (headless) запуск (подписка задумана для интерактивной работы) | — |
+| Alibaba Coding Plan | интерактивная работа | — | неинтерактивный (headless) запуск [AL1] |
+| Alibaba / QwenCloud Token Plan | — | неинтерактивный (headless) запуск | — |
+| Google AI (Gemini, Antigravity) | инструменты Google | — | OAuth в сторонних харнессах; запуск `agy` из стороннего харнесса |
+| Ollama Cloud | — | автоматизация (в условиях явно не разрешена) | — |
+| Любой PAYG-ключ (DeepSeek, Z.ai Standard, Kimi Platform, MiniMax API, Alibaba PAYG, OpenRouter) | любой харнесс | — | — |
+| Локальная модель | любой харнесс | — | — |
+
+Отдельной строкой под таблицей: `claude -p` со сторонним эндпоинтом не нарушает условия Anthropic, но Anthropic такую конфигурацию не поддерживает [07, итог п. 4].
+
+10. **Если что-то сломалось:** приложите вывод `agent-dispatch doctor --profile <p>`, `status <id> --json` и лог задачи (секреты в нём вычищены) к issue или сообщению владельцу. Если эндпоинт отвергает beta-поля запроса, добавьте в `env` профиля `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` [01].
+
+Также раздел «Роли моделей» получает одну строку со ссылкой на переназначение, а `plugin.json` — фразу из C25.
+
+---
+
+## 8. План поставки
+
+Инкременты идут по порядку. После каждого инкремента `main` остаётся рабочим, а поведение по умолчанию не меняется.
+
+| № | Содержание | Тесты (только заглушки) | Объём (оценка) |
+|---|---|---|---|
+| 0 | Ядро `bin/lib/agent-core.mjs`: выделенная копия общей части `zcode-dispatch.mjs` плюс новое — снимок потомков, `redactor(values[])`, лестница сигналов (§3.1). `zcode-dispatch.mjs` и его тесты не меняются | `tests/test-agent-core.sh`: резервация, boot-id, уборка мёртвых раннеров, отмена с потомками, таймаут, вычистка секретов, фильтр окружения — на тривиальном адаптере. `tests/test-zcode-dispatch.sh`: 110 PASS без правок | копия около 1100 строк, около 150 новых |
+| 1 | `agent-dispatch`: конфигурация, встроенные профили и роли, `key`, `profile`, `preset`, `route` (формат §3.3, `--skip`, связанные профили), `channels`, `doctor`, `status`, `result`, `cancel`, `release-stale`; сквозные адаптеры `zcode` и `codex` (таблица §3.3); переназначение ролей в сессии на `inproc`-профили (§5.1); правки оркестратора и скиллов (§6) при прежних значениях по умолчанию; скилл `agent-invocation`; каркас раздела README. Версия 0.12.0 | `tests/test-agent-dispatch.sh`: заглушки `zcode-dispatch` и `codex-dispatch` записывают argv → для каждой роли argv совпадает с таблицей §3.3 (эталон); слияние конфигурации; отказ на неизвестное поле, на битый файл и на переопределение встроенного имени; `route --all` без файла и с файлом, совпадающим со встроенной схемой, печатает `routes: default`; `route plan-writer` выдаёт пользовательский `inproc`-профиль; `--skip glm:quota` исключает профили с меткой `zai-coding-plan`; `key set` (права 0600, отказ на аргумент, ввод через pipe); вычистка секретов; отказ второй пишущей задаче в том же дереве; `maxParallel`. `tests/test-pipeline-context.sh`: `agent-invocation` в `PIPELINE_SKILLS`. Статические grep-проверки: значения таблицы Model split и строки `$ZDISPATCH`/`$DISPATCH` в `SKILL.md` не изменились | ~800 кода, ~450 тестов |
+| 2 | Адаптер `claude`: вход, API, `none` (локальная модель); README по нему | `agent-stub.cjs`, диалект `claude-json`: env (ровно одна переменная с ключом, свой `CLAUDE_CONFIG_DIR`, никаких `ANTHROPIC_*` у профиля со входом, scrub, `CLAUDE_CODE_EFFORT_LEVEL` в наложении, алиас `FABLE`); argv (флаги, набор ревьюера с git, один `--append-system-prompt-file`); пустой ключ → отказ без запуска; классы ошибок по `api_error_status` (`is_error` при exit 0, `error_max_turns`, 401/402/404/429/529, `prompt_too_long`, SIGINT → пустой stdout с exit 0, SIGTERM → 143); привязка resume и `No conversation found` → `resume-lost`; `permission_denials`; проверка справки | ~300 + ~300 |
+| 3 | Адаптер `dsh` | диалект `dsh-ndjson`: сборка patch-файла (строки целиком, `baseURL` из `endpoint`, слияние `options.patch` без перекрытия закреплённых полей, effort в обеих строках); `danger-full-access` без `native`, `workspace-write` с `native`, `read-only` у ревьюера; `auth: native` не задаёт `DEEPSEEK_API_KEY`; после SIGTERM dsh выходит с кодом 0, но задача всё равно получает статус `cancelled` по записи диспетчера; отмена SIGINT → не меньше 7 с → SIGKILL; коды `dsh: <CODE>:`; позднее событие `session`; проверка, что это нужный `dsh` | ~250 + ~200 |
+| 4 | Адаптер `opencode` (v1.19.x) | диалект `opencode-jsonl`: агенты `sp-` в `OPENCODE_CONFIG_CONTENT` и `--agent`; оставшийся `ask` → `blocked`; режим `stdin-wait` (stdin закрыт); exit 1 с валидным текстом; отсоединённые потомки убиты; `agent … not found` → `launch`; `instructions` проекта; `home: isolated` при ключе; `quota` только по признакам в теле | ~300 + ~250 |
+| 5 | Адаптер `pi` | диалект `pi-jsonl`: exit 0 при ошибке провайдера; resume — тот же `cwd` и файл сессии, `No project session found` → `resume-lost`; всегда `--mode json`; `stopReason`; `options.extensions` → `-e`; отмена только SIGTERM; `home: isolated` при ключе | ~250 + ~200 |
+| 6 | Роли субагентов Claude на внешних профилях через `$AD` — последний инкремент; пакеты ревью — как у Astra | эталонные argv; сценарий от начала до конца (end-to-end) на заглушке | ~150 + правки скиллов |
+
+**Заглушка.** `tests/fixtures/agent-stub.cjs` обобщает `zcode-stub.cjs` и подставляется через поле профиля `bin`:
+
+- `AGENT_STUB_DIALECT`: `zcode-json`, `claude-json`, `opencode-jsonl`, `pi-jsonl`, `dsh-ndjson`;
+- `AGENT_STUB_MODE`: 15 существующих режимов плюс `exit0-error`, `sigterm-exit0`, `error-then-recover`, `auto-reject`, `stdin-wait`, `detached-child`, `late-session`, `max-turns`, `rate-limit`, `quota`, `context`;
+- заглушка отвечает на справку (`helpArgv`), `--version`, `auth status --json`, `opencode auth list`, `pi auth check` и `dsh --dump-config`;
+- заглушка записывает argv, env и stdin для проверок.
+
+**Изоляция тестов.** Ядро читает фиксированные переменные: `AGENT_DISPATCH_STATE_DIR` (аналог `ZCODE_STATE_DIR`), `AGENT_DISPATCH_ZCODE` и `AGENT_DISPATCH_CODEX` (пути к заглушкам обёрток), `AGENT_TEST_BOOT_ID` (имитация перезагрузки), `AGENT_ENV_PASSTHROUGH` (проброс управляющих переменных заглушки через белый список). Имена можно поменять в плане, но они фиксируются один раз.
+
+**Встроенная схема.** Заглушками не проверить, что правки `SKILL.md` сохраняют поведение по умолчанию. Поэтому есть эталон argv (инкремент 1), статические grep-проверки и сверка правок `SKILL.md` с таблицей §6.1 на ревью плана и фаз.
+
+**Живых проверок нет.** Дымового прогона в плане нет. Если владелец захочет, после инкремента 2 он сам запускает `doctor --probe` для `claude-sub`, `luna`, `astra` и `glm`. Остальные провайдеры проверят друзья на своих ключах.
+
+**Порядок инкрементов 3–5:** `dsh` → OpenCode → pi. Он меняется, если друг попросит другой харнесс первым.
+
+---
+
+## 9. Что сознательно не делаем
+
+- Движок условий провайдеров, отказы в коде, флаги серых зон, уровни безопасности, гейты по риску, аудит диффов, канареечные проверки, проверки типа ключа и его привязки к эндпоинту.
+- Встроенную интеграцию `srt` и автоматическую песочницу.
+- Запрет режимов полного доступа (`danger-full-access` у dsh, `bypassPermissions` у claude): без песочницы пишущие роли работают так же, как ZCode в `--mode yolo`.
+- Отказ запуска на непроверенной версии харнесса.
+- Сторонние модели через Codex: не документируем и не поддерживаем, но и не запрещаем. Любые правки companion.
+- Antigravity, Qwen Code, Kimi Code CLI, Gemini CLI и другие харнессы; подписки Kimi Code и MiniMax.
+- Пресеты для входов pi в Anthropic и Copilot; OAuth Claude вне Claude Code.
+- Установку харнессов и моделей: `doctor` только говорит, чего не хватает.
+- Подбор моделей под роли, оценку качества и проверку правила семейств для пользовательских настроек.
+- Изменения встроенной схемы, правил effort и пределов циклов.
+- Дедупликацию `zcode-dispatch.mjs` и ядра в этом проекте.
+- Серверные режимы (`opencode serve`/`--attach`, RPC pi, ACP) — только разовые headless-запуски.
+- Шифрование ключей: хватает прав 0600; кому нужно больше, может использовать `keyCmd` с менеджером паролей.
+- Нативную поддержку Windows — у неё отдельный бриф (`2026-10-20-zcode-windows-native-brief.md`).
+- Живые проверки на сторонних провайдерах и покупку токенов.
+
+---
+
+## 10. Принятые решения и непроверенное
+
+Вопросов к владельцу нет. То, что раньше было открытым, решено так:
+
+- **Порядок инкрементов 3–5:** `dsh` → OpenCode → pi; меняется, если друг попросит другой харнесс первым.
+- **Роли субагентов Claude:** переназначение на другую модель и effort — с инкремента 1, внешнее исполнение — инкремент 6 (решение владельца: роли перенастраиваются как угодно).
+- **Дымовой прогон:** в плане его нет; по желанию владелец запускает `doctor --probe` сам (§8).
+
+Не проверено запуском; на план не влияет, подтвердят первые пользователи:
+
+- работает ли `git commit` под `workspace-write` у `dsh` в связанных рабочих деревьях (git worktree), где `.git` лежит вне `cwd` [04b] — оговорка в README (§3.7);
+- какой `reasoningEffort` у dsh побеждает в headless-режиме и принимаются ли все поля patch-файла [04b, вопрос 3] — `doctor` проверяет через `--dump-config`;
+- нет ли гонок при параллельной первой инициализации профиля headless у dsh [04b, вопрос 4] — `doctor` инициализирует профиль заранее;
+- видит ли зачистка потомков инструменты dsh в user-systemd scopes на Linux [04b §10];
+- код выхода OpenCode v1 при автоотклонении запроса разрешения (по исходникам — 0) [02];
+- можно ли повторять `--append-system-prompt-file` у `claude` — адаптер передаёт один файл [01].
