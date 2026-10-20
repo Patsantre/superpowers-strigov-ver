@@ -324,10 +324,11 @@ expect_text "$ORCH" '`GLM channel failed (errorClass=<class>) — Ф<id> falls b
 expect_absent "$ORCH" '<next implementer profile; built-in Luna max>' 'no profile-name placeholder in the doctor announcement'
 expect_absent "$ORCH" 'falls back to <profile> (built-in: Luna max)' 'no profile-name placeholder in the GLM-down announcement'
 expect_new "$ORCH" 'between built-in profiles, word for word the built-in line of "## Reporting cadence"' 'built-in switches: the old line, no Channel line beside it'
-# "без <profile>": GLM keeps its own kill switch; any other profile leaves its chains even under routes: default.
+# "без <profile>": GLM keeps its own kill switch; any other profile is a switch only with the user's own routing.
 expect_new "$ORCH" '("без GLM" is the GLM kill switch above and writes no `channels` line)' '"без GLM" writes no channels line'
-expect_new "$ORCH" 'while the marker holds an `off` line, "## Routing" items 2 and 4 call `route` with the skips' '"без <profile>" turns route calls back on under routes: default'
-expect_new "$ORCH" 'skipped for the session while the `channels` marker holds no `off` line' 'Routing item 1: the routes: default shortcut ends with an off line'
+expect_new "$ORCH" 'only when `route --all` did not print `routes: default`' '"без <profile>" needs the user'"'"'s own routing'
+expect_new "$ORCH" 'Under `routes: default` no such switch exists, as before 0.12.0.' 'no "без <profile>" switch under routes: default'
+expect_new "$ORCH" 'are skipped for the session: the Model split table' 'Routing item 1: the routes: default shortcut holds for the session'
 
 # The documented route --all example, run against the CLI (no harness runs: route only).
 echo ""

@@ -140,7 +140,7 @@ The failure rules depend on the job's harness (dev-orchestrator Step 3, "GLM inf
 | `blocked` | OpenCode's remaining `ask` (`auto-rejecting` on stderr); a permission refusal without a result | the next profile |
 | `resume-lost` | the harness lost the session | FRESH on the same profile with the re-brief; not a failure |
 
-- A `down` or `off` profile stays so until the session ends: append `<profile> <down|off> <class|kill-switch> <ISO time>` to `<scratchpad>/dev-orchestrator/channels` (`off` comes from the user's "без <profile>"; "без GLM" is the GLM kill switch and writes no line). The next `route` call skips it — under `routes: default` too: an `off` line turns the `route` calls back on (dev-orchestrator Step 3 "Kill switch").
+- A `down` or `off` profile stays so until the session ends: append `<profile> <down|off> <class|kill-switch> <ISO time>` to `<scratchpad>/dev-orchestrator/channels` (`off` comes from the user's "без <profile>", which exists only when the user's routing differs from the built-in scheme; "без GLM" is the GLM kill switch and writes no line). The next `route` call skips it (dev-orchestrator Step 3 "Kill switch").
 - Every switch is one announced line; the same operation goes to the new profile FRESH at the next seq, composed per dev-orchestrator Step 3. `cancelled` → report to the user and wait.
 - The chain exhausted → `route` exits 2 with `no profile left` → exactly one question to the user.
 
