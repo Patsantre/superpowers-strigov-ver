@@ -1167,6 +1167,8 @@ async function cmdTask(args) {
   if (values["resume-task"] !== undefined && values.fresh) throw new UsageError("--resume-task and --fresh are mutually exclusive");
   if (process.env.SP_IMPLEMENTER === "luna") throw new UsageError("SP_IMPLEMENTER=luna is set: the GLM channel is switched off (kill switch)");
   passthroughNames(); // refuse invalid names before any job or reservation state is written
+  const lockProblem = configLockProblem(); // refuse here, not later as a failed/launch job in the runner
+  if (lockProblem) throw new UsageError(lockProblem);
   const ws = requireWorkspace(values.cwd);
   refuseUnavailableReservation(ws.jobsDir, ws.root);
   const promptFile = checkPromptFile(values["prompt-file"]);

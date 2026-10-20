@@ -1754,12 +1754,15 @@ console.log(JSON.stringify({ packed: v("packed"), unpacked: v("unpacked"), nover
         before_noflock="$(cat "$ZCODE_STATE_DIR/personal-provider-config.json")"
         out="$(PATH="$noflock" "$node_bin" "$MJS" doctor)" || true
         noflock_out="$(printf '%s\n' "noflock-fake-key-0123456789" | PATH="$noflock" "$node_bin" "$MJS" api-key set 2>&1)" || noflock_rc=$?
+        local noflock_task_out noflock_task_rc=0
+        noflock_task_out="$(PATH="$noflock" "$node_bin" "$MJS" task --background --prompt-file "$prompt" 2>&1)" || noflock_task_rc=$?
         if grep -Fq "FAIL platform: linux: flock(1) from util-linux is not on PATH" <<<"$out" && [[ "$noflock_rc" -eq 2 && "$noflock_out" == *"flock(1)"* ]] \
+            && [[ "$noflock_task_rc" -eq 2 && "$noflock_task_out" == *"flock(1)"* && "$noflock_task_out" != *"started in the background"* ]] \
             && [[ "$(cat "$ZCODE_STATE_DIR/personal-provider-config.json")" == "$before_noflock" ]]; then
-            pass "17 linux: without flock(1) on PATH doctor fails its platform check and api-key set is refused (exit 2, config unchanged)"
+            pass "17 linux: without flock(1) on PATH doctor fails its platform check; api-key set and task are refused up front (exit 2, config unchanged, no job started)"
         else
-            fail "17 linux: without flock(1) on PATH doctor fails its platform check and api-key set is refused (exit 2, config unchanged)"
-            echo "    api-key exit=$noflock_rc out=$noflock_out"
+            fail "17 linux: without flock(1) on PATH doctor fails its platform check; api-key set and task are refused up front (exit 2, config unchanged, no job started)"
+            echo "    api-key exit=$noflock_rc out=$noflock_out task exit=$noflock_task_rc out=$noflock_task_out"
             echo "$out" | sed 's/^/    /'
         fi
     else
