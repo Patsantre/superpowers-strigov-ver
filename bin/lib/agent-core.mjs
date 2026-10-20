@@ -55,9 +55,14 @@
 //   `unknown`, which never authorizes a signal and never counts as gone. harnessGroupState() and processIdentity()
 //   therefore return four states: a caller that signals on anything but "ours" is wrong. A group of the ownership log
 //   is the job's only while its leader is (a group id outlives its leader, and a stranger can lead a group under it
-//   later); only the harness group, whose leader the runner watched, also counts while members outlive the leader.
+//   later); only the harness group, whose leader the runner watched, also counts while members outlive the leader
+//   (on Linux while they are in the harness's own session: inAnotherSession).
 //   A process that ended but was never reaped (a zombie, for good under a Linux container's pid 1 that does not reap)
-//   is gone for all of this: isAlive() and groupAlive() do not count it.
+//   is gone for all of this: isAlive() and groupAlive() do not count it (a group only once a second /proc scan
+//   confirms the first, zombieOnlyGroups). A zombie is a process whose threads have all ended: one whose main thread
+//   alone ended reads Z too, and lives (hasEnded). Its start time still counts as identity: a zombie holding the
+//   harness group's leader pid makes that group foreign when its start time differs, unknown when it cannot be
+//   compared (harnessGroupState).
 // The adapter contract (spec §3.2) — adapters return data, the core owns processes, files, signals and keys:
 //   { id, idPrefix, manifest: { sessionId: "preassign" | "first-event", sessionIdFormat?: "uuid" | "job-id",
 //     cancel: { ladder: [[signal, waitMs], …] }, helpArgv?, requiredFlags?, homeEnv? },
@@ -759,31 +764,122 @@ const signalable = (target) => {
 // Zombies: a process that ended but was not reaped yet stays in the process table and in its group, and kill(…, 0)
 // finds it. On Linux that can last for good: under a pid 1 that never reaps (a container whose pid 1 is node, npx or
 // `sleep infinity`) every process the cleanup SIGKILLed would stay "alive". A zombie has ended: on Linux isAlive() and
-// groupAlive() do not count it (state Z or X in /proc/<pid>/stat). macOS needs no check: launchd reaps every orphan at
-// once, and every other parent in a job's tree is the job's own (stopped by the same cleanup) or a runner or
-// supervisor, which reap — a zombie there is gone within the waits that follow a signal.
+// groupAlive() do not count it. The state in /proc/<pid>/stat is its leader thread's, though: a process whose main
+// thread ended (pthread_exit) while other threads run reads Z as well ("Zl" in ps) and lives on. So a process has
+// ended when its state is Z or X and its thread count (field 20 of the same stat line) is down to that leader: 1, or 0
+// once it is being released (hasEnded). A group of threads down to a zombie leader never grows again: only a live
+// thread starts one. macOS needs no check: launchd reaps every orphan at once, and every other parent in a job's tree
+// is the job's own (stopped by the same cleanup) or a runner or supervisor, which reap — a zombie there is gone within
+// the waits that follow a signal.
 const ZOMBIE_STATES = new Set(["Z", "X"]);
-const isZombie = (pid) => process.platform === "linux" && ZOMBIE_STATES.has(procStatFields(pid)?.[0]);
+const threadCount = (fields) => (/^\d+$/.test(fields?.[20 - 3] ?? "") ? Number(fields[20 - 3]) : null);
+const hasEnded = (state, threads) => ZOMBIE_STATES.has(state) && Number.isInteger(threads) && threads <= 1;
+const isZombie = (pid) => {
+  if (process.platform !== "linux") return false;
+  const fields = procStatFields(pid);
+  return hasEnded(fields?.[0], threadCount(fields));
+};
 
-// Linux: the ids of `pgids` whose members, as far as /proc shows them, are all zombies.
-function zombieGroups(pgids) {
-  if (process.platform !== "linux" || pgids.length === 0) return new Set();
+// One pass over /proc: every listed process as { pid, state, pgid, sid, threads, gone }, or null when /proc cannot be
+// listed — fields 3, 5, 6 and 20 of its stat line (state, process group, session, thread count). state and pgid are
+// null when its stat could not be read; `gone` then says why: true when the pid no longer exists (the process ended
+// and was reaped after the listing — routine wherever processes come and go), false when something still holds it
+// that /proc does not show (another user's process under hidepid, a pid reused at once).
+function procScan() {
   let names;
   try {
     names = fs.readdirSync("/proc");
   } catch {
-    return new Set();
+    return null;
   }
-  const wanted = new Set(pgids);
-  const live = new Set();
-  const ended = new Set();
+  const scan = [];
   for (const name of names) {
     if (!/^\d+$/.test(name)) continue;
-    const fields = procStatFields(name); // [state, ppid, pgrp, …]
+    const pid = Number(name);
+    const fields = procStatFields(pid); // [state, ppid, pgrp, session, …]
     const pgid = Number(fields?.[2]);
-    if (wanted.has(pgid)) (ZOMBIE_STATES.has(fields[0]) ? ended : live).add(pgid);
+    const sid = Number(fields?.[3]);
+    if (typeof fields?.[0] === "string" && fields[0] !== "" && Number.isInteger(pgid)) {
+      scan.push({ pid, state: fields[0], pgid, sid: Number.isInteger(sid) ? sid : null, threads: threadCount(fields), gone: false });
+    } else scan.push({ pid, state: null, pgid: null, sid: null, threads: null, gone: !signalable(pid) });
   }
-  return new Set([...ended].filter((pgid) => !live.has(pgid)));
+  return scan;
+}
+
+const readable = (entry) => typeof entry?.state === "string" && Number.isInteger(entry.pgid);
+// A scan entry that has ended for good (hasEnded): a zombie whose other threads are gone too.
+const ended = (entry) => hasEnded(entry.state, entry.threads);
+
+// The members of the `wanted` groups in one scan (procScan's shape) as Map pgid → Map pid → whether it has ended
+// (ended), or null when the scan cannot tell. A process whose stat could not be read may be a member of any group.
+// One that is gone is skipped in a first scan (`first` null): whatever it forked after the listing is listed by the
+// confirming scan. In a confirming scan it is skipped only when the first scan read that pid (then another group's
+// process, or a zombie member reaped since, which changes the membership anyway); a new one may have been a member
+// that forked after its listing, so the scan cannot tell. One that is still there leaves any scan unable to tell.
+function scanMembers(scan, wanted, first = null) {
+  if (!Array.isArray(scan)) return null;
+  const known = first === null ? null : new Set(first.filter(readable).map((entry) => entry.pid));
+  const members = new Map();
+  for (const entry of scan) {
+    if (!readable(entry)) {
+      if (entry?.gone === true && (known === null || known.has(entry.pid))) continue;
+      return null;
+    }
+    if (!wanted.has(entry.pgid)) continue;
+    if (!members.has(entry.pgid)) members.set(entry.pgid, new Map());
+    members.get(entry.pgid).set(entry.pid, ended(entry));
+  }
+  return members;
+}
+
+const allEnded = (members) => [...members.values()].every(Boolean);
+
+// Of `pgids`, the groups one scan shows with members that have all ended (zombies down to their leader thread):
+// candidates only (zombieOnlyGroups).
+export function zombieCandidates(pgids, scan) {
+  const members = scanMembers(scan, new Set(pgids));
+  return new Set(members ? [...members].filter(([, group]) => allEnded(group)).map(([pgid]) => pgid) : []);
+}
+
+// Of `pgids`, the groups that two /proc scans, taken one after the other, show as zombie-only; null when the second
+// scan cannot tell (scanMembers: take another). A scan lists the pids first and reads their stats after, so one scan
+// can miss a member: one that a listed member forked after the listing and then ended, all before its stat was read,
+// shows every listed member a zombie while the new one lives. A candidate of the first scan (zombieCandidates)
+// therefore counts only when the second lists exactly the same members, every one still ended: a new member forked
+// before the second listing shows there. Pure: the scans are procScan's results.
+export function zombieOnlyGroups(pgids, first, second) {
+  const candidates = zombieCandidates(pgids, first);
+  if (candidates.size === 0) return new Set();
+  const before = scanMembers(first, candidates);
+  const after = scanMembers(second, candidates, first);
+  if (!after) return null;
+  return new Set(
+    [...candidates].filter((pgid) => {
+      const was = before.get(pgid);
+      const now = after.get(pgid);
+      return now !== undefined && now.size === was.size && [...now.keys()].every((pid) => was.has(pid)) && allEnded(now);
+    }),
+  );
+}
+
+// Of `pgids`, the groups that are zombie-only, from the scans `scan()` takes: a second scan only when the first finds a
+// candidate, and up to CONFIRM_SCANS of them while they cannot tell; none that can confirms nothing (uncertainty keeps
+// a group alive).
+const CONFIRM_SCANS = 3;
+export function zombieGroupsFrom(pgids, scan) {
+  if (pgids.length === 0) return new Set();
+  const first = scan();
+  if (zombieCandidates(pgids, first).size === 0) return new Set();
+  for (let attempt = 0; attempt < CONFIRM_SCANS; attempt += 1) {
+    const confirmed = zombieOnlyGroups(pgids, first, scan());
+    if (confirmed) return confirmed;
+  }
+  return new Set();
+}
+
+// Linux: the ids of `pgids` whose members are all zombies, as /proc shows them (zombieGroupsFrom).
+function zombieGroups(pgids) {
+  return process.platform === "linux" ? zombieGroupsFrom(pgids, procScan) : new Set();
 }
 
 export function isAlive(pid) {
@@ -963,19 +1059,48 @@ const possiblyOurs = (state) => state === "ours" || state === "unknown";
 // by that stored id (spec §3.6 А8: the tree widens zcode-dispatch's group-only kill, so a stale id must not reach a
 // stranger). The groups of the ownership log are not judged by this: they count only by their leader
 // (survivingGroups).
-//   ours    — the leader lives with the start time recorded at spawn, or the leader is gone but the group still has
-//             members (POSIX reuses no process group id while its group exists): what a harness leaves behind in its
-//             group is the cleanup's main work, and the runner sweeps it the moment it reaps the harness;
-//   foreign — the leader's pid lives with another start time: the group ended and the pid now belongs to another
-//             process;
-//   unknown — the leader's pid lives, but its start time cannot be read (or was never recorded): never signalled,
-//             and never released as gone (release-stale, the reaper's cleanup);
+//   ours    — the leader lives with the start time recorded at spawn, or the leader has ended (reaped, or a zombie with
+//             that start time) but the group still has members (POSIX reuses no process group id while its group
+//             exists): what a harness leaves behind in its group is the cleanup's main work, and the runner sweeps it
+//             the moment it reaps the harness;
+//   foreign — the leader's pid is held by a process with another start time — a live one, or one that ended but was
+//             never reaped (a zombie keeps its pid and its start time): the group ended and the pid, and with it the
+//             group id, now belongs to another process; on Linux also a group whose leader is reaped and whose members
+//             are in another session than the harness's own (inAnotherSession);
+//   unknown — the leader's pid is held, but the holder's start time cannot be read (or none was recorded) while the
+//             leader lives, or while a zombie holds it and the group has members: never signalled, and never
+//             released as gone (release-stale, the reaper's cleanup);
 //   gone    — neither the leader nor any member is left.
 export function harnessGroupState(pgid, startedAt) {
   if (!Number.isInteger(pgid) || pgid <= 1) return "gone";
   const leader = processIdentity(pgid, startedAt);
   if (leader !== "gone") return leader;
-  return groupAlive(pgid) ? "ours" : "gone";
+  // processIdentity counts a zombie as gone (it has ended), but its start time still tells whose the pid is: a stranger
+  // that reused the pid and ended while members of its group live must not make that group ours, nor may a zombie
+  // whose start time cannot be compared.
+  if (signalable(pgid)) {
+    const now = typeof startedAt === "string" && startedAt !== "" ? processStart(pgid, { like: startedAt }) : null;
+    if (now !== null && now !== startedAt) return "foreign";
+    if (now === null) return groupAlive(pgid) ? "unknown" : "gone";
+    return groupAlive(pgid) ? "ours" : "gone";
+  }
+  if (!groupAlive(pgid)) return "gone";
+  return inAnotherSession(pgid) ? "foreign" : "ours";
+}
+
+// Linux: whether /proc shows the members of process group `pgid` in a session other than session `pgid`. A group lies
+// in one session for its whole life, and the harness is spawned detached (setsid): it leads session `pgid`, so every
+// member of its group is in that session too, also once the harness is gone. A group with its leader reaped and its
+// members elsewhere was made by a process that took the pid later — a shell's pipeline (`a | b`, led by `a`, which
+// ended first) is in the shell's session. None of the group's members may read as in session `pgid`: one that leaves
+// the group by setsid can be read between its two changes (new session, old group). False when /proc cannot tell
+// (no member readable, not Linux): the group then counts as the harness's, as before.
+function inAnotherSession(pgid) {
+  if (process.platform !== "linux") return false;
+  const sessions = new Set(
+    (procScan() ?? []).filter((entry) => readable(entry) && entry.pgid === pgid && Number.isInteger(entry.sid)).map((entry) => entry.sid),
+  );
+  return sessions.size > 0 && !sessions.has(pgid);
 }
 
 export function normalizeLadder(ladder) {

@@ -248,12 +248,12 @@ main() {
 
     local git_id=(-c user.email=t@example.com -c user.name=t -c commit.gpgsign=false)
     local r
-    for r in repo repo2 repo3 repo4 repo5 repo6 repo7 repo8 repo9 repo10 repo11 repo12 repo13 repo14; do
+    for r in repo repo2 repo3 repo4 repo5 repo6 repo7 repo8 repo9 repo10 repo11 repo12 repo13 repo14 repo15 repo16 repo17; do
         git init -q -b main "$TEST_ROOT/$r"
         printf 'x\n' >"$TEST_ROOT/$r/a.txt"
         (cd "$TEST_ROOT/$r" && git add a.txt && git "${git_id[@]}" commit -qm c0)
     done
-    local repo repo2 repo3 repo4 repo5 repo6 repo7 repo8 repo9 repo10 repo11 repo12 repo13 repo14
+    local repo repo2 repo3 repo4 repo5 repo6 repo7 repo8 repo9 repo10 repo11 repo12 repo13 repo14 repo15 repo16 repo17
     repo="$(cd "$TEST_ROOT/repo" && git rev-parse --show-toplevel)"
     repo2="$(cd "$TEST_ROOT/repo2" && git rev-parse --show-toplevel)"
     repo3="$(cd "$TEST_ROOT/repo3" && git rev-parse --show-toplevel)"
@@ -268,6 +268,9 @@ main() {
     repo12="$(cd "$TEST_ROOT/repo12" && git rev-parse --show-toplevel)"
     repo13="$(cd "$TEST_ROOT/repo13" && git rev-parse --show-toplevel)"
     repo14="$(cd "$TEST_ROOT/repo14" && git rev-parse --show-toplevel)"
+    repo15="$(cd "$TEST_ROOT/repo15" && git rev-parse --show-toplevel)"
+    repo16="$(cd "$TEST_ROOT/repo16" && git rev-parse --show-toplevel)"
+    repo17="$(cd "$TEST_ROOT/repo17" && git rev-parse --show-toplevel)"
     mkdir -p "$TEST_ROOT/notgit"
     # An auxiliary command for the boundedExec tests: `lead <file>` ignores SIGTERM, starts a member of its own process
     # group that ignores it too, and writes "<its parent> <its pid> <the member's pid>" to the file; both wait forever.
@@ -1953,7 +1956,8 @@ core.boundedExec(process.execPath, [process.argv[1], "lead", process.argv[2]], {
     kill -KILL "$runner" "$cancel40" 2>/dev/null
     wait "$cancel40" 2>/dev/null
     local survived=no
-    if [[ -n "$d1" && -n "$d2" ]] && kill -0 "$d1" 2>/dev/null && kill -0 "$d2" 2>/dev/null && ! kill -0 "$runner" 2>/dev/null; then survived=yes; fi
+    # The runner's end is not instant (a SIGKILLed process stays until its teardown and reaping are done): wait for it.
+    if [[ -n "$d1" && -n "$d2" ]] && kill -0 "$d1" 2>/dev/null && kill -0 "$d2" 2>/dev/null && gone "$runner"; then survived=yes; fi
     out="$(with_deadline 30 ad cancel "$id")"
     if [[ "$harness_died" == yes && "$survived" == yes && "$out" == "$id is cancelled (cleanup resumed)" ]] && gone "$d1" "$d2" \
         && [[ -e "$JOBS/$id.json.cleaned" && "$(ad status "$id" --json | jfield job.status)" == cancelled ]]; then
@@ -2194,6 +2198,367 @@ console.log([ran.status, ran.error === null, recorded, late.error?.code, late.ti
     else
         fail "45 the exec supervisor runs and records its group with the core's file gone (it imports nothing); past its deadline before the start, the command never starts (ETIMEDOUT)"
         echo "    status no-error recorded late-code late-timedOut: $out started: $([[ -e "$marker45" ]] && echo yes || echo no)"
+    fi
+
+    # --- 46. a zombie that holds the harness leader's pid keeps its start time: a stranger's never makes the group ours ---
+    # perl forks C, which leads a group of its own, forks a member M into it and ends; perl never reaps C. A zombie
+    # leader with a live member: what a stranger leaves that took the harness's old pid for a group of its own and ended.
+    # Pending jobs name C as their harness with another start time (foreign), with none (unknown) — the reaper and cancel
+    # send nothing and M lives — and with C's own (the job's harness ended and left M): the reaper stops M as before.
+    # pending_js: `pending(dir, id, child, startedAt, extra)` writes a completed job whose runner is dead and whose harness
+    # is `child` (a pending cleanup); `logOf(file)` reads its log (46, 49).
+    local pending_js='
+const fs = await import("node:fs");
+const { spawnSync } = await import("node:child_process");
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const dead = spawnSync("/usr/bin/true").pid;
+const pending = (dir, id, child, startedAt, extra = {}) => {
+  const file = `${dir}/${id}.json`, now = new Date().toISOString();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ id, status: "completed", errorClass: null, profile: "p1", harness: "plain", write: false, runnerPid: dead,
+    runnerStartedAt: "Mon Oct 19 10:00:00 2026", childPid: child, childStartedAt: startedAt, startedAt: now, finishedAt: now, bootId: core.bootId(),
+    timeoutMin: 1, cancelLadder: [["SIGTERM", 200], ["SIGKILL", 0]], ...extra }));
+  fs.writeFileSync(`${file}.runner`, `${JSON.stringify({ pid: dead, startedAt: "Mon Oct 19 10:00:00 2026", bootId: core.bootId(), claimedAt: now,
+    childPid: child, childStartedAt: startedAt })}\n`);
+  return file;
+};
+const logOf = (file) => { try { return fs.readFileSync(file.replace(/\.json$/, ".log"), "utf8"); } catch { return ""; } };'
+    if [[ "$(uname -s)" != Linux ]]; then
+        echo "  [SKIP] 46 Linux only: a zombie that outlives its parent (macOS's launchd reaps every orphan at once)"
+    elif command -v perl >/dev/null; then
+        local file46="$TEST_ROOT/zombie-46.txt" holder46 C46 M46 JOBS15 m46_alive=no
+        perl -e '$| = 1; my $c = fork; if (!$c) { setpgrp(0, 0); my $m = fork; if (!$m) { sleep 60; exit 0; } print "$$ $m\n"; exit 0; } sleep 60;' \
+            "$TEST_ROOT/zombie-holder-46" >"$file46" &
+        holder46=$!
+        wait_file "$file46"
+        read -r C46 M46 <"$file46"
+        JOBS15="$(jobs_dir_of "$repo15")"
+        out="$(core_js "$pending_js"'
+const [jobs, jobs15, repo, C, M] = process.argv.slice(1);
+const c = Number(C), m = Number(M), other = "ticks:1";
+for (let i = 0; i < 50 && core.isAlive(c); i += 1) await sleep(100); // C ends right after it printed
+const own = core.processStart(c);
+const states = [core.isAlive(c), core.isAlive(m), core.groupAlive(c), core.processIdentity(c, other), core.harnessGroupState(c, other),
+  core.harnessGroupState(c, null), core.harnessGroupState(c, own)];
+const foreign = pending(jobs, "pt-0001", c, other);
+const unknown = pending(jobs, "pt-0002", c, null);
+const reaped = core.reapDeadRunners(jobs);
+await sleep(300);
+pending(jobs15, "pt-0001", c, other, { workspaceRoot: repo, cwd: repo });
+console.log([...states, reaped.length, core.isAlive(m), /SIG/.test(logOf(foreign) + logOf(unknown)), fs.existsSync(`${foreign}.cleaned`),
+  fs.existsSync(`${unknown}.cleaned`)].join(" "));' "$TEST_ROOT/jobs-46" "$JOBS15" "$repo15" "$C46" "$M46")"
+        out2="$(with_deadline 30 ad cancel pt-0001 --cwd "$repo15")"
+        sleep 0.3
+        if [[ -n "$M46" ]] && kill -0 "$M46" 2>/dev/null; then m46_alive=yes; fi
+        out3="$(core_js "$pending_js"'
+const [jobs, C, M] = process.argv.slice(1);
+const c = Number(C), m = Number(M);
+const file = pending(jobs, "pt-0001", c, core.processStart(c));
+const first = core.reapDeadRunners(jobs);
+for (let i = 0; i < 50 && core.isAlive(m); i += 1) await sleep(100);
+core.reapDeadRunners(jobs);
+console.log([first[0]?.action, first[0]?.groups?.includes(c), core.isAlive(m), fs.existsSync(`${file}.cleaned`)].join(" "));' "$TEST_ROOT/jobs-46m" "$C46" "$M46")"
+        if [[ "$out" == "false true true gone foreign unknown ours 0 true false true false" && "$out2" == "pt-0001 is completed" && "$m46_alive" == yes \
+            && -e "$JOBS15/pt-0001.json.cleaned" && "$out3" == "cleanup-resumed true false true" ]] && ! grep -qs SIG "$JOBS15/pt-0001.log"; then
+            pass "46 a zombie holding the harness leader's pid, its group with a live member: another start time makes the group foreign, none makes it unknown — the reaper and cancel send nothing and the member lives; with the job's own start time the reaper stops the member as before"
+        else
+            fail "46 a zombie holding the harness leader's pid, its group with a live member: another start time makes the group foreign, none makes it unknown — the reaper and cancel send nothing and the member lives; with the job's own start time the reaper stops the member as before"
+            echo "    C-alive M-alive group identity foreign/null/own reaped M-alive SIG cleaned(foreign,unknown): $out"
+            echo "    cancel=$out2 member alive after cancel: $m46_alive cancel log: $(grep -s "cancel\|SIG" "$JOBS15/pt-0001.log" | tr '\n' ' ') own-start reaper: $out3"
+        fi
+        kill -KILL "$holder46" 2>/dev/null || true
+        if [[ -n "$M46" ]]; then kill -KILL "$M46" 2>/dev/null || true; fi
+        wait "$holder46" 2>/dev/null || true
+    else
+        echo "  [SKIP] 46 needs perl (a parent that never reaps its child)"
+    fi
+
+    # --- 47. a group is zombie-only once a second /proc scan confirms the first ---
+    # A scan lists the pids, then reads each stat. Astra's race: a listed member forks after the listing and ends before
+    # its stat is read — one scan shows only zombies while the new member lives. The pure helpers over given scans (the
+    # shape procScan returns), on every platform: G=500 is a candidate (zombies 500, 501), 600 has live members. A Z
+    # whose thread count is above 1 (its main thread ended, others run) or unreadable has not ended (48); X with 0
+    # threads (being released) has.
+    out="$(core_js '
+const Z = (pid, pgid) => ({ pid, state: "Z", pgid, sid: pgid, threads: 1, gone: false });
+const S = (pid, pgid) => ({ pid, state: "S", pgid, sid: pgid, threads: 1, gone: false });
+const Zl = (pid, pgid, threads = 2) => ({ ...Z(pid, pgid), threads }); // main thread ended, other threads run
+const gone = (pid) => ({ pid, state: null, pgid: null, sid: null, threads: null, gone: true }); // ended and reaped after the listing
+const hidden = (pid) => ({ pid, state: null, pgid: null, sid: null, threads: null, gone: false }); // still there, its stat unreadable
+const show = (set) => (set === null ? "null" : [...set].sort().join("+") || "-");
+const G = [500, 600];
+const first = [Z(500, 500), Z(501, 500), S(600, 600), S(601, 600)];
+const cases = {
+  equal: core.zombieOnlyGroups(G, first, first),
+  astraOneScan: core.zombieCandidates(G, first), // what one scan concluded (2e63ed1)
+  astra: core.zombieOnlyGroups(G, first, [Z(500, 500), Z(501, 500), S(502, 500), S(600, 600), S(601, 600)]),
+  astraEnded: core.zombieOnlyGroups(G, first, [Z(500, 500), Z(501, 500), Z(502, 500), S(600, 600), S(601, 600)]),
+  astraReaped: core.zombieOnlyGroups(G, [Z(500, 500), gone(501), S(600, 600)], [Z(500, 500), S(502, 500), S(600, 600)]),
+  hiddenFirst: core.zombieOnlyGroups(G, [...first, hidden(700)], first),
+  hiddenSecond: core.zombieOnlyGroups(G, first, [...first, hidden(700)]),
+  goneNewSecond: core.zombieOnlyGroups(G, first, [...first, gone(800)]),
+  goneOldSecond: core.zombieOnlyGroups(G, first, [Z(500, 500), Z(501, 500), gone(600), S(601, 600)]),
+  goneFirst: core.zombieOnlyGroups(G, [...first, gone(900)], first),
+  reapedMember: core.zombieOnlyGroups(G, first, [Z(500, 500), S(600, 600), S(601, 600)]),
+  noFirst: core.zombieOnlyGroups(G, null, first),
+  noSecond: core.zombieOnlyGroups(G, first, null),
+  zlCandidate: core.zombieCandidates(G, [Z(500, 500), Zl(501, 500), S(600, 600)]),
+  zlLeader: core.zombieOnlyGroups(G, [Zl(500, 500, 3), S(600, 600)], [Zl(500, 500, 3), S(600, 600)]),
+  noThreads: core.zombieOnlyGroups(G, [Z(500, 500), Zl(501, 500, null)], [Z(500, 500), Zl(501, 500, null)]),
+  released: core.zombieOnlyGroups(G, [{ ...Z(500, 500), state: "X", threads: 0 }, S(600, 600)], [{ ...Z(500, 500), state: "X", threads: 0 }, S(600, 600)]),
+};
+const from = (...scans) => {
+  let taken = 0;
+  const result = core.zombieGroupsFrom(G, () => scans[taken++] ?? null);
+  return `${show(result)}/${taken}`;
+};
+const runs = {
+  retry: from(first, [...first, hidden(700)], [...first, gone(800)], first),
+  exhausted: from(first, [...first, hidden(700)], [...first, hidden(700)], [...first, hidden(700)], first),
+  noCandidate: from([Z(500, 500), S(501, 500), S(600, 600)], first),
+  astraFrom: from(first, [Z(500, 500), Z(501, 500), S(502, 500), S(600, 600)], first),
+};
+console.log([...Object.entries(cases).map(([name, set]) => `${name}=${show(set)}`), ...Object.entries(runs).map(([name, run]) => `${name}=${run}`)].join(" "));' 2>&1)"
+    local want47="equal=500 astraOneScan=500 astra=- astraEnded=- astraReaped=- hiddenFirst=- hiddenSecond=null goneNewSecond=null goneOldSecond=500 goneFirst=500 reapedMember=- noFirst=- noSecond=null zlCandidate=- zlLeader=- noThreads=- released=500 retry=500/4 exhausted=-/4 noCandidate=-/1 astraFrom=-/2"
+    if [[ "$out" == "$want47" ]]; then
+        pass "47 zombie-only needs a second /proc scan to confirm the first: a member forked after the first listing keeps the group alive (Astra's race); a process /proc hides, or a new one gone before its stat was read in the confirming scan, confirms nothing (the next scan is taken, up to three); one that ended in the first scan, or that the first scan read, is skipped; a Z with other threads still running (or an unreadable thread count) has not ended"
+    else
+        fail "47 zombie-only needs a second /proc scan to confirm the first: a member forked after the first listing keeps the group alive (Astra's race); a process /proc hides, or a new one gone before its stat was read in the confirming scan, confirms nothing (the next scan is taken, up to three); one that ended in the first scan, or that the first scan read, is skipped; a Z with other threads still running (or an unreadable thread count) has not ended"
+        echo "    want: $want47"
+        echo "    got:  $out"
+    fi
+    # The same through groupAlive / harnessGroupState, over a fake Linux /proc (fs and process.kill stubbed for pids
+    # 500-999; nothing is signalled): Astra's race keeps the group ours; a zombie-only group is gone, also while an
+    # unrelated process (900) ends between its listing and its stat; a stranger's zombie leader (start 2000, the job's
+    # 1000) with a live member makes the group foreign, and one with no recorded start unknown. A fake process is
+    # { pid, pgid, state, start, sid? (default: its pgid), threads? (default 1) }; `states(name, make)` prints
+    # "<name>:<groupAlive(500)>/<harnessGroupState(500, the job's start 1000)>/<harnessGroupState(500, none recorded)>".
+    local fakeproc='
+const fs = (await import("node:fs")).default;
+Object.defineProperty(process, "platform", { value: "linux" });
+const { readdirSync, readFileSync } = fs;
+const kill = process.kill.bind(process);
+const fake = (pid) => Math.abs(pid) >= 500 && Math.abs(pid) < 1000;
+let procs, onList;
+const world = (table, hook = null) => { procs = new Map(table.map((p) => [p.pid, { ...p }])); onList = hook; };
+fs.readdirSync = (dir, ...rest) => {
+  if (dir !== "/proc") return readdirSync(dir, ...rest);
+  const names = [...procs.keys()].map(String);
+  onList?.();
+  onList = null;
+  return names;
+};
+fs.readFileSync = (file, ...rest) => {
+  const match = /^\/proc\/(\d+)\/stat$/.exec(String(file));
+  if (!match || !fake(Number(match[1]))) return readFileSync(file, ...rest);
+  const p = procs.get(Number(match[1]));
+  if (!p) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  return `${p.pid} (x) ${p.state} 1 ${p.pgid} ${p.sid ?? p.pgid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 ${p.threads ?? 1} 0 ${p.start} 0 0`;
+};
+process.kill = (pid, signal = "SIGTERM") => {
+  if (!fake(pid)) return kill(pid, signal);
+  if (signal !== 0) throw new Error(`${signal} to ${pid}`);
+  if (pid > 0 ? procs.has(pid) : [...procs.values()].some((p) => p.pgid === -pid)) return true;
+  throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+};
+const states = (name, make) => {
+  make();
+  const alive = core.groupAlive(500);
+  make();
+  const own = core.harnessGroupState(500, "ticks:1000");
+  make();
+  return `${name}:${alive}/${own}/${core.harnessGroupState(500, null)}`;
+};'
+    out="$(core_js "$fakeproc"'
+const astra = () => world([{ pid: 500, pgid: 500, state: "Z", start: 1000 }, { pid: 501, pgid: 500, state: "S", start: 1001 }], () => {
+  procs.get(501).state = "Z"; // 501 forks 502 right after the first listing, then ends
+  procs.set(502, { pid: 502, pgid: 500, state: "S", start: 1002 });
+});
+const zombies = () => world([{ pid: 500, pgid: 500, state: "Z", start: 1000 }, { pid: 501, pgid: 500, state: "Z", start: 1001 }]);
+const churn = () => world([{ pid: 500, pgid: 500, state: "Z", start: 1000 }, { pid: 900, pgid: 900, state: "S", start: 9 }], () => procs.delete(900));
+const stranger = () => world([{ pid: 500, pgid: 500, state: "Z", start: 2000 }, { pid: 501, pgid: 500, state: "S", start: 2001 }]);
+console.log([["astra", astra], ["zombies", zombies], ["churn", churn], ["stranger", stranger]].map(([name, make]) => states(name, make)).join(" "));' 2>&1)"
+    local want47b="astra:true/ours/unknown zombies:false/gone/gone churn:false/gone/gone stranger:true/foreign/unknown"
+    if [[ "$out" == "$want47b" ]]; then
+        pass "47 the same over a fake Linux /proc through groupAlive / harnessGroupState: Astra's race keeps the group ours; a zombie-only group is gone, also while an unrelated process ends mid-scan; a stranger's zombie leader with a live member makes the group foreign (no recorded start: unknown)"
+    else
+        fail "47 the same over a fake Linux /proc through groupAlive / harnessGroupState: Astra's race keeps the group ours; a zombie-only group is gone, also while an unrelated process ends mid-scan; a stranger's zombie leader with a live member makes the group foreign (no recorded start: unknown)"
+        echo "    want: $want47b"
+        echo "    got:  $out"
+    fi
+
+    # --- 48. a process whose main thread ended while its other threads run reads Z, but lives: it stays the job's ---
+    # /proc/<pid>/stat shows the state of a process's leader thread: once main ends alone (pthread_exit; "Zl" in ps)
+    # that is Z while the process runs on, and only the thread count (field 20 of the same line) tells it from a zombie.
+    # Over the fake /proc of 47, on every platform: such a harness leader (2 threads) is alive and ours; such a member
+    # (3 threads) of a group whose leader is reaped keeps the group ours.
+    out="$(core_js "$fakeproc"'
+const zl = () => world([{ pid: 500, pgid: 500, state: "Z", threads: 2, start: 1000 }]);
+const zlMember = () => world([{ pid: 501, pgid: 500, state: "Z", threads: 3, start: 1001 }]);
+zl();
+const leader = `${core.isAlive(500)}/${core.processIdentity(500, "ticks:1000")}`;
+console.log([states("zl", zl), states("zlMember", zlMember), `leader:${leader}`].join(" "));' 2>&1)"
+    local want48="zl:true/ours/unknown zlMember:true/ours/ours leader:true/ours"
+    if [[ "$out" == "$want48" ]]; then
+        pass "48 over a fake Linux /proc: a process whose main thread ended while others run (Z, more than one thread) is alive and ours, as the harness leader and as a member left in the harness group"
+    else
+        fail "48 over a fake Linux /proc: a process whose main thread ended while others run (Z, more than one thread) is alive and ours, as the harness leader and as a member left in the harness group"
+        echo "    want: $want48"
+        echo "    got:  $out"
+    fi
+    # The same with real processes (Linux, perl with threads; perl ends its main thread by the raw exit syscall, as
+    # exit_group would end them all). First as the harness leader itself: alive and ours, and terminateTree's ladder
+    # stops it. Then as the only member left in a harness group whose leader (sh) ended and was reaped, under a dead
+    # runner with a write reservation held: release-stale refuses, the reaper stops it before the cleanup counts as done,
+    # and release-stale releases after that. (Such a process's cmdline is empty, so pkill -f does not find it: its pid
+    # is killed by hand.)
+    local exit48=""
+    if [[ "$(uname -s)" == Linux ]] && perl -Mthreads -e 1 2>/dev/null; then
+        exit48="$(perl -e 'require POSIX; my $n = eval { require "syscall.ph"; &SYS_exit() } // { x86_64 => 60, aarch64 => 93 }->{(POSIX::uname())[4]}; print $n // ""' 2>/dev/null)"
+    fi
+    if [[ "$(uname -s)" != Linux ]]; then
+        echo "  [SKIP] 48 with real processes: Linux only (what /proc shows of a process whose main thread ended)"
+    elif [[ -z "$exit48" ]]; then
+        echo "  [SKIP] 48 with real processes: needs perl with threads and the exit syscall's number"
+    else
+        local JOBS16 pids48 zl48='use threads; threads->create(sub { while (1) { select(undef, undef, undef, 0.1) } })->detach; select(undef, undef, undef, 0.1); syscall($ARGV[0] + 0, 0);'
+        JOBS16="$(jobs_dir_of "$repo16")"
+        out="$(core_js '
+const fs = await import("node:fs");
+const path = await import("node:path");
+const { spawn, spawnSync } = await import("node:child_process");
+const [jobs, repo, zl, nr, marker] = process.argv.slice(1);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const fields = (pid) => { try { const text = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); return text.slice(text.lastIndexOf(")") + 2).split(" "); } catch { return null; } };
+const mainEnded = (pid) => { const f = fields(pid); return f?.[0] === "Z" && Number(f[17]) >= 2; };
+const exitOf = (child) => (child.exitCode !== null || child.signalCode !== null ? Promise.resolve(child.signalCode ?? child.exitCode)
+  : Promise.race([new Promise((resolve) => child.once("exit", (code, signal) => resolve(signal ?? code))), sleep(3000).then(() => "running")]));
+const pids = [];
+const note = (pid) => { pids.push(pid); fs.writeFileSync(`${marker}.pids`, pids.join(" ")); };
+const lead = spawn("perl", ["-e", zl, nr, marker], { detached: true, stdio: "ignore" });
+lead.unref(); // a core that never stops it must fail this check, not hang it
+const L = lead.pid;
+note(L);
+for (let i = 0; i < 50 && !mainEnded(L); i += 1) await sleep(100);
+const startL = core.processStart(L);
+const out = [mainEnded(L), core.isAlive(L), core.processIdentity(L, startL), core.groupAlive(L), core.harnessGroupState(L, startL)];
+const stopped = await core.terminateTree(L, [["SIGTERM", 1000], ["SIGKILL", 0]]);
+out.push(stopped.sent.map((line) => line.split(" ")[0]).join("+") || "-", stopped.survivors.length, await exitOf(lead));
+const sh = spawn("/bin/sh", ["-c", "perl -e \"$1\" \"$2\" \"$3\" </dev/null >/dev/null 2>&1 & echo $!", "sh", zl, nr, marker], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+sh.unref();
+const G = sh.pid;
+const startG = core.processStart(G);
+const M = await new Promise((resolve) => sh.stdout.once("data", (data) => resolve(Number(String(data).trim()))));
+note(M);
+await exitOf(sh);
+for (let i = 0; i < 50 && !mainEnded(M); i += 1) await sleep(100);
+const dead = spawnSync("/usr/bin/true").pid;
+const id = "pt-0001", file = `${jobs}/${id}.json`, now = new Date().toISOString();
+fs.mkdirSync(jobs, { recursive: true });
+fs.writeFileSync(file, JSON.stringify({ id, status: "completed", errorClass: null, profile: "p1", harness: "plain", write: true, workspaceRoot: repo, cwd: repo,
+  runnerPid: dead, runnerStartedAt: "Mon Oct 19 10:00:00 2026", childPid: G, childStartedAt: startG, startedAt: now, finishedAt: now, bootId: core.bootId(),
+  timeoutMin: 1, cancelLadder: [["SIGTERM", 200], ["SIGKILL", 0]] }));
+fs.writeFileSync(`${file}.runner`, `${JSON.stringify({ pid: dead, startedAt: "Mon Oct 19 10:00:00 2026", bootId: core.bootId(), claimedAt: now, childPid: G,
+  childStartedAt: startG })}\n`);
+fs.writeFileSync(`${path.dirname(jobs)}/active.lock.0`, JSON.stringify({ holderPid: dead, holderStartedAt: "Mon Oct 19 10:00:00 2026", jobId: id, token: "tok-48",
+  generation: 0, createdAt: now, bootId: core.bootId() }));
+const release = () => {
+  try {
+    core.releaseStaleCommand({ cwd: repo }, { stdout: () => {}, stderr: () => {} });
+    return "released";
+  } catch (error) {
+    return /still has live harness process group/.test(error.message) ? "held" : `error(${error.message.replace(/\s+/g, "_")})`;
+  }
+};
+out.push(mainEnded(M), core.isAlive(G), core.groupAlive(G), core.harnessGroupState(G, startG), release());
+const first = core.reapDeadRunners(jobs);
+const cleanedEarly = fs.existsSync(`${file}.cleaned`);
+for (let i = 0; i < 50 && core.isAlive(M); i += 1) await sleep(100);
+core.reapDeadRunners(jobs);
+out.push(first[0]?.action ?? "-", first[0]?.groups?.includes(G) ?? false, cleanedEarly, core.isAlive(M), fs.existsSync(`${file}.cleaned`), release());
+console.log(out.join(" "));' "$JOBS16" "$repo16" "$zl48" "$exit48" "$TEST_ROOT/zl-48" 2>&1)"
+        pids48="$(cat "$TEST_ROOT/zl-48.pids" 2>/dev/null)"
+        SLEEPERS="$SLEEPERS $pids48"
+        local want48r="true true ours true ours SIGTERM 0 SIGTERM true false true ours held cleanup-resumed true false false true released"
+        if [[ "$out" == "$want48r" ]]; then
+            pass "48 with real processes (Linux): main thread ended, a thread runs — as the harness leader it is alive and ours and the ladder stops it; as the last member of a reaped harness's group it holds the reservation until the reaper has stopped it"
+        else
+            fail "48 with real processes (Linux): main thread ended, a thread runs — as the harness leader it is alive and ours and the ladder stops it; as the last member of a reaped harness's group it holds the reservation until the reaper has stopped it"
+            echo "    want: $want48r"
+            echo "    got:  $out"
+        fi
+        for pid in $pids48; do kill -KILL "$pid" 2>/dev/null || true; done
+    fi
+
+    # --- 49. a harness group whose leader is reaped is the job's only in the harness's own session (Linux) ---
+    # The harness is spawned detached (setsid): it leads session G, and every member of its group G stays in session G
+    # (a group lies in one session for good). A group under the reaped harness's old id whose members are in another
+    # session was made by a stranger that took the pid later — an interactive shell's pipeline `a | b`, led by a, which
+    # ended first. Over the fake /proc of 47, on every platform: members in another session make the group foreign; in
+    # session G it stays ours, also while one member leaves by setsid (read halfway: new session, old group).
+    out="$(core_js "$fakeproc"'
+const pipeline = () => world([{ pid: 501, pgid: 500, sid: 400, state: "S", start: 1001 }, { pid: 502, pgid: 500, sid: 400, state: "S", start: 1002 }]);
+const leftover = () => world([{ pid: 501, pgid: 500, state: "S", start: 1001 }]);
+const leaving = () => world([{ pid: 501, pgid: 500, sid: 501, state: "S", start: 1001 }, { pid: 502, pgid: 500, state: "S", start: 1002 }]);
+const zlStranger = () => world([{ pid: 501, pgid: 500, sid: 400, state: "Z", threads: 2, start: 1001 }]);
+console.log([states("pipeline", pipeline), states("leftover", leftover), states("leaving", leaving), states("zlStranger", zlStranger)].join(" "));' 2>&1)"
+    local want49="pipeline:true/foreign/foreign leftover:true/ours/ours leaving:true/ours/ours zlStranger:true/foreign/foreign"
+    if [[ "$out" == "$want49" ]]; then
+        pass "49 over a fake Linux /proc: a group under the reaped harness's id whose members are in another session is foreign; in the harness's own session it stays ours, also while a member leaves by setsid"
+    else
+        fail "49 over a fake Linux /proc: a group under the reaped harness's id whose members are in another session is foreign; in the harness's own session it stays ours, also while a member leaves by setsid"
+        echo "    want: $want49"
+        echo "    got:  $out"
+    fi
+    # With real processes (Linux, perl): C leads a group in perl's session (setpgrp, as a shell's job control does),
+    # leaves a member M and ends, and perl reaps C: pending jobs name C as their harness — the reaper and cancel send
+    # nothing, M lives and the cleanup is done. C2 does the same from a session of its own (setsid, as the harness is
+    # spawned): the reaper stops its member M2 before the cleanup is done.
+    if [[ "$(uname -s)" != Linux ]]; then
+        echo "  [SKIP] 49 with real processes: Linux only (a process's session is read from /proc)"
+    elif command -v perl >/dev/null; then
+        local file49="$TEST_ROOT/session-49.txt" holder49 C49 M49 C49s M49s JOBS17 m49_alive=no
+        perl -e 'require POSIX; $| = 1; for my $own (0, 1) { my $c = fork; if (!$c) { if ($own) { POSIX::setsid() } else { setpgrp(0, 0) } my $m = fork; if (!$m) { sleep 60; exit 0; } print "$$ $m\n"; exit 0; } waitpid($c, 0); } print "reaped\n"; sleep 60;' \
+            "$TEST_ROOT/session-holder-49" >"$file49" &
+        holder49=$!
+        wait_lines "$file49" 3
+        { read -r C49 M49; read -r C49s M49s; } <"$file49"
+        JOBS17="$(jobs_dir_of "$repo17")"
+        out="$(core_js "$pending_js"'
+const [jobs, jobs17, repo, C, M] = process.argv.slice(1);
+const c = Number(C), m = Number(M);
+const states = [core.isAlive(c), core.isAlive(m), core.groupAlive(c), core.harnessGroupState(c, "ticks:1"), core.harnessGroupState(c, null)];
+const foreign = pending(jobs, "pt-0001", c, "ticks:1");
+const reaped = core.reapDeadRunners(jobs);
+await sleep(300);
+pending(jobs17, "pt-0001", c, "ticks:1", { workspaceRoot: repo, cwd: repo });
+console.log([...states, reaped.length, core.isAlive(m), /SIG/.test(logOf(foreign)), fs.existsSync(`${foreign}.cleaned`)].join(" "));' \
+            "$TEST_ROOT/jobs-49" "$JOBS17" "$repo17" "$C49" "$M49")"
+        out2="$(with_deadline 30 ad cancel pt-0001 --cwd "$repo17")"
+        sleep 0.3
+        if [[ -n "$M49" ]] && kill -0 "$M49" 2>/dev/null; then m49_alive=yes; fi
+        out3="$(core_js "$pending_js"'
+const [jobs, C, M] = process.argv.slice(1);
+const c = Number(C), m = Number(M);
+const state = core.harnessGroupState(c, "ticks:1");
+const file = pending(jobs, "pt-0001", c, "ticks:1");
+const first = core.reapDeadRunners(jobs);
+for (let i = 0; i < 50 && core.isAlive(m); i += 1) await sleep(100);
+core.reapDeadRunners(jobs);
+console.log([state, first[0]?.action, first[0]?.groups?.includes(c), core.isAlive(m), fs.existsSync(`${file}.cleaned`)].join(" "));' "$TEST_ROOT/jobs-49s" "$C49s" "$M49s")"
+        if [[ "$out" == "false true true foreign foreign 0 true false true" && "$out2" == "pt-0001 is completed" && "$m49_alive" == yes \
+            && -e "$JOBS17/pt-0001.json.cleaned" && "$out3" == "ours cleanup-resumed true false true" ]] && ! grep -qs SIG "$JOBS17/pt-0001.log"; then
+            pass "49 with real processes (Linux): a reaped leader's group in another session (a shell's pipeline) is foreign — the reaper and cancel send nothing and its member lives; one in the leader's own session (setsid, as the harness) is ours and the reaper stops its member"
+        else
+            fail "49 with real processes (Linux): a reaped leader's group in another session (a shell's pipeline) is foreign — the reaper and cancel send nothing and its member lives; one in the leader's own session (setsid, as the harness) is ours and the reaper stops its member"
+            echo "    C-alive M-alive group foreign/null reaped M-alive SIG cleaned: $out"
+            echo "    cancel=$out2 member alive after cancel: $m49_alive cancel log: $(grep -s "cancel\|SIG" "$JOBS17/pt-0001.log" | tr '\n' ' ') setsid group: $out3"
+        fi
+        kill -KILL "$holder49" 2>/dev/null || true
+        for pid in $M49 $M49s; do kill -KILL "$pid" 2>/dev/null || true; done
+        wait "$holder49" 2>/dev/null || true
+    else
+        echo "  [SKIP] 49 with real processes: needs perl"
     fi
 
     # --- leak check: nothing this run started is still running ---
