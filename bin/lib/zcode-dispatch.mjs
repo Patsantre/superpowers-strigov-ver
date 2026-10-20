@@ -1,6 +1,6 @@
 // zcode-dispatch.mjs — background-job wrapper around Z.ai's official ZCode CLI
-// (the Agent CLI embedded in /Applications/ZCode.app), shaped like the vendored
-// Codex companion: task / status / result / cancel / doctor.
+// (the Agent CLI embedded in the ZCode desktop app: /Applications/ZCode.app on macOS,
+// /opt/ZCode on Linux), shaped like the vendored Codex companion: task / status / result / cancel / doctor.
 //
 // Pure Node ESM, no dependencies, no shell: every child process is spawned with
 // an argv array. Never reads or writes the user's ~/.zcode (shared with the desktop
@@ -34,6 +34,7 @@ export const VERIFIED_NODE_MAJOR = 26;
 export const PROMPT_TRANSPORT = "argv"; // "argv" | "stdin"
 export const MAX_PROMPT_BYTES = 200 * 1024;
 export const APP_VERSION_PLIST_KEY = "CFBundleShortVersionString";
+export const SUPPORTED_PLATFORMS = ["darwin", "linux"];
 export const MODEL_ARGS = []; // MODEL_MECHANISM flag:<--name> → ["<--name>", PINNED_MODEL]
 export const MODEL_ENV = {}; // MODEL_MECHANISM env:<NAME> → { "<NAME>": PINNED_MODEL }
 // MODEL_MECHANISM personal-config: the selection at SELECTION_PATH of the wrapper-owned personal provider
@@ -105,13 +106,24 @@ class UsageError extends Error {}
 
 // ---------- environment and paths ----------
 
+// The app's install layout. ZCode is an Electron app, and electron-builder puts the CLI (glm/zcode.cjs), the
+// built-in provider config and app.asar into the same resources directory on every platform: Contents/Resources
+// in the macOS bundle, resources/ beside the executable elsewhere (/opt/ZCode is the Linux deb/rpm default). The
+// app version comes from Info.plist on macOS and from app.asar's package.json elsewhere (electron-builder writes
+// the same version into both).
+const DEFAULT_APP = { darwin: "/Applications/ZCode.app", linux: "/opt/ZCode" };
+
 function zcodePaths(env = process.env) {
-  const app = env.ZCODE_APP || "/Applications/ZCode.app";
+  const darwin = process.platform === "darwin";
+  const app = env.ZCODE_APP || DEFAULT_APP[process.platform] || DEFAULT_APP.linux;
+  const resources = darwin ? path.join(app, "Contents", "Resources") : path.join(app, "resources");
   return {
     app,
-    plist: path.join(app, "Contents", "Info.plist"),
-    bin: env.ZCODE_BIN || path.join(app, "Contents", "Resources", "glm", "zcode.cjs"),
-    providerConfig: path.join(app, "Contents", "Resources", "config", "provider", "zcode-builtin.json"),
+    version: darwin
+      ? { kind: "plist", file: path.join(app, "Contents", "Info.plist"), label: `${APP_VERSION_PLIST_KEY} from ${path.join(app, "Contents", "Info.plist")}` }
+      : { kind: "asar", file: path.join(resources, "app.asar"), label: `the version in package.json of ${path.join(resources, "app.asar")}` },
+    bin: env.ZCODE_BIN || path.join(resources, "glm", "zcode.cjs"),
+    providerConfig: path.join(resources, "config", "provider", "zcode-builtin.json"),
     node: env.ZCODE_NODE || "node",
   };
 }
@@ -148,11 +160,49 @@ function ensureCliHome() {
   return dir;
 }
 
-function readAppVersion(plist) {
-  const r = spawnSync("plutil", ["-extract", APP_VERSION_PLIST_KEY, "raw", "-o", "-", plist], { encoding: "utf8" });
+function readAppVersion(source) {
+  if (source.kind === "asar") return readAsarVersion(source.file);
+  const r = spawnSync("plutil", ["-extract", APP_VERSION_PLIST_KEY, "raw", "-o", "-", source.file], { encoding: "utf8" });
   if (r.error || r.status !== 0) return null;
   const version = r.stdout.trim();
   return version.length > 0 ? version : null;
+}
+
+// The "version" of package.json inside an Electron app.asar, or null. The archive starts with two Chromium
+// pickles: [4][header pickle size] and then the header pickle [payload size][JSON length][JSON]; a file's
+// offset counts from the end of the header pickle. An unpacked package.json sits in app.asar.unpacked/.
+const ASAR_HEADER_MAX = 64 * 1024 * 1024;
+
+export function readAsarVersion(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, "r");
+    const read = (length, position) => {
+      const buffer = Buffer.alloc(length);
+      if (fs.readSync(fd, buffer, 0, length, position) !== length) throw new Error("short read");
+      return buffer;
+    };
+    const head = read(16, 0);
+    const headerSize = head.readUInt32LE(4);
+    const jsonLength = head.readUInt32LE(12);
+    if (head.readUInt32LE(0) !== 4 || jsonLength > ASAR_HEADER_MAX || jsonLength + 8 > headerSize) return null;
+    const entry = JSON.parse(read(jsonLength, 16).toString("utf8"))?.files?.["package.json"];
+    if (!isObject(entry) || !Number.isSafeInteger(entry.size) || entry.size <= 0 || entry.size > 1024 * 1024) return null;
+    let text;
+    if (entry.unpacked === true) {
+      text = fs.readFileSync(path.join(`${file}.unpacked`, "package.json"), "utf8");
+    } else {
+      const offset = Number(entry.offset);
+      if (!Number.isSafeInteger(offset) || offset < 0) return null;
+      text = read(entry.size, 8 + headerSize + offset).toString("utf8");
+    }
+    const version = JSON.parse(text)?.version;
+    return typeof version === "string" && /^\d+\.\d+\.\d+/.test(version) ? version : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 }
 
 function resolveWorkspace(cwd) {
@@ -410,42 +460,84 @@ function sweepTempCopies(file) {
   for (const name of names) if (name.startsWith(prefix)) fs.rmSync(path.join(path.dirname(file), name), { force: true });
 }
 
-// The config lock: a BSD flock taken atomically by open(2) on macOS (O_SHLOCK / O_EXLOCK; Node passes the
-// flags through), held by the open file description and dropped by the kernel when its last descriptor
-// closes — also when a process dies, so it never goes stale. A run (task runner, probe) takes it SHARED
-// before it reads the config and hands the descriptor to the CLI as fd 3, so the CLI keeps it held also during
-// a cancel's grace period and after the runner itself was killed; the runner keeps its own copy until the
-// CLI's streams are closed. ZCode's tool processes do not inherit it (the CLI spawns them with three stdio
-// descriptors, and libuv on macOS closes the rest), but their output reaches the wrapper only through the CLI.
-// So the key is frozen for as long as anything can still reach the wrapper's log or record. api-key set /
-// clear take it EXCLUSIVE and refuse while a holder lives; every writer of the config is serialized.
-// macOS only: these open(2) flags mean something else, or nothing, elsewhere.
-const O_SHLOCK = 0x10;
+// The config lock: a flock(2) lock on <personal config>.lock, held by the open file description and dropped by
+// the kernel when its last descriptor closes — also when a process dies, so it never goes stale. A run (task
+// runner, probe) takes it SHARED before it reads the config and hands the descriptor to the CLI as fd 3, so the
+// CLI keeps it held also during a cancel's grace period and after the runner itself was killed; the runner keeps
+// its own copy until the CLI's streams are closed. api-key set / clear take it EXCLUSIVE and refuse while a
+// holder lives; every writer of the config is serialized. So the key is frozen for as long as anything can still
+// reach the wrapper's log or record. No pid is involved. ZCode's tool processes do not inherit fd 3: the CLI
+// spawns them with three stdio descriptors, and libuv passes on nothing else (checked on macOS and Linux); their
+// output reaches the wrapper only through the CLI.
+// How the lock is taken, per platform (Node has no flock call):
+//   macOS — atomically by open(2) with the BSD flags O_SHLOCK / O_EXLOCK (Node passes them through).
+//   Linux — open(2) first, then flock(1) from util-linux locks that descriptor, passed to it as its fd 3: the
+//           lock belongs to the open file description it shares with this process, so it stays after flock(1)
+//           exits.
+const LOCK_SHARED = "shared";
+const LOCK_EXCLUSIVE = "exclusive";
+const O_SHLOCK = 0x10; // macOS only: these open(2) flags mean something else, or nothing, elsewhere
 const O_EXLOCK = 0x20;
 const configLockFile = () => `${personalConfigFile()}.lock`;
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
+// Why the config lock cannot be taken on this machine, or null.
+function configLockProblem() {
+  if (!SUPPORTED_PLATFORMS.includes(process.platform)) return `${process.platform}: zcode-dispatch supports ${SUPPORTED_PLATFORMS.join(" and ")} only`;
+  if (process.platform !== "linux") return null;
+  const r = spawnSync("flock", ["--version"], { encoding: "utf8" });
+  if (r.error || r.status !== 0) return "linux: flock(1) from util-linux is not on PATH; the config lock needs it (e.g. apt install util-linux)";
+  return null;
+}
+
+// One non-blocking attempt: true when taken, false when another holder conflicts.
+function tryLockFd(fd, kind) {
+  const r = spawnSync("flock", [kind === LOCK_SHARED ? "-s" : "-x", "-n", "3"], { stdio: ["ignore", "ignore", "pipe", fd], encoding: "utf8" });
+  if (r.error) throw new UsageError(`cannot run flock(1) for ${configLockFile()}: ${r.error.code ?? r.error.message}`);
+  if (r.status === 0) return true;
+  if (r.status === 1) return false; // util-linux and busybox: the lock is held elsewhere
+  throw new Error(`flock(1) failed on ${configLockFile()} (exit ${r.status ?? r.signal}): ${r.stderr.trim()}`);
+}
+
 // Returns the descriptor, or null when the lock stays taken for waitMs.
 function openConfigLock(kind, waitMs) {
-  if (process.platform !== "darwin") throw new UsageError(`zcode-dispatch needs macOS (ZCode.app and BSD file locks); this is ${process.platform}`);
+  const problem = configLockProblem();
+  if (problem) throw new UsageError(problem);
   ensurePrivateDir(stateRoot());
   const deadline = Date.now() + waitMs;
-  for (;;) {
-    try {
-      return fs.openSync(configLockFile(), fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NONBLOCK | kind, 0o600);
-    } catch (error) {
-      if (error.code !== "EAGAIN" && error.code !== "EWOULDBLOCK") throw error;
-      if (Date.now() >= deadline) return null;
-      sleepSync(50);
+  const baseFlags = fs.constants.O_RDWR | fs.constants.O_CREAT;
+  if (process.platform === "darwin") {
+    const flags = baseFlags | fs.constants.O_NONBLOCK | (kind === LOCK_SHARED ? O_SHLOCK : O_EXLOCK);
+    for (;;) {
+      try {
+        return fs.openSync(configLockFile(), flags, 0o600);
+      } catch (error) {
+        if (error.code !== "EAGAIN" && error.code !== "EWOULDBLOCK") throw error;
+        if (Date.now() >= deadline) return null;
+        sleepSync(50);
+      }
     }
   }
+  const fd = fs.openSync(configLockFile(), baseFlags, 0o600);
+  try {
+    for (;;) {
+      if (tryLockFd(fd, kind)) return fd;
+      if (Date.now() >= deadline) break;
+      sleepSync(50);
+    }
+  } catch (error) {
+    fs.closeSync(fd);
+    throw error;
+  }
+  fs.closeSync(fd);
+  return null;
 }
 
 // Replaces (apiKey given) or removes (null) the API-key rule, keeps every other rule, pins PINNED_SELECTION.
 // Under the exclusive config lock, so it is refused while a run holds the shared one. The rule is written in
 // the CLI's canonical shape (providers.toJSON order), so the CLI keeps the file as is.
 export function setApiKeyRule(file, apiKey) {
-  const lockFd = openConfigLock(O_EXLOCK, 2_000);
+  const lockFd = openConfigLock(LOCK_EXCLUSIVE, 2_000);
   if (lockFd === null) {
     throw new UsageError(`a GLM run (task or probe — its runner or CLI) still holds ${configLockFile()} (see: lsof ${configLockFile()}); store or clear the key after it ends, or cancel the task; nothing changed`);
   }
@@ -1075,8 +1167,8 @@ async function cmdTask(args) {
   refuseUnavailableReservation(ws.jobsDir, ws.root);
   const promptFile = checkPromptFile(values["prompt-file"]);
   const paths = zcodePaths();
-  const appVersion = readAppVersion(paths.plist);
-  if (!appVersion) throw new UsageError(`cannot read ${APP_VERSION_PLIST_KEY} from ${paths.plist}; refusing to run with an unknown client version`);
+  const appVersion = readAppVersion(paths.version);
+  if (!appVersion) throw new UsageError(`cannot read ${paths.version.label}; refusing to run with an unknown client version`);
   if (!fs.existsSync(paths.bin)) throw new UsageError(`ZCode CLI not found: ${paths.bin}`);
   if (!fs.existsSync(paths.providerConfig)) throw new UsageError(`ZCode provider config not found: ${paths.providerConfig}`);
   let configured;
@@ -1172,7 +1264,7 @@ async function runJob(id, jobsDir, token) {
     }
     let pinned;
     try {
-      configLockFd = openConfigLock(O_SHLOCK, 10_000);
+      configLockFd = openConfigLock(LOCK_SHARED, 10_000);
       if (configLockFd === null) throw new Error("an api-key command holds the config lock; retry");
       securePersonalConfig(personalConfigFile());
       pinned = readPersonalConfig(personalConfigFile());
@@ -1322,11 +1414,12 @@ async function cmdDoctor(args) {
     if (level === "FAIL") failed = true;
   };
 
-  if (process.platform === "darwin") report("ok", "platform", "darwin");
-  else report("FAIL", "platform", `${process.platform}: zcode-dispatch needs macOS (ZCode.app and BSD file locks)`);
-  const appVersion = readAppVersion(paths.plist);
+  const platformProblem = configLockProblem();
+  if (platformProblem) report("FAIL", "platform", platformProblem);
+  else report("ok", "platform", process.platform === "linux" ? "linux (config lock: flock(1))" : process.platform);
+  const appVersion = readAppVersion(paths.version);
   if (appVersion) report("ok", "app", `${paths.app} ${appVersion}`);
-  else report("FAIL", "app", `cannot read ${APP_VERSION_PLIST_KEY} from ${paths.plist}`);
+  else report("FAIL", "app", `cannot read ${paths.version.label}`);
   if (fs.existsSync(paths.bin)) report("ok", "cli", paths.bin);
   else report("FAIL", "cli", `not found: ${paths.bin}`);
   if (fs.existsSync(paths.providerConfig)) report("ok", "provider-config", paths.providerConfig);
@@ -1397,7 +1490,7 @@ async function cmdDoctor(args) {
 
 // One synchronous PONG request: the only diagnostic that spends quota.
 async function runProbe(paths, appVersion, root) {
-  const configLockFd = openConfigLock(O_SHLOCK, 10_000);
+  const configLockFd = openConfigLock(LOCK_SHARED, 10_000);
   if (configLockFd === null) throw new Error("an api-key command holds the config lock; retry doctor --probe");
   try {
     return await probeWithLock(paths, appVersion, root, configLockFd);
@@ -1506,7 +1599,7 @@ async function readSecretLine(promptText) {
 async function cmdApiKey(args) {
   // Arguments are never echoed: a key typed as an argument must not reach stderr (parse() would print it).
   const [action, ...rest] = args;
-  if (action === "set" && rest.length > 0) throw new UsageError("api-key set takes the key on stdin, never as an argument (e.g. pbpaste | zcode-dispatch api-key set); nothing stored");
+  if (action === "set" && rest.length > 0) throw new UsageError("api-key set takes the key on stdin, never as an argument (e.g. pbpaste | zcode-dispatch api-key set, or xclip -o -selection clipboard | … on Linux); nothing stored");
   if (action === "clear") {
     if (rest.length > 0) throw new UsageError("usage: zcode-dispatch api-key clear (no arguments)");
     setApiKeyRule(personalConfigFile(), null);

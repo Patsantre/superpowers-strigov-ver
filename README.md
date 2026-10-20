@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.10.2" src="https://img.shields.io/badge/version-0.10.2-7c8cff?style=flat-square">
+  <img alt="Version 0.11.0" src="https://img.shields.io/badge/version-0.11.0-7c8cff?style=flat-square">
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square">
   <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-35d6a6?style=flat-square">
 </p>
@@ -35,7 +35,7 @@ npm install -g @openai/codex
 codex login
 ```
 
-Optional — the default implementer, **GLM-5.3-Flash via Z.ai's ZCode**: install [ZCode.app](https://github.com/zai-org/ZCode) into `/Applications`, then store a GLM Coding Plan API key from <https://z.ai/manage-apikey/apikey-list> once: run `zcode-dispatch api-key set` in a terminal and paste the key at the hidden prompt. The key becomes a provider of ZCode's own "Z.ai Coding Plan" template in the wrapper's private config and does not expire. There is no OAuth login: the CLI's `zcode login` keeps no refresh token and lasts about an hour (details in the `zcode-invocation` skill, "One-time setup"). Without a key, `zcode-dispatch doctor` fails and the pipeline implements on Codex Luna `max` instead — announced, never silent. Behind a local proxy, export `ZCODE_HTTP_PROXY=http://<host>:<port>` if headless runs fail with a network error (the CLI ignores `HTTP(S)_PROXY` and the macOS system proxy; the wrapper passes this variable via the allowlist). The CLI receives an allowlisted environment; explicitly pass extra names with `ZCODE_ENV_PASSTHROUGH="NAME1,NAME2"`.
+Optional — the default implementer, **GLM-5.3-Flash via Z.ai's ZCode**: install [ZCode](https://github.com/zai-org/ZCode) — macOS: ZCode.app into `/Applications`; Linux: the app's `resources/` (`glm/`, `config/provider/zcode-builtin.json`, `app.asar`) under `/opt/ZCode/resources`, built from source or copied from a macOS/Windows install, plus `flock` from util-linux; Windows is not supported yet — then store a GLM Coding Plan API key from <https://z.ai/manage-apikey/apikey-list> once: run `zcode-dispatch api-key set` in a terminal and paste the key at the hidden prompt. The key becomes a provider of ZCode's own "Z.ai Coding Plan" template in the wrapper's private config and does not expire. There is no OAuth login: the CLI's `zcode login` keeps no refresh token and lasts about an hour (details in the `zcode-invocation` skill, "One-time setup"). Without a key, `zcode-dispatch doctor` fails and the pipeline implements on Codex Luna `max` instead — announced, never silent. Behind a local proxy, export `ZCODE_HTTP_PROXY=http://<host>:<port>` if headless runs fail with a network error (the CLI ignores `HTTP(S)_PROXY` and the macOS system proxy; the wrapper passes this variable via the allowlist). The CLI receives an allowlisted environment; explicitly pass extra names with `ZCODE_ENV_PASSTHROUGH="NAME1,NAME2"`.
 
 ### 2. Install the plugin
 

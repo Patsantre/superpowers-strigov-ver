@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Tests for bin/zcode-dispatch, the ZCode CLI job wrapper. Zero model calls:
-# ZCODE_BIN points at tests/fixtures/zcode-stub.cjs, ZCODE_APP at
-# tests/fixtures/FakeZCode.app, and all job state lives under a temp root.
+# ZCODE_BIN points at tests/fixtures/zcode-stub.cjs, ZCODE_APP at a fake install
+# (tests/fixtures/FakeZCode.app on macOS, a resources/ tree built from it on Linux),
+# and all job state lives under a temp root. Runs on macOS and Linux.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -9,6 +10,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ZD="$REPO_ROOT/bin/zcode-dispatch"
 MJS="$REPO_ROOT/bin/lib/zcode-dispatch.mjs"
 FIX="$SCRIPT_DIR/fixtures"
+
+OS="$(uname -s)"
 
 FAILURES=0
 TEST_ROOT=""
@@ -55,6 +58,49 @@ first_pattern() {
 const { pathToFileURL } = await import("node:url");
 const m = await import(pathToFileURL(process.env.ZD_MJS).href);
 console.log(m.PATTERNS[process.argv[1]][0]);' "$1"
+}
+
+# ---- the fake ZCode install for this platform (zcodePaths in the .mjs) ----
+FAKE_APP_VERSION="$(sed -n '/CFBundleShortVersionString/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;}' "$FIX/FakeZCode.app/Contents/Info.plist")"
+
+# app_resources <app> — the app's resources directory: Contents/Resources on macOS, resources/ elsewhere.
+app_resources() {
+    if [[ "$OS" == Darwin ]]; then echo "$1/Contents/Resources"; else echo "$1/resources"; fi
+}
+
+# write_asar <file> <package.json text> [unpacked] — a minimal Electron app.asar holding only package.json
+# (with "unpacked", the entry points at <file>.unpacked/package.json instead).
+write_asar() {
+    node -e '
+const fs = require("node:fs");
+const [file, pkg, mode] = process.argv.slice(1);
+const data = Buffer.from(pkg);
+const entry = mode === "unpacked" ? { size: data.length, unpacked: true } : { size: data.length, offset: "0" };
+const json = Buffer.from(JSON.stringify({ files: { "package.json": entry, "index.js": { size: 0, offset: String(data.length) } } }));
+const padded = Math.ceil(json.length / 4) * 4;
+const header = Buffer.alloc(8 + padded);
+header.writeUInt32LE(4 + padded, 0); // header pickle payload: [JSON length][JSON, padded to 4]
+header.writeUInt32LE(json.length, 4);
+json.copy(header, 8);
+const prefix = Buffer.alloc(8);
+prefix.writeUInt32LE(4, 0);
+prefix.writeUInt32LE(header.length, 4);
+fs.writeFileSync(file, Buffer.concat([prefix, header, mode === "unpacked" ? Buffer.alloc(0) : data]));
+if (mode === "unpacked") {
+  fs.mkdirSync(`${file}.unpacked`, { recursive: true });
+  fs.writeFileSync(`${file}.unpacked/package.json`, data);
+}' "$@"
+}
+
+# write_app_version <app> — gives <app> this platform's version source: Info.plist, or app.asar.
+write_app_version() {
+    if [[ "$OS" == Darwin ]]; then
+        mkdir -p "$1/Contents"
+        cp "$FIX/FakeZCode.app/Contents/Info.plist" "$1/Contents/Info.plist"
+    else
+        mkdir -p "$1/resources"
+        write_asar "$1/resources/app.asar" "{\"name\":\"@zcode/desktop\",\"version\":\"$FAKE_APP_VERSION\"}"
+    fi
 }
 
 # wait_status <id> <regex> <seconds> [status args...] — poll until the status matches; print it.
@@ -156,7 +202,14 @@ main() {
     # No marketplace cache under this HOME, so the shim must resolve the dev-tree .mjs.
     export HOME="$TEST_ROOT/home"
     mkdir -p "$HOME"
-    export ZCODE_APP="$FIX/FakeZCode.app"
+    if [[ "$OS" == Darwin ]]; then
+        export ZCODE_APP="$FIX/FakeZCode.app"
+    else
+        export ZCODE_APP="$TEST_ROOT/FakeZCode"
+        write_app_version "$ZCODE_APP"
+        mkdir -p "$ZCODE_APP/resources/config/provider"
+        cp "$FIX/FakeZCode.app/Contents/Resources/config/provider/zcode-builtin.json" "$ZCODE_APP/resources/config/provider/"
+    fi
     export ZCODE_BIN="$FIX/zcode-stub.cjs"
     export ZCODE_STATE_DIR="$TEST_ROOT/state"
     unset ZCODE_NODE ZCODE_TASK_TIMEOUT_MIN SP_IMPLEMENTER ZCODE_DATA_BASE_DIR ZCODE_HTTP_PROXY
@@ -235,11 +288,10 @@ process.exit(ok ? 0 : 1);'
         ZCODE_SESSION_DB_PATH="$TEST_ROOT/foreign.sqlite" ZCODE_SESSION_DB="$TEST_ROOT/foreign-alias.sqlite" \
         ZCODE_LOG_DIR="$TEST_ROOT/foreign-log" start_task --prompt-file "$prompt")"
     st="$(wait_status "$id" 'completed|failed|cancelled' 20)"
-    local transport plist_key want_version cfg
+    local transport want_version cfg
     transport="$(const_of PROMPT_TRANSPORT)"
-    plist_key="$(const_of APP_VERSION_PLIST_KEY)"
-    want_version="$(plutil -extract "$plist_key" raw -o - "$ZCODE_APP/Contents/Info.plist")"
-    cfg="$ZCODE_APP/Contents/Resources/config/provider/zcode-builtin.json"
+    want_version="$FAKE_APP_VERSION"
+    cfg="$(app_resources "$ZCODE_APP")/config/provider/zcode-builtin.json"
     if [[ "$st" == completed ]] && REC="$TEST_ROOT/record.json" PROMPT="$prompt" ROOT="$repo" \
         TRANSPORT="$transport" CFG="$cfg" VER="$want_version" CLI_HOME="$cli_home" \
         MODEL_ARGS="$(const_of MODEL_ARGS)" DISALLOWED="$(const_of DISALLOWED_TOOLS)" node -e '
@@ -882,8 +934,8 @@ process.exit(injected && runner.status === "cancelled" && m.readRecord(file).sta
     fi
     expect_exit 2 "10 SP_IMPLEMENTER=luna" env SP_IMPLEMENTER=luna "$ZD" task --background --prompt-file "$prompt"
     expect_exit 2 "10 an invalid name in ZCODE_ENV_PASSTHROUGH" env ZCODE_ENV_PASSTHROUGH="OK_NAME 1BAD" "$ZD" task --background --prompt-file "$prompt"
-    mkdir -p "$TEST_ROOT/NoPlist.app/Contents"
-    expect_exit 2 "10 ZCODE_APP without a readable Info.plist" env ZCODE_APP="$TEST_ROOT/NoPlist.app" "$ZD" task --background --prompt-file "$prompt"
+    mkdir -p "$(app_resources "$TEST_ROOT/NoVersion.app")"
+    expect_exit 2 "10 ZCODE_APP without a readable app version (Info.plist / app.asar)" env ZCODE_APP="$TEST_ROOT/NoVersion.app" "$ZD" task --background --prompt-file "$prompt"
     expect_exit 2 "10 missing --background" "$ZD" task --prompt-file "$prompt"
     expect_exit 2 "10 unknown flag" "$ZD" task --background --bogus --prompt-file "$prompt"
     expect_exit 2 "10 unknown id on status" "$ZD" status zt-9999
@@ -931,8 +983,7 @@ process.exit(injected && runner.status === "cancelled" && m.readRecord(file).sta
         fail "11 doctor: missing zcode.cjs -> FAIL cli, exit 1"
         echo "    exit: $rc"
     fi
-    mkdir -p "$TEST_ROOT/NoCfg.app/Contents"
-    cp "$ZCODE_APP/Contents/Info.plist" "$TEST_ROOT/NoCfg.app/Contents/Info.plist"
+    write_app_version "$TEST_ROOT/NoCfg.app"
     rc=0
     out="$(ZCODE_APP="$TEST_ROOT/NoCfg.app" "$ZD" doctor)" || rc=$?
     if [[ "$rc" -eq 1 && "$out" == *"FAIL provider-config: "* ]]; then
@@ -1304,9 +1355,9 @@ fs.writeFileSync(process.env.PCFG, JSON.stringify(o), { mode: 0o600 });'
     fi
     expect_exit 2 "15 api-key without an action is refused (exit 2)" "$ZD" api-key
     expect_exit 2 "15 api-key clear with an argument is refused (exit 2)" "$ZD" api-key clear extra
-    mkdir -p "$TEST_ROOT/NoTemplate.app/Contents/Resources/config/provider"
-    cp "$ZCODE_APP/Contents/Info.plist" "$TEST_ROOT/NoTemplate.app/Contents/Info.plist"
-    printf '{}\n' > "$TEST_ROOT/NoTemplate.app/Contents/Resources/config/provider/zcode-builtin.json"
+    write_app_version "$TEST_ROOT/NoTemplate.app"
+    mkdir -p "$(app_resources "$TEST_ROOT/NoTemplate.app")/config/provider"
+    printf '{}\n' > "$(app_resources "$TEST_ROOT/NoTemplate.app")/config/provider/zcode-builtin.json"
     rc=0
     printf '%s\n' "other-fake-key-0123456789" | ZCODE_APP="$TEST_ROOT/NoTemplate.app" "$ZD" api-key set >"$TEST_ROOT/key-notpl.out" 2>&1 || rc=$?
     if [[ "$rc" -eq 2 ]] && grep -Fq 'declares no provider template "zai-api"' "$TEST_ROOT/key-notpl.out"; then
@@ -1645,6 +1696,60 @@ process.stdout.write(JSON.stringify({ rc, injected: target !== null, intact: sna
     else
         fail "16 release-stale still sees the live holder of a reservation stamped with the current boot id, whatever its createdAt"
         echo "    exit=$same_boot_rc out=$same_boot_out"
+    fi
+
+    # --- 17. platform layout: the app version from app.asar, and the platform's config lock ---
+    local asar_dir="$TEST_ROOT/asar" asar_json
+    mkdir -p "$asar_dir"
+    write_asar "$asar_dir/packed.asar" '{"name":"@zcode/desktop","version":"3.15.1"}'
+    write_asar "$asar_dir/unpacked.asar" '{"name":"@zcode/desktop","version":"3.16.0"}' unpacked
+    write_asar "$asar_dir/noversion.asar" '{"name":"@zcode/desktop"}'
+    head -c 20 "$asar_dir/packed.asar" > "$asar_dir/truncated.asar"
+    printf 'not an asar archive at all\n' > "$asar_dir/garbage.asar"
+    asar_json="$(DIR="$asar_dir" ZD_MJS="$MJS" node --input-type=module -e '
+const { pathToFileURL } = await import("node:url");
+const m = await import(pathToFileURL(process.env.ZD_MJS).href);
+const v = (n) => m.readAsarVersion(`${process.env.DIR}/${n}.asar`);
+console.log(JSON.stringify({ packed: v("packed"), unpacked: v("unpacked"), noversion: v("noversion"), truncated: v("truncated"), garbage: v("garbage"), missing: v("missing") }));')"
+    if [[ "$asar_json" == '{"packed":"3.15.1","unpacked":"3.16.0","noversion":null,"truncated":null,"garbage":null,"missing":null}' ]]; then
+        pass "17 readAsarVersion reads package.json's version from app.asar (packed and app.asar.unpacked); no version, a truncated, foreign or missing file -> null"
+    else
+        fail "17 readAsarVersion reads package.json's version from app.asar (packed and app.asar.unpacked); no version, a truncated, foreign or missing file -> null"
+        echo "    got: $asar_json"
+    fi
+
+    if [[ "$OS" == Linux ]]; then
+        rc=0
+        out="$("$ZD" doctor)" || rc=$?
+        if [[ "$rc" -eq 0 ]] && grep -Fqx "ok platform: linux (config lock: flock(1))" <<<"$out" && grep -Fqx "ok app: $ZCODE_APP $FAKE_APP_VERSION" <<<"$out"; then
+            pass "17 linux: doctor reports 'ok platform: linux (config lock: flock(1))' and the version from resources/app.asar"
+        else
+            fail "17 linux: doctor reports 'ok platform: linux (config lock: flock(1))' and the version from resources/app.asar"
+            echo "$out" | sed 's/^/    /'
+        fi
+        # Without flock(1) on PATH the lock cannot be taken: doctor fails its platform check, the key stays as is.
+        # The .mjs is run directly: the bash shim needs more of PATH than node and git.
+        local noflock="$TEST_ROOT/noflock-bin" tool node_bin before_noflock noflock_out noflock_rc=0
+        mkdir -p "$noflock"
+        for tool in node git; do ln -sf "$(command -v "$tool")" "$noflock/$tool"; done
+        node_bin="$(command -v node)"
+        before_noflock="$(cat "$ZCODE_STATE_DIR/personal-provider-config.json")"
+        out="$(PATH="$noflock" "$node_bin" "$MJS" doctor)" || true
+        noflock_out="$(printf '%s\n' "noflock-fake-key-0123456789" | PATH="$noflock" "$node_bin" "$MJS" api-key set 2>&1)" || noflock_rc=$?
+        if grep -Fq "FAIL platform: linux: flock(1) from util-linux is not on PATH" <<<"$out" && [[ "$noflock_rc" -eq 2 && "$noflock_out" == *"flock(1)"* ]] \
+            && [[ "$(cat "$ZCODE_STATE_DIR/personal-provider-config.json")" == "$before_noflock" ]]; then
+            pass "17 linux: without flock(1) on PATH doctor fails its platform check and api-key set is refused (exit 2, config unchanged)"
+        else
+            fail "17 linux: without flock(1) on PATH doctor fails its platform check and api-key set is refused (exit 2, config unchanged)"
+            echo "    api-key exit=$noflock_rc out=$noflock_out"
+            echo "$out" | sed 's/^/    /'
+        fi
+    else
+        if grep -Fqx "ok platform: darwin" <<<"$("$ZD" doctor)"; then
+            pass "17 darwin: doctor reports 'ok platform: darwin'"
+        else
+            fail "17 darwin: doctor reports 'ok platform: darwin'"
+        fi
     fi
 
     echo ""
