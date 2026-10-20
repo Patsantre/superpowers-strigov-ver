@@ -27,8 +27,9 @@
 //   the value and refuses an empty one, one with inner whitespace, and a profile that holds the key in a field.
 // runner (the CLI's internal verb RUN_VERB):
 //   return await runJob({ id, jobsDir, token, adapters })   with adapters = { <harness id>: adapter }.
-//   discover → prepareHome → invocation → the harness (runCli) → reduce → finalize → the terminal record. The runner
-//   owns every stop of its harness: it watches the record and runs the adapter's ladder once the job is cancelled.
+//   discover → prepareHome → invocation → the harness (runCli) → scrub → reduce → finalize → the terminal record.
+//   The runner owns every stop of its harness: it watches the record and runs the adapter's ladder once the job is
+//   cancelled.
 // other verbs, for core ids (route zt- / task- ids to the wrappers before calling these):
 //   statusCommand({ cwd, id, json, all }), resultCommand({ cwd, id }), await cancelCommand({ cwd, id }),
 //   releaseStaleCommand({ cwd }) — each returns the exit code and writes to an { stdout, stderr } sink.
@@ -49,6 +50,7 @@
 //     probe?(req, ctx) → the same shape, for one "Reply with exactly: PONG" turn (default: invocation),
 //     reduce(io) → { ok, response, sessionId, usage, reportedModel, errorClass, errorText, meta? },
 //     finalize?(job, ctx) → null | partial reduce result,  resumeCheck?(prev, profile, req, ctx) → null | reason,
+//     scrub?(job, ctx) → [{ path, mode, content }] (the harness's own files rewritten with ctx.redact; keyed jobs only),
 //     patterns: { <error class> | "transient": [string | RegExp] } }.
 //   `env` holds the adapter's defaults (§3.6 Б), `mandatoryEnv` and prepareHome's `env` the mandatory settings
 //   (§3.6 А); a null value removes a name. `dirs` (absolute; created 0700) and `files` ({ path, mode, content }) must
@@ -1791,6 +1793,18 @@ export async function runJob({ id, jobsDir, token, adapters = {}, env = process.
       shouldStop: () => (fs.existsSync(claim) ? stopLabel() : null),
     });
     const io = { ...harnessIo(result), cancelled: readRecord(file)?.status === "cancelled" };
+    // spec §3.5: a harness can keep what it saw in files of its own (pi's session transcript), beyond the stream
+    // redaction. On every path — completed, failed, timed out, cancelled — the adapter's scrub() returns those files
+    // with the job's redactor applied, and the core writes them back before the record turns terminal (a cancelled one
+    // already is): under the data root, atomically, each with the mode the adapter gives.
+    if (typeof adapter.scrub === "function" && secret !== null) {
+      try {
+        const files = await adapter.scrub({ ...req.job, record: readRecord(file), io }, { ...ctx, redact });
+        writeAdapterFiles({ files: Array.isArray(files) ? files : [] }, env);
+      } catch (error) {
+        appendLog(log, `scrub() failed: ${redact(error?.message ?? error)}`);
+      }
+    }
     let reduced = null;
     if (!io.spawnError) {
       try {

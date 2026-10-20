@@ -12,7 +12,11 @@
 // - The session id is preassigned (the job id, manifest.sessionIdFormat "job-id") and the session files live flat in
 //   <job dir of the first job of the chain>/sessions; a resume passes the same dir and id from the same cwd
 //   [03 §4]. pi never reports a lost session: it warns "No project session found with id …" and starts a new one,
-//   so resumeCheck looks for the session file before a resume and finalize() turns that warning into resume-lost.
+//   so resumeCheck looks for the session file before a resume and finalize() turns that warning, or the new session
+//   file pi created, into resume-lost.
+// - pi writes every message of a run into that session file as it is [03 §6 "Leak risks" 4], beyond the core's
+//   stream redaction: scrub() hands the core those files with the job's redactor applied after every run, so a key
+//   the model or a tool printed does not stay in the job dir (spec §3.5).
 // - Read-only reviewer = `--tools read,grep,find,ls` (no bash, so no git; spec §3.6 A4) with `--no-mcp` (MCP tools
 //   survive `--tools` otherwise [03 §15 item 18]); the writer gets pi's defaults plus grep/find/ls [03 §16.2].
 // - `--no-approve` keeps the repository's `.pi/*` (settings, models, extensions, MCP) out (spec §3.6 A5);
@@ -20,9 +24,10 @@
 //   (the env ones overridable through profile.env). Context files (AGENTS.md / CLAUDE.md) stay on: `-nc` is not
 //   passed (spec §3.6 A6). options.extensions adds one `-e <x>` each; they load even under `-ne` [03 §9].
 // - The key goes only into the variable named by `keyVar` (spec §3.5). With a key from agent-dispatch the home is
-//   isolated by default (PI_CODING_AGENT_DIR = <data>/homes/<profile>/pi, the same dir `profile env` prints): pi
-//   prefers a credential stored in its own auth.json over the environment, so a key saved in the user's pi would
-//   silently win over ours [03 §6]. With "home": "user" the caller's PI_CODING_AGENT_DIR passes (manifest.homeEnv).
+//   isolated (PI_CODING_AGENT_DIR = <data>/homes/<profile>/pi, the same dir `profile env` prints): pi prefers a
+//   credential stored in its own auth.json over the environment, so a key saved in the user's pi would silently win
+//   over ours [03 §6]. A keyed profile with "home": "user", or one whose isolated home holds an auth.json, is refused
+//   (exit 2). With "home": "user" (a login) the caller's PI_CODING_AGENT_DIR passes (manifest.homeEnv).
 // - pi exits 0 when the provider fails: reduce() reads the events — the last assistant `message_end` (its text,
 //   stopReason, errorMessage) and `agent_settled` (the terminal marker, `aborted`) [03 §3.1, §3.3].
 // - Cancel: SIGTERM, which pi answers by SIGKILLing the process groups of its bash tools and exiting 143; never
@@ -35,7 +40,7 @@
 // Pure data, as the contract asks: processes and files only through ctx.exec / ctx.fs.
 
 import path from "node:path";
-import { filterEnv, parseEvents } from "../agent-core.mjs";
+import { UsageError, filterEnv, parseEvents } from "../agent-core.mjs";
 
 // The version the facts were read from (pi itself was not run, [03] header); doctor names any other one.
 export const VERIFIED_VERSIONS = ["1.3.0"];
@@ -48,6 +53,8 @@ export const HOME_VAR = "PI_CODING_AGENT_DIR";
 // pi's warning when --session-id names no session of this cwd in the session dir [03 §4, src/main.ts:436-448]. It is
 // printed on every fresh job as well (its id is new), so only a resumed job reads it as a lost session.
 export const LOST_SESSION_RE = /No project session found with id/;
+// The only `builtin:` names `-e` takes [03 §9]; tests/fixtures/stub-dialects/pi-jsonl.cjs loads this list.
+export const BUILTIN_EXTENSIONS = ["builtin:mcp", "builtin:llama.cpp", "builtin:codemode", "builtin:tool-search"];
 
 const isObject = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
 const keyed = (profile) => isObject(profile?.auth) && ["key", "keyEnv", "keyCmd"].some((source) => source in profile.auth);
@@ -77,6 +84,28 @@ function secretEnvOf(profile) {
     throw new Error("a pi profile with a key needs keyVar, the variable pi reads the key from (zai → ZAI_API_KEY, deepseek → DEEPSEEK_API_KEY, openrouter → OPENROUTER_API_KEY)");
   }
   return [profile.keyVar];
+}
+
+// Why a keyed profile would not run on its key, or null. pi prefers a credential it stores itself (auth.json, from
+// /login) to the key in the environment — it "owns" its provider [03 §6] — so a job would bill that credential while
+// `channels` names the key. In the user's own pi home that login is the user's business: a keyed profile runs in its
+// isolated home only (its default); there, an auth.json (a /login through `profile env`, or a login profile of the
+// same name before) refuses the run. Only its existence is checked: the adapter never reads a credential store.
+function storedCredentialProblem(profile, ctx) {
+  if (!keyed(profile)) return null;
+  const keyVar = profile.keyVar || "keyVar";
+  if (!isolated(profile)) {
+    return `a keyed pi profile runs only in its isolated home (the default with a key): in ${agentDirOf(profile, ctx) ?? "~/.pi/agent"} a credential pi stored itself (auth.json, /login) would win over ${keyVar}; remove "home": "user"`;
+  }
+  const file = path.join(agentDirOf(profile, ctx), "auth.json");
+  if (ctx?.fs?.exists?.(file) !== true) return null;
+  return `${file} exists: a credential stored there (pi /login) wins over ${keyVar}; remove that file (a keyed profile needs no login)`;
+}
+
+// The refusal of storedCredentialProblem, as task (exit 2) and doctor --probe give it.
+function refuseStoredCredential(profile, ctx, profileName) {
+  const problem = storedCredentialProblem(profile, ctx);
+  if (problem) throw new UsageError(`profile ${profileName ?? ctx?.profileName ?? "-"}: ${problem}`);
 }
 
 // Where the session of a job lives: a fresh job starts <its job dir>/sessions; a resumed one returns to the dir its
@@ -154,23 +183,64 @@ export function reduce(io) {
 
 // ---------- resume [03 §4; spec §3.6 A12] ----------
 
+// The header (line 1, {type: "session", id, cwd, …}) of a session file, or null.
+function headerOf(fsApi, file) {
+  const text = fsApi.readFile(file);
+  if (typeof text !== "string") return null;
+  try {
+    const header = JSON.parse(text.slice(0, text.indexOf("\n") >= 0 ? text.indexOf("\n") : text.length));
+    return header?.type === "session" ? header : null;
+  } catch {
+    return null;
+  }
+}
+
 // The header of the session file with this id for this cwd in `dir` — what pi itself must find for --session-id to
 // resume rather than start over. Files whose name carries the id are read first (pi names them <time>_<id>.jsonl).
 export function findSessionHeader(fsApi, dir, sessionId, cwd) {
   const names = (fsApi.readdir(dir) ?? []).filter((name) => name.endsWith(".jsonl"));
   const ordered = [...names.filter((name) => name.includes(sessionId)), ...names.filter((name) => !name.includes(sessionId))];
   for (const name of ordered) {
-    const text = fsApi.readFile(path.join(dir, name));
-    if (typeof text !== "string") continue;
-    let header = null;
-    try {
-      header = JSON.parse(text.slice(0, text.indexOf("\n") >= 0 ? text.indexOf("\n") : text.length));
-    } catch {
-      continue;
-    }
-    if (header?.type === "session" && header.id === sessionId && header.cwd === cwd) return header;
+    const header = headerOf(fsApi, path.join(dir, name));
+    if (header?.id === sessionId && header.cwd === cwd) return header;
   }
   return null;
+}
+
+// The session files in `dir` named for this id (pi's <time>_<id>.jsonl), sorted.
+const sessionFilesOf = (fsApi, dir, sessionId) => (fsApi.readdir(dir) ?? []).filter((name) => name.endsWith(`${sessionId}.jsonl`)).sort();
+
+// ---------- scrub: the key out of pi's own session files (spec §3.5) ----------
+
+const MAX_SCRUB_DEPTH = 8;
+
+// A file's text when it is text (valid UTF-8 without NUL), else null; an fs that returns strings gives text.
+function textOfFile(raw) {
+  if (typeof raw === "string") return raw;
+  if (!Buffer.isBuffer(raw)) return null;
+  const text = raw.toString("utf8");
+  return !text.includes("\u0000") && Buffer.from(text, "utf8").equals(raw) ? text : null;
+}
+
+// Every text file under `dir` (nested dirs too) whose content `redact` changes, as the core writes it back:
+// { path, mode (its current one), content (redacted) }. Files `redact` leaves alone are not listed; a binary file is
+// never rewritten. Reads only through fsApi.
+export function scrubSessionFiles(fsApi, dir, redact, depth = 0) {
+  const files = [];
+  for (const name of [...(fsApi.readdir(dir) ?? [])].sort()) {
+    const file = path.join(dir, name);
+    const stat = fsApi.stat(file);
+    if (stat?.isDirectory?.()) {
+      if (depth < MAX_SCRUB_DEPTH) files.push(...scrubSessionFiles(fsApi, file, redact, depth + 1));
+      continue;
+    }
+    if (!stat?.isFile?.()) continue;
+    const text = textOfFile(fsApi.readFile(file, null));
+    if (text === null) continue;
+    const content = redact(text);
+    if (content !== text) files.push({ path: file, mode: stat.mode & 0o777, content });
+  }
+  return files;
 }
 
 // ---------- doctor (spec §5.4: no model call) ----------
@@ -202,17 +272,20 @@ const firstLine = (text) => String(text ?? "").trim().split("\n")[0].slice(0, 16
 // `pi auth check --provider <p> --json` (spec §5.4): exit 0 ready · 1 not_ready · 2 invalid, without a network call
 // for API keys [03 §3.3, §16.2]. The JSON shape beyond `authType` / `status` is not documented, so the exit code
 // decides. A login profile needs "ready"; a keyed one needs pi to hold nothing for the provider, because pi prefers its
-// own credential to the key in the environment [03 §6].
+// own credential to the key in the environment [03 §6] — a keyed profile that task refuses for that reason
+// (storedCredentialProblem) fails without running pi.
 function authCheck(profile, ctx) {
   const name = ctx.profileName ?? "<profile>";
   const provider = providerOf(profile.model);
   const login = !keyed(profile);
+  const refused = login ? null : storedCredentialProblem(profile, ctx);
+  if (refused) return { name: "pi-auth", level: "FAIL", hint: `${refused}; task refuses the profile (exit 2)` };
   if (!provider) {
     return { name: "pi-auth", level: login ? "WARN" : "ok", hint: `model ${JSON.stringify(profile.model ?? null)} names no <provider>/ prefix; pi auth check not run` };
   }
   const agentDir = agentDirOf(profile, ctx);
   const where = agentDir ?? "~/.pi/agent";
-  const loginHint = `the user logs in: ${isolated(profile) ? `eval "$(agent-dispatch profile env ${name})"; ` : ""}pi, then /login ${provider}`;
+  const loginHint = `the user logs in: ${isolated(profile) ? `agent-dispatch profile env ${name} -- pi` : "pi"}, then /login ${provider}`;
   if (isolated(profile) && !ctx.fs.exists(agentDir)) {
     return login
       ? { name: "pi-auth", level: "FAIL", hint: `the isolated home ${agentDir} does not exist yet, so pi holds no login for ${provider}; ${loginHint}` }
@@ -238,9 +311,11 @@ function authCheck(profile, ctx) {
     if (r.status === 1) return { name: "pi-auth", level: "FAIL", hint: `pi holds no credential for ${provider} in ${where}; ${loginHint}` };
     if (r.status === 2) return { name: "pi-auth", level: "FAIL", hint: `the credential pi holds for ${provider} in ${where} is invalid${authType}; ${loginHint}` };
   } else {
-    const fix = isolated(profile) ? `remove it from ${where} (pi /logout ${provider})` : `use "home": "isolated" or remove it (pi /logout ${provider})`;
+    // An isolated home without an auth.json here (storedCredentialProblem): what pi holds comes from its models.json
+    // apiKey, next in pi's order before the environment [03 §6].
+    const fix = `remove it from ${where} (the provider's apiKey in models.json)`;
     if (r.status === 0) {
-      return { name: "pi-auth", level: "WARN", hint: `pi already holds a credential for ${provider} in ${where}${authType}; pi prefers it to the key in ${profile.keyVar}, so the key from agent-dispatch is not used — ${fix}` };
+      return { name: "pi-auth", level: "FAIL", hint: `pi already holds a credential for ${provider} in ${where}${authType}; pi prefers it to the key in ${profile.keyVar}, so the key from agent-dispatch is not used — ${fix}` };
     }
     if (r.status === 1) return { name: "pi-auth", level: "ok", hint: `pi holds no credential of its own for ${provider} in ${where}; the key goes in through ${profile.keyVar}` };
     if (r.status === 2) {
@@ -267,13 +342,18 @@ export function doctorChecks(profile, ctx) {
   const extensions = extensionsOf(profile);
   const absent = extensions.filter((extension) => path.isAbsolute(extension) && !ctx.fs.exists(extension));
   const unchecked = extensions.filter((extension) => !extension.startsWith("builtin:") && !path.isAbsolute(extension));
+  // The built-in list comes from [03 §9], not from a pi binary: an unknown name is a WARN, not a FAIL.
+  const unknown = extensions.filter((extension) => extension.startsWith("builtin:") && !BUILTIN_EXTENSIONS.includes(extension));
   for (const extension of absent) {
     checks.push({ name: "pi-extension", level: "FAIL", hint: `${extension} does not exist; pi would stop with "Failed to load extension" (errorClass launch)` });
+  }
+  for (const extension of unknown) {
+    checks.push({ name: "pi-extension", level: "WARN", hint: `${extension} is not one of pi's built-in extensions (${BUILTIN_EXTENSIONS.join(", ")}); pi would stop with "Failed to load extension" (errorClass launch)` });
   }
   for (const extension of unchecked) {
     checks.push({ name: "pi-extension", level: "WARN", hint: `${extension} is not checked: pi resolves it at run time, a relative path against the task's workspace root; prefer an absolute path` });
   }
-  if (extensions.length > 0 && absent.length === 0 && unchecked.length === 0) {
+  if (extensions.length > 0 && absent.length === 0 && unknown.length === 0 && unchecked.length === 0) {
     checks.push({ name: "pi-extension", level: "ok", hint: extensions.map((extension) => `-e ${extension}`).join(" ") });
   }
   checks.push(authCheck(profile, ctx));
@@ -314,23 +394,24 @@ const pi = {
 
   // "isolated": the profile's own agent dir (settings, auth.json, models.json, sessions by default, fd/rg downloads)
   // [03 §6 "Profile isolation"]. Nothing is written into it: pi keeps its own state there (a ChatGPT login's deviceId
-  // lives in settings.json [03 §15 item 17]).
+  // lives in settings.json [03 §15 item 17]). Its env is also what `agent-dispatch profile env P` exports, so `pi` →
+  // /login runs in the dir the jobs use (there is no loginEnv hook of its own).
   prepareHome(profile, ctx) {
     if (!isolated(profile)) return { env: {}, dirs: [], files: [] };
     const dir = agentDirOf(profile, ctx);
     return { env: { [HOME_VAR]: dir }, dirs: [dir], files: [] };
   },
 
-  // `agent-dispatch profile env P` for "home": "isolated": where `pi` → /login must run to log this profile in.
-  loginEnv(profile, ctx) {
-    return { [HOME_VAR]: path.join(ctx.paths.homes, ctx.profileName, "pi") };
-  },
-
   invocation(req, ctx) {
     const profile = req.profile ?? {};
-    // A job-less request (doctor's env check) has no session to keep.
+    // A job-less request (doctor's env check) has no session to keep, and runs nothing: doctor's pi-auth row reports
+    // a stored credential that task refuses.
     const jobLess = !req.job?.id || !req.sessionId;
+    if (!jobLess) refuseStoredCredential(profile, ctx, req.profileName);
     const sessionDir = jobLess ? null : sessionDirOf(req);
+    // A resume records the session files of its id that are there before pi starts: one that appears during the run
+    // is a new session pi started instead (finalize).
+    const before = req.resume && !jobLess ? { sessionFilesBefore: sessionFilesOf(ctx.fs, sessionDir, req.sessionId) } : {};
     return {
       argv: [
         binOf(req),
@@ -354,15 +435,17 @@ const pi = {
       cwd: req.job.cwd,
       dirs: sessionDir ? [sessionDir] : [],
       files: [],
-      meta: jobLess ? null : { sessionDir, agentDir: agentDirOf(profile, ctx) },
+      meta: jobLess ? null : { sessionDir, agentDir: agentDirOf(profile, ctx), ...before },
     };
   },
 
   // One "Reply with exactly: PONG" turn: no session, no tools (-nt), no context files (the probe runs in a scratch dir
   // under the data root, whose ancestors may hold AGENTS.md / CLAUDE.md) [03 §16.2 doctor --probe]. The profile's own
-  // --thinking stays (not §16.2's `off`): the probe checks the model and effort the jobs use.
+  // --thinking stays (not §16.2's `off`): the probe checks the model and effort the jobs use — and is refused like a
+  // task when a stored credential would answer instead of the key.
   probe(req, ctx) {
     const profile = req.profile ?? {};
+    refuseStoredCredential(profile, ctx, req.profileName);
     return {
       argv: [binOf(req), "--mode", "json", ...modelArgs(profile), "--no-session", "--no-approve", "-ne", "-ns", "-np", "-nc", "--no-mcp", "-nt", ...extensionArgs(profile)],
       env: { ...DEFAULT_ENV },
@@ -378,16 +461,39 @@ const pi = {
 
   reduce,
 
-  // A resumed job whose stderr carries pi's "No project session found with id …" ran in a new, empty session: the
-  // answer lacks the earlier context, so the job is resume-lost (spec §3.6 A12) and the orchestrator re-briefs FRESH.
-  // Only here, because the same warning opens every fresh job. (The stderr tail keeps the last 200 lines; pi prints
-  // the warning at startup and is quiet on stderr in JSON mode.)
-  finalize(job) {
+  // A resumed job that ran in a new, empty session: the answer lacks the earlier context, so the job is resume-lost
+  // (spec §3.6 A12) and the orchestrator re-briefs FRESH. Two signs, either one enough: pi's "No project session found
+  // with id …" in the stderr tail (only for a resume: the same warning opens every fresh job), and a session file of
+  // this id and cwd that was not in the session dir when the job started (meta.sessionFilesBefore) — the one pi created
+  // instead. The second does not depend on the warning, printed at startup, surviving the core's 200-line tail behind
+  // a chatty extension's stderr.
+  finalize(job, ctx) {
     if (!job?.record?.resumeOf) return null;
+    const lost = (errorText) => ({ ok: false, response: null, errorClass: "resume-lost", errorText });
     const line = String(job.io?.stderrTail ?? "")
       .split("\n")
       .find((text) => LOST_SESSION_RE.test(text));
-    return line ? { ok: false, response: null, errorClass: "resume-lost", errorText: line.trim() } : null;
+    if (line) return lost(line.trim());
+    const { sessionDir: dir, sessionFilesBefore: before } = job.record.meta ?? {};
+    const sessionId = job.record.sessionId;
+    if (!Array.isArray(before) || typeof dir !== "string" || !dir || typeof sessionId !== "string" || !ctx?.fs) return null;
+    const created = sessionFilesOf(ctx.fs, dir, sessionId)
+      .filter((name) => !before.includes(name))
+      .find((name) => {
+        const header = headerOf(ctx.fs, path.join(dir, name));
+        return header?.id === sessionId && header.cwd === job.cwd;
+      });
+    return created ? lost(`pi started a new session file ${created} in ${dir} instead of resuming session ${sessionId}`) : null;
+  },
+
+  // After every run — completed, failed, timed out or cancelled — the core passes the job's redactor (ctx.redact, which
+  // knows the key) and writes back what this returns: each text file of the session dir that held a registered value,
+  // redacted (<redacted>, as in the log), with its mode. A resume reads only the header's id and cwd
+  // (findSessionHeader), which redaction leaves alone, and the model gets <redacted> where the key was.
+  scrub(job, ctx) {
+    const dir = job?.record?.meta?.sessionDir ?? (job?.dir ? path.join(job.dir, "sessions") : null);
+    if (typeof ctx?.redact !== "function" || typeof dir !== "string" || !dir) return [];
+    return scrubSessionFiles(ctx.fs, dir, ctx.redact);
   },
 
   // spec §3.6 A12: the same cwd (pi's lookup in a --session-dir filters by the header cwd) and a session file whose

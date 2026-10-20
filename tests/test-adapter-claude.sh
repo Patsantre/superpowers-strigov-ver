@@ -181,7 +181,7 @@ main() {
     local v
     for v in $(env | sed -n 's/^\(ANTHROPIC_[A-Za-z0-9_]*\)=.*/\1/p; s/^\(CLAUDE_[A-Za-z0-9_]*\)=.*/\1/p; s/^\(AGENT_STUB_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
     export AGENT_STUB_DIALECT=claude-json
-    local STUB_VARS="AGENT_STUB_DIALECT,AGENT_STUB_MODE,AGENT_STUB_RECORD,AGENT_STUB_DELAY_MS,AGENT_STUB_MESSAGE,AGENT_STUB_CLASS,AGENT_STUB_EXIT,AGENT_STUB_RESPONSE,AGENT_STUB_SECRET_VAR,AGENT_STUB_STATUS,AGENT_STUB_SIGNALS,AGENT_STUB_CALL_LOG,AGENT_STUB_AUTH_LOG,AGENT_STUB_VERSION,AGENT_STUB_HELP_DROP,AGENT_STUB_BG_TOKENS,AGENT_STUB_BASH_PROBE"
+    local STUB_VARS="AGENT_STUB_DIALECT,AGENT_STUB_MODE,AGENT_STUB_RECORD,AGENT_STUB_DELAY_MS,AGENT_STUB_MESSAGE,AGENT_STUB_CLASS,AGENT_STUB_EXIT,AGENT_STUB_RESPONSE,AGENT_STUB_SECRET_VAR,AGENT_STUB_STATUS,AGENT_STUB_SIGNALS,AGENT_STUB_CALL_LOG,AGENT_STUB_AUTH_LOG,AGENT_STUB_VERSION,AGENT_STUB_HELP_DROP,AGENT_STUB_BG_TOKENS,AGENT_STUB_BASH_PROBE,AGENT_STUB_PLAIN_PREFIX"
     export AGENT_ENV_PASSTHROUGH="$STUB_VARS"
     local KEY
     KEY="sk-test-$(node -e 'process.stdout.write(require("node:crypto").randomBytes(12).toString("hex"))')"
@@ -255,6 +255,8 @@ EOF
     # A claude.ai login in ~/.claude (the dialect's marker) and a user setting the overlay must beat [01 E10].
     printf '{}\n' >"$HOME/.claude/stub-login.json"
     printf '{"env":{"CLAUDE_CODE_EFFORT_LEVEL":"low"}}\n' >"$HOME/.claude/settings.json"
+    # The deny rules of every reviewer overlay: the git options that write files or run programs (§3.6 A4).
+    local GIT_DENY='"Bash(git *--output*)","Bash(git *--ext-diff*)","Bash(git *--textconv*)","Bash(git *--no-index*)","Bash(git difftool*)"'
 
     # From here on a failing command must not end the suite: FAILURES decides the exit code, and the summary prints.
     set +e
@@ -315,8 +317,10 @@ EOF
     [[ "$(ad result "$ID")" == "DONE"*"stub finished"* && "$(jobf "$ID" r.reportedModel)" == claude-opus-stub && "$(jobf "$ID" r.usage.input_tokens)" == 42 ]]
     verdict "2 result prints the result field; reportedModel and usage come from the JSON result" $? "$(ad result "$ID")"
 
-    # 2b login, reviewer.
-    task_on csub login-r AGENT_STUB_BG_TOKENS=1 -- --role phase-review
+    # 2b login, reviewer. Every spelling git accepts for its file-writing and program-running options is denied; the
+    # safe ones (--no-ext-diff, --no-textconv) and plain reading run.
+    local git_cmds='["git show --output=x HEAD","git diff --output x","git log -p --output=/tmp/x","git show --ext-diff HEAD","git log -p --textconv","git diff --no-index /etc/hosts /dev/null","git show HEAD","git diff HEAD~1 -- a.txt","git log --oneline -5","git status --short","git diff --no-ext-diff","git log -p --no-textconv"]'
+    task_on csub login-r AGENT_STUB_BG_TOKENS=1 "AGENT_STUB_BASH_PROBE=$git_cmds" -- --role phase-review
     st="$(wait_job "$ID")"
     d="$JOBS/$ID"
     sid="$(jobf "$ID" r.sessionId)"
@@ -324,8 +328,22 @@ EOF
         --tools Read,Glob,Grep,Bash --allowedTools "Bash(git show:*)" "Bash(git diff:*)" "Bash(git log:*)" "Bash(git status:*)" \
         --strict-mcp-config --disable-slash-commands --append-system-prompt-file "$d/system.md" --session-id "$sid" --permission-mode dontAsk)"
     got="$(jget "$REC" r.argv)"
-    [[ "$st" == completed && "$got" == "$exp" && "$(cat "$d/system.md")" == *"Your tools are read-only"* ]]
+    [[ "$st" == completed && "$got" == "$exp" && "$(cat "$d/system.md")" == *"Your tools are read-only"*"without --output, --ext-diff, --textconv or --no-index"* ]]
     verdict "2 login reviewer: Read,Glob,Grep,Bash + the four git allow rules + dontAsk; system.md says read-only" $? "got: $got" "exp: $exp"
+    got="$(jget "$d/settings.json" r)"
+    exp='{"disableAllHooks":true,"permissions":{"deny":['"$GIT_DENY"']},"env":{"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB":"1","CLAUDE_CODE_EFFORT_LEVEL":"xhigh"}}'
+    [[ "$got" == "$exp" ]]
+    verdict "2 login reviewer overlay: deny rules for git --output, --ext-diff, --textconv, --no-index and difftool" $? "got: $got" "exp: $exp"
+    got="$(jget "$REC.claude.json" r.bash)"
+    exp='{"git show --output=x HEAD":"deny","git diff --output x":"deny","git log -p --output=/tmp/x":"deny","git show --ext-diff HEAD":"deny","git log -p --textconv":"deny","git diff --no-index /etc/hosts /dev/null":"deny","git show HEAD":"allow","git diff HEAD~1 -- a.txt":"allow","git log --oneline -5":"allow","git status --short":"allow","git diff --no-ext-diff":"allow","git log -p --no-textconv":"allow"}'
+    [[ "$got" == "$exp" ]]
+    verdict "2 login reviewer: git show/diff/log with --output (= or a separate value), --ext-diff, --textconv, --no-index denied; reading runs" $? "got: $got" "exp: $exp"
+    # A claude that reads `Bash(git diff:*)` as a plain text prefix would also take git difftool and git diff-tree.
+    task_on csub login-r-plain AGENT_STUB_PLAIN_PREFIX=1 'AGENT_STUB_BASH_PROBE=["git difftool -y --extcmd=touch HEAD","git diff-tree -p --output=x HEAD","git diff HEAD"]' -- --role phase-review
+    st="$(wait_job "$ID")"
+    got="$(jget "$REC.claude.json" r.bash)"
+    [[ "$st" == completed && "$got" == '{"git difftool -y --extcmd=touch HEAD":"deny","git diff-tree -p --output=x HEAD":"deny","git diff HEAD":"allow"}' ]]
+    verdict "2 reviewer, the allow rules read without a word boundary: git difftool --extcmd and git diff-tree --output are still denied" $? "st=$st bash: $got"
     [[ "$(jobf "$ID" r.reportedModel)" == claude-opus-stub && "$(ad result "$ID" | head -1)" == DONE ]]
     verdict "2 reportedModel is the main model, not a smaller background (haiku-tier) entry of modelUsage" $? "reportedModel=$(jobf "$ID" r.reportedModel)"
 
@@ -423,7 +441,7 @@ EOF
     st="$(wait_job "$ID")"
     [[ "$st" == completed && "$(jget "$REC" 'r.argv[r.argv.indexOf("--tools") + 1]')" == Read,Glob,Grep,Bash && "$(jget "$REC" 'r.argv.slice(-2).join(" ")')" == "--max-turns 7" ]]
     verdict "3 options.tools does not widen a reviewer (group A4); maxTurns applies" $? "argv=$(jget "$REC" r.argv)"
-    [[ "$(jget "$JOBS/$ID/settings.json" r.permissions)" == '{"deny":["WebSearch"]}' \
+    [[ "$(jget "$JOBS/$ID/settings.json" r.permissions)" == '{"deny":["WebSearch",'"$GIT_DENY"']}' \
         && "$(jget "$REC.claude.json" r.bash)" == '{"npm test":"deny","npm test -- --watch":"deny","git diff HEAD":"allow"}' ]]
     verdict "3 options.settings allow rules past the four git commands are dropped for a reviewer (npm test denied, git diff runs)" $? \
         "permissions=$(jget "$JOBS/$ID/settings.json" r.permissions) bash=$(jget "$REC.claude.json" r.bash)"
@@ -546,7 +564,7 @@ EOF
     task_on csub allow-r "AGENT_STUB_BASH_PROBE=$cmds" -- --role phase-review
     st="$(wait_job "$ID")"
     exp='{"npm install left-pad":"deny","git commit -am x":"deny","rm -rf a.txt":"deny","git diff HEAD~1":"allow","git status":"allow","git log --oneline":"allow"}'
-    [[ "$st" == completed && "$(jget "$JOBS/$ID/settings.json" r.permissions)" == '{"deny":["Bash(npm install:*)","Bash(git commit:*)"]}' \
+    [[ "$st" == completed && "$(jget "$JOBS/$ID/settings.json" r.permissions)" == '{"deny":['"$GIT_DENY"',"Bash(npm install:*)","Bash(git commit:*)"]}' \
         && "$(jget "$REC.claude.json" r.bash)" == "$exp" && "$(jget "$REC.claude.json" 'r.permissions.allow.includes("Bash(npm install:*)")')" == true ]]
     verdict "7 login reviewer: the user's allow rules past the git commands get deny rules (npm install, git commit denied; git diff/status/log run)" $? \
         "st=$st permissions=$(jget "$JOBS/$ID/settings.json" r.permissions)" "bash: $(jget "$REC.claude.json" r.bash)" "exp:  $exp"
@@ -560,7 +578,7 @@ EOF
     printf '%s\n' '{"permissions":{"allow":["Bash"]}}' >"$HOME/.claude/settings.json"
     task_on csub allow-broad 'AGENT_STUB_BASH_PROBE=["git diff","ls"]' -- --role phase-review
     st="$(wait_job "$ID")"
-    [[ "$st" == completed && "$(jget "$JOBS/$ID/settings.json" r.permissions)" == '{"deny":["Bash"]}' && "$(jget "$REC.claude.json" r.bash)" == '{"git diff":"deny","ls":"deny"}' ]]
+    [[ "$st" == completed && "$(jget "$JOBS/$ID/settings.json" r.permissions)" == '{"deny":['"$GIT_DENY"',"Bash"]}' && "$(jget "$REC.claude.json" r.bash)" == '{"git diff":"deny","ls":"deny"}' ]]
     verdict "7 a bare Bash allow rule: denied for the reviewer, the git commands with it (read-only first)" $? "st=$st bash=$(jget "$REC.claude.json" r.bash)"
     printf '%s\n' '{"sandbox":{"enabled":true}}' >"$HOME/.claude/settings.json"
     task_on csub sandbox-r 'AGENT_STUB_BASH_PROBE=["touch x","git diff"]' -- --role phase-review
@@ -675,8 +693,9 @@ EOF
     verdict "11 login without a login: FAIL with the hint" $? "$OUT"
     rm -f "$STATE/homes/ciso/claude/stub-login.json"
     run_ad doctor --profile ciso
-    [[ "$OUT" == *"FAIL auth-status ciso: claude is not logged in in $STATE/homes/ciso/claude"*'eval "$(agent-dispatch profile env ciso)"'* ]]
-    verdict "11 login + home isolated without a login: FAIL pointing at profile env" $? "$OUT"
+    [[ "$OUT" == *"FAIL auth-status ciso: claude is not logged in in $STATE/homes/ciso/claude (authMethod none); the user logs in: agent-dispatch profile env ciso -- claude, then /login"* \
+        && "$OUT" != *"eval "* ]]
+    verdict "11 login + home isolated without a login: FAIL pointing at profile env ciso -- claude (no eval)" $? "$OUT"
     : >"$AGENT_STUB_AUTH_LOG"
     run_ad doctor --profile czai
     local placeholder_sha empty_sha key_sha state_real
@@ -766,6 +785,7 @@ EOF
 const { pathToFileURL } = await import("node:url");
 const core = await import(pathToFileURL(process.argv[1]).href);
 const adapter = (await import(pathToFileURL(process.argv[2]).href)).default;
+const { default: path } = await import("node:path");
 const lines = [];
 const check = (label, ok, detail = "") => lines.push(`${ok ? "ok" : "not ok"}|${label}|${ok ? "" : JSON.stringify(detail)}`);
 const io = (stdout, extra = {}) => ({ stdout, events: core.parseEvents(stdout), stderrTail: "", exit: { code: 0, signal: null }, timedOut: false, spawnError: null, ...extra });
@@ -830,11 +850,48 @@ const rules = ["Bash", "Bash(*)", "Bash(git:*)", "Bash(git diff:*)", "Bash(git d
 const userCtx = core.makeCtx({ env: { HOME: "/home/u", PATH: "/bin" }, profileName: "p1", fs: { readFile: (f) => (f === "/home/u/.claude/settings.json" ? JSON.stringify({ permissions: { allow: rules } }) : null), exists: () => false, stat: () => null, readdir: () => null } });
 const plan = (profile, write) => adapter.invocation({ profile, profileName: "p1", write, job: { cwd: "/repo/b", dir: "/x" }, prompt: { path: "/x/prompt.md" }, sessionId: "11111111-2222-3333-4444-555555555555", resume: null, harness: null }, userCtx);
 const overlay = (inv) => JSON.parse(inv.files.find((f) => f.path === "/x/settings.json").content);
+const GIT_DENY = ["Bash(git *--output*)", "Bash(git *--ext-diff*)", "Bash(git *--textconv*)", "Bash(git *--no-index*)", "Bash(git difftool*)"];
 const denied = overlay(plan(login, false)).permissions?.deny ?? [];
-check("reviewer: Bash, Bash(*), Bash(git:*), a compound rule and Bash(npm test:*) are denied; git-command rules and other tools are not", JSON.stringify(denied) === JSON.stringify(["Bash", "Bash(*)", "Bash(git:*)", "Bash(git diff && rm -rf x)", "Bash(npm test:*)"]), denied);
+check("reviewer: the git deny rules, then Bash, Bash(*), Bash(git:*), a compound rule and Bash(npm test:*); git-command rules and other tools are not denied", JSON.stringify(denied) === JSON.stringify([...GIT_DENY, "Bash", "Bash(*)", "Bash(git:*)", "Bash(git diff && rm -rf x)", "Bash(npm test:*)"]), denied);
 check("writer on the same login profile: no permissions in the overlay", !("permissions" in overlay(plan(login, true))), overlay(plan(login, true)));
 const keyOverlay = overlay(plan({ harness: "claude", auth: { keyEnv: "K" }, endpoint: "https://e.test", model: "m" }, false));
-check("API reviewer: the user settings are not loaded, so nothing is added", JSON.stringify(keyOverlay.permissions) === "{\"deny\":[\"WebSearch\",\"WebFetch\"]}" && !("sandbox" in keyOverlay), keyOverlay);
+check("API reviewer: the user settings are not loaded, so only the git deny rules join the web tools", JSON.stringify(keyOverlay.permissions) === JSON.stringify({ deny: ["WebSearch", "WebFetch", ...GIT_DENY] }) && !("sandbox" in keyOverlay), keyOverlay);
+const probePlan = adapter.probe({ profile: login, profileName: "p1", write: false, job: { cwd: "/repo/b", dir: "/x" }, prompt: { path: "/x/prompt.md" }, sessionId: null, resume: null, harness: null }, userCtx);
+check("probe (no tools): no git deny rules", !("permissions" in overlay(probePlan)), overlay(probePlan));
+// A login profile whose settings.json leaves the login: refused (UsageError: exit 2) for a reviewer, a writer and the
+// probe, naming the file and every entry; an API profile does not load that file.
+const withSettings = (settings, file) => core.makeCtx({ env: { HOME: "/home/u", PATH: "/bin" }, profileName: "p1", fs: { readFile: (f) => (f === file ? JSON.stringify(settings) : null), exists: () => false, stat: () => null, readdir: () => null } });
+const refusalOf = (profile, sctx, how) => {
+  const r = { profile, profileName: "p1", write: how === "write", job: { cwd: "/repo/b", dir: "/x" }, prompt: { path: "/x/prompt.md" }, sessionId: null, resume: null, harness: null };
+  try {
+    if (how === "probe") adapter.probe(r, sctx);
+    else adapter.invocation(r, sctx);
+    return null;
+  } catch (error) {
+    return error;
+  }
+};
+const tail = "claude would use that key or endpoint instead of the claude.ai login (spec §3.6 A2); remove them there, or define an API profile for the key";
+for (const [settings, keys] of [
+  [{ env: { ANTHROPIC_API_KEY: "k" } }, "env.ANTHROPIC_API_KEY"], [{ env: { ANTHROPIC_AUTH_TOKEN: "t" } }, "env.ANTHROPIC_AUTH_TOKEN"],
+  [{ env: { ANTHROPIC_BASE_URL: "https://g.test" } }, "env.ANTHROPIC_BASE_URL"], [{ apiKeyHelper: "/bin/echo k" }, "apiKeyHelper"],
+  [{ env: { CLAUDE_CODE_USE_VERTEX: "1" } }, "env.CLAUDE_CODE_USE_VERTEX"], [{ env: { CLAUDE_CODE_USE_FOUNDRY: 1 } }, "env.CLAUDE_CODE_USE_FOUNDRY"],
+  [{ env: { ANTHROPIC_CUSTOM_HEADERS: "Authorization: Bearer x" } }, "env.ANTHROPIC_CUSTOM_HEADERS"],
+  [{ apiKeyHelper: "h", env: { ANTHROPIC_BASE_URL: "https://g.test", ANTHROPIC_AUTH_TOKEN: "t" } }, "env.ANTHROPIC_AUTH_TOKEN, env.ANTHROPIC_BASE_URL, apiKeyHelper"],
+]) {
+  const sctx = withSettings(settings, "/home/u/.claude/settings.json");
+  const errors = ["review", "write", "probe"].map((how) => refusalOf(login, sctx, how));
+  check(`login settings ${keys}: refused for reviewer, writer and probe`, errors.every((e) => e instanceof core.UsageError && e.message === `profile p1: /home/u/.claude/settings.json sets ${keys}: ${tail}`), errors.map((e) => e?.message ?? null));
+  const api = refusalOf({ harness: "claude", auth: { keyEnv: "K" }, endpoint: "https://e.test", model: "m" }, sctx, "review");
+  check(`API profile, the same file in ~/.claude (${keys}): not loaded, not refused`, api === null, api?.message);
+}
+const isoLogin = { harness: "claude", auth: "login", home: "isolated", model: "opus" };
+const isoFile = path.join(userCtx.paths.homes, "p1", "claude", "settings.json");
+const isoError = refusalOf(isoLogin, withSettings({ apiKeyHelper: "h" }, isoFile), "write");
+check("login + home isolated: its own settings.json is checked", isoError instanceof core.UsageError && isoError.message === `profile p1: ${isoFile} sets apiKeyHelper: ${tail}`, isoError?.message);
+const clean = refusalOf(login, withSettings({ apiKeyHelper: "", env: { ANTHROPIC_API_KEY: "", ANTHROPIC_BASE_URL: null, ANTHROPIC_MODEL: "m", ANTHROPIC_CUSTOM_HEADERS: "X-Route: a" } }, "/home/u/.claude/settings.json"), "review");
+check("login settings with an empty key, no endpoint, a model and a header that is no credential: not refused", clean === null, clean?.message);
+check("no loginEnv: profile env exports the env of prepareHome, the isolated CLAUDE_CONFIG_DIR", !("loginEnv" in adapter) && JSON.stringify(adapter.prepareHome(isoLogin, userCtx).env) === JSON.stringify({ CLAUDE_CONFIG_DIR: path.join(userCtx.paths.homes, "p1", "claude") }), adapter.prepareHome(isoLogin, userCtx));
 const boxed = { harness: "claude", auth: { keyEnv: "K" }, endpoint: "https://e.test", model: "m", options: { settings: { sandbox: { enabled: true } } } };
 check("options.settings sandbox without native: no auto-allow for a reviewer, untouched for a writer", JSON.stringify(overlay(plan(boxed, false)).sandbox) === "{\"enabled\":true,\"autoAllowBashIfSandboxed\":false}" && JSON.stringify(overlay(plan(boxed, true)).sandbox) === "{\"enabled\":true}", [overlay(plan(boxed, false)).sandbox, overlay(plan(boxed, true)).sandbox]);
 const badCtx = core.makeCtx({ env: { HOME: "/home/u", PATH: "/bin", "ANTHROPIC_A.B": "1", ANTHROPIC_FOO: "1" }, profileName: "p1", fs: userCtx.fs });
@@ -853,12 +910,64 @@ for (const l of lines) console.log(l);
         if [[ "$verdict_word" == ok ]]; then pass "14 ${rest%%|*}"; elif [[ "$verdict_word" == "not ok" ]]; then fail "14 ${rest%%|*}"; echo "    ${rest#*|}"; else fail "14 unit output: $line"; fi
     done <<<"$unit"
 
-    # --- 15. nothing left behind ---
+    # --- 15. a login profile's settings.json that leaves the login (spec §3.6 A2) ---
+    # `--setting-sources user` applies its env and apiKeyHelper [01 E18], past the removal of the inherited ANTHROPIC_*:
+    # a key, a key helper, an endpoint, a cloud provider or a credential header there refuses the profile before launch
+    # (exit 2, no job), and doctor FAILs it; auth status shows which credential claude would take instead.
+    user_settings="$(cat "$HOME/.claude/settings.json")"
+    local refusal_tail="claude would use that key or endpoint instead of the claude.ai login (spec §3.6 A2); remove them there, or define an API profile for the key"
+    local entry keys json auth_row
+    local -a offending=(
+        'env.ANTHROPIC_API_KEY|{"env":{"ANTHROPIC_API_KEY":"sk-in-user-settings"}}|FAIL auth-status csub: claude takes a key in '"$HOME"'/.claude, not the claude.ai login (authMethod api_key, apiKeySource ANTHROPIC_API_KEY)'
+        'env.ANTHROPIC_AUTH_TOKEN|{"env":{"ANTHROPIC_AUTH_TOKEN":"token-in-user-settings"}}|WARN auth-status csub: claude takes a token variable in '"$HOME"'/.claude, not the claude.ai login (authMethod oauth_token'
+        'env.ANTHROPIC_BASE_URL|{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example.test"}}|ok auth-status csub: logged in (authMethod claude.ai)'
+        'apiKeyHelper|{"apiKeyHelper":"/bin/echo k"}|FAIL auth-status csub: claude takes a key in '"$HOME"'/.claude, not the claude.ai login (authMethod api_key_helper, apiKeySource apiKeyHelper)'
+        'env.CLAUDE_CODE_USE_BEDROCK|{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}|auth-status csub'
+        'env.ANTHROPIC_CUSTOM_HEADERS|{"env":{"ANTHROPIC_CUSTOM_HEADERS":"X-Route: a\nx-api-key: k"}}|auth-status csub'
+    )
+    n="$(count_records "$JOBS")"
+    for entry in "${offending[@]}"; do
+        IFS='|' read -r keys json auth_row <<<"$entry"
+        printf '%s\n' "$json" >"$HOME/.claude/settings.json"
+        task_on csub "leave-${keys//./-}"
+        [[ "$RC" -eq 2 && "$ERR" == "agent-dispatch: profile csub: $HOME/.claude/settings.json sets $keys: $refusal_tail" && -z "$ID" && ! -e "$REC" ]]
+        verdict "15 user settings with $keys: the login profile's task is refused (exit 2, nothing runs)" $? "rc=$RC err=$ERR"
+        run_ad doctor --profile csub
+        [[ "$RC" -ne 0 && "$OUT" == *"FAIL user-settings csub: $HOME/.claude/settings.json sets $keys: $refusal_tail; every task is refused"* && "$OUT" == *"$auth_row"* ]]
+        verdict "15 user settings with $keys: doctor FAIL user-settings (and auth status: ${auth_row%%:*})" $? "$OUT"
+    done
+    printf '%s\n' '{"apiKeyHelper":"/bin/echo k","env":{"ANTHROPIC_BASE_URL":"https://gateway.example.test","ANTHROPIC_API_KEY":"k"}}' >"$HOME/.claude/settings.json"
+    task_on csub leave-write -- --write
+    [[ "$RC" -eq 2 && "$ERR" == *"settings.json sets env.ANTHROPIC_API_KEY, env.ANTHROPIC_BASE_URL, apiKeyHelper: claude would use"* && -z "$ID" && ! -e "$REC" ]]
+    verdict "15 a writer is refused the same way; every offending entry is named" $? "rc=$RC err=$ERR"
+    rm -f "$TEST_ROOT/rec/leave-probe.json"
+    OUT="$(AGENT_STUB_RECORD="$TEST_ROOT/rec/leave-probe.json" ad doctor --profile csub --probe 2>&1)"
+    [[ "$OUT" == *"sets env.ANTHROPIC_API_KEY, env.ANTHROPIC_BASE_URL, apiKeyHelper"* && "$OUT" != *"ok probe csub"* && ! -e "$TEST_ROOT/rec/leave-probe.json" ]]
+    verdict "15 doctor --probe does not run claude on such a login profile" $? "$OUT"
+    [[ "$(count_records "$JOBS")" -eq "$n" ]]
+    verdict "15 the refusals leave no job record" $? "before=$n after=$(count_records "$JOBS")"
+    printf '%s\n' '{"apiKeyHelper":"/bin/echo k"}' >"$STATE/homes/ciso/claude/settings.json"
+    task_on ciso leave-iso -- --write
+    [[ "$RC" -eq 2 && "$ERR" == "agent-dispatch: profile ciso: $STATE/homes/ciso/claude/settings.json sets apiKeyHelper: $refusal_tail" && ! -e "$REC" ]]
+    verdict "15 login + home isolated: the profile's own settings.json is checked the same way" $? "rc=$RC err=$ERR"
+    rm -f "$STATE/homes/ciso/claude/settings.json"
+    # Entries that keep the login: an empty key variable, a model, a header that is no credential.
+    printf '%s\n' '{"env":{"ANTHROPIC_API_KEY":"","ANTHROPIC_MODEL":"opus","ANTHROPIC_CUSTOM_HEADERS":"X-Route: team-a","CLAUDE_CODE_EFFORT_LEVEL":"low"}}' >"$HOME/.claude/settings.json"
+    task_on csub leave-clean -- --write
+    st="$(wait_job "$ID")"
+    [[ "$RC" -eq 0 && "$st" == completed && "$(jget "$REC.claude.json" r.credential)" == claude.ai ]]
+    verdict "15 user settings without a key, helper or endpoint: the login profile runs on the login" $? "rc=$RC err=$ERR st=$st credential=$(jget "$REC.claude.json" r.credential)"
+    run_ad doctor --profile csub
+    [[ "$OUT" != *"user-settings csub"* && "$OUT" == *"ok auth-status csub: logged in (authMethod claude.ai) in $HOME/.claude"* ]]
+    verdict "15 doctor: no user-settings row, ok auth-status" $? "$OUT"
+    printf '%s\n' "$user_settings" >"$HOME/.claude/settings.json"
+
+    # --- 16. nothing left behind ---
     sleep 0.3
     local leftover
     leftover="$(pgrep -f "$TEST_ROOT" 2>/dev/null | tr '\n' ' ')"
     [[ -z "$leftover" ]]
-    verdict "15 no process of this run is left" $? "pids: $leftover $(ps -o pid=,command= -p "${leftover// /,}" 2>/dev/null)"
+    verdict "16 no process of this run is left" $? "pids: $leftover $(ps -o pid=,command= -p "${leftover// /,}" 2>/dev/null)"
 
     echo
     echo "PASS count: $PASSES"

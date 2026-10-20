@@ -292,7 +292,8 @@ check("cancel ladder SIGINT, at least 7 s, then SIGKILL", JSON.stringify(m.cance
 check("no required help flags: the headless flags follow the launcher flags (spec §3.2: only the version is checked)", Array.isArray(m.requiredFlags) && m.requiredFlags.length === 0, m.requiredFlags);
 check("native home variable DSH_HOME", JSON.stringify(m.homeEnv) === JSON.stringify(["DSH_HOME"]), m.homeEnv);
 check("verified version 0.2.1-rc.2", JSON.stringify(m.verifiedVersions) === JSON.stringify(["0.2.1-rc.2"]), m.verifiedVersions);
-for (const hook of ["discover", "prepareHome", "invocation", "probe", "reduce", "finalize", "resumeCheck", "doctorChecks", "loginEnv"]) check(`hook ${hook}()`, typeof dsh[hook] === "function");
+for (const hook of ["discover", "prepareHome", "invocation", "probe", "reduce", "finalize", "resumeCheck", "doctorChecks"]) check(`hook ${hook}()`, typeof dsh[hook] === "function");
+check("no loginEnv hook: profile env exports prepareHome().env, the one source of the isolated DSH_HOME", !("loginEnv" in dsh));
 check("patterns cover auth, quota, model-not-selected, context, rate-limit, server, launch",
   ["auth", "quota", "model-not-selected", "context", "rate-limit", "server", "launch"].every((k) => Array.isArray(dsh.patterns[k]) && dsh.patterns[k].length > 0));
 check("no resume-lost pattern: patterns see fresh jobs too, and a fresh job cannot lose a session", !("resume-lost" in dsh.patterns), Object.keys(dsh.patterns));
@@ -366,7 +367,6 @@ check("home isolated: DSH_HOME=<data>/homes/<profile>/dsh is mandatory and creat
 inv = dsh.invocation(req(iso), ctx);
 check("home isolated: no DSH_HOME re-admission; meta names the isolated home", inv.inheritEnv.length === 0 && inv.meta.dshHome === "/data/homes/ds-x/dsh", [inv.inheritEnv, inv.meta.dshHome]);
 check("home user: prepareHome sets nothing", JSON.stringify(dsh.prepareHome(keyed, ctx).env) === "{}");
-check("loginEnv (profile env): DSH_HOME of the isolated home", JSON.stringify(dsh.loginEnv(iso, ctx)) === JSON.stringify({ DSH_HOME: "/data/homes/ds-x/dsh" }));
 const ctxHome = core.makeCtx({ env: { ...env, DSH_HOME: "/custom/dsh" }, profile: {}, profileName: "ds-x" });
 check("home user: the caller'"'"'s DSH_HOME is the session home", dsh.invocation(req(keyed), ctxHome).meta.dshHome === "/custom/dsh");
 
@@ -501,6 +501,15 @@ r = R(io([session, turnEnd({ kind: "aborted" }), { type: "final", text: "" }], {
 check("aborted at exit 0 (an outside SIGTERM) is no success: crash", !r.ok && r.errorClass === "crash", r);
 r = R(io([session, turnEnd({ kind: "aborted" }), { type: "final", text: "" }], { code: 130, cancelled: true }));
 check("aborted after a cancel: no class (the record says cancelled)", !r.ok && r.errorClass === null, r);
+// Only a completed turn is success: dsh exits 0 on SIGTERM and its final is only "often" empty [04b §3, §10], so
+// neither the exit code nor a non-empty final may stand in for the turn_end kind.
+for (const kind of ["aborted", "interrupted", "blocked"]) {
+  r = R(io([session, { type: "text", text: "DONE\npartial" }, turnEnd({ kind }), { type: "final", text: "DONE\npartial" }], { code: 0 }));
+  check(`${kind} at exit 0 with a non-empty final → not ok, no response (${kind === "blocked" ? "blocked" : "crash"})`,
+    r.ok === false && r.response === null && r.errorClass === (kind === "blocked" ? "blocked" : "crash"), r);
+}
+r = R(io([session, { type: "final", text: "DONE\nno turn ended" }], { code: 0 }));
+check("a non-empty final without any turn_end at exit 0 → not ok", r.ok === false && r.response === null, r);
 r = R(io([session, turnEnd({ kind: "completed" })], { code: 0 }));
 check("completed without a final event → malformed", r.errorClass === "malformed", r);
 r = R(io([session, turnEnd({ kind: "completed" }), { type: "final", text: "  \n" }], { code: 1 }));
@@ -917,8 +926,10 @@ check("resumeCheck: user home then, isolated home now → refused", /DSH_HOME/.t
     kill -TERM "$child"
     ST="$(wait_status "$id" 'completed|failed|cancelled' 20)"
     SJ="$(ad status "$id" --json)"
-    [[ "$ST" == failed && "$(jfield job.exitCode <<<"$SJ")" == 0 && "$(jfield job.errorClass <<<"$SJ")" == crash ]]
-    verdict "B12 an outside SIGTERM: dsh exits 0 with an aborted turn → failed/crash, not completed" $? "st=$ST $SJ"
+    run_ad result "$id"
+    [[ "$ST" == failed && "$(jfield job.exitCode <<<"$SJ")" == 0 && "$(jfield job.errorClass <<<"$SJ")" == crash && -z "$(jfield job.response <<<"$SJ")" \
+        && "$RC" -ne 0 && "$OUT" != *"partial answer"* ]] && grep -q '"type":"final","text":"DONE\\npartial answer before the abort"' "$JOBS/$id.log"
+    verdict "B12 an outside SIGTERM: dsh exits 0, an aborted turn and a partial final → failed/crash, no response, not completed" $? "st=$ST rc=$RC out=$OUT $SJ" "$(grep -F '"final"' "$JOBS/$id.log")"
     sigs="$TEST_ROOT/sig-b12b.txt"
     ready="$TEST_ROOT/ready-b12b"
     AGENT_STUB_MODE=sigterm-final AGENT_STUB_SIGNALS="$sigs" AGENT_STUB_READY="$ready" start --profile ds-key --prompt-file "$prompt"
@@ -971,6 +982,8 @@ check("doctor: the dump shows the pinned baseURL (ok)", l["dsh-endpoint"] === "o
 check("doctor: the dump shows session-log-deepseek off (ok)", l["dsh-session-log"] === "ok", checks);
 check("doctor: the node runtime is checked", ["ok", "WARN"].includes(l["dsh-node"]), checks);
 check("doctor: the permission modes are named", /danger-full-access/.test(hint(checks, "dsh-permissions")) && /read-only/.test(hint(checks, "dsh-permissions")));
+check("doctor: dsh-permissions ok from the dump run as a reviewer (sandbox-policy read-only, approval ask)",
+  l["dsh-permissions"] === "ok" && /sandbox-policy read-only/.test(hint(checks, "dsh-permissions")) && !/approval-policy/.test(hint(checks, "dsh-permissions")), checks);
 const patch = writes.at(-1)?.files?.[0]?.path ?? "";
 check("doctor: the patch template is written under the data root (doctor dir)",
   patch.startsWith(path.join(env.AGENT_DISPATCH_STATE_DIR, "state", "doctor")) && fs.existsSync(patch), patch);
@@ -1015,6 +1028,58 @@ check("doctor (Linux, wrap): no dsh-wrap warning (the nesting limit is macOS'"'"
 const remodel = { ...base, options: { patch: { "agent-default-model": { config: { model: "deepseek-flash" } } } } };
 c = await dsh.doctorChecks(remodel, fake("linux", { profile: remodel }));
 check("doctor: options.patch naming another model than the profile'"'"'s → dsh-model WARN", levels(c)["dsh-model"] === "WARN" && /deepseek-flash/.test(hint(c, "dsh-model")), c);
+check("doctor without a dump: dsh-permissions WARN, not verified", levels(c)["dsh-permissions"] === "WARN" && /not verified/.test(hint(c, "dsh-permissions")), c);
+
+// dsh-effort reads the rendered rows: options.patch may set another reasoningEffort than the profile'"'"'s.
+const reEffort = { ...base, options: { patch: { "llm-deepseek": { config: { reasoningEffort: "xhigh" } } } } };
+c = await dsh.doctorChecks(reEffort, fake("linux", { profile: reEffort }));
+check("doctor: options.patch reasoningEffort xhigh in llm-deepseek (profile high) → dsh-effort WARN naming each row'"'"'s value",
+  levels(c)["dsh-effort"] === "WARN" && /high in agent-default-model, reasoningEffort xhigh in llm-deepseek \(options\.patch\): xhigh is not one of/.test(hint(c, "dsh-effort")), c);
+const fixedEffort = { ...base, effort: "xhigh", options: { patch: { "agent-default-model": { config: { reasoningEffort: "max" } }, "llm-deepseek": { config: { reasoningEffort: "max" } } } } };
+c = await dsh.doctorChecks(fixedEffort, fake("linux", { profile: fixedEffort }));
+check("doctor: a profile effort xhigh that options.patch replaces with max in both rows → dsh-effort ok",
+  levels(c)["dsh-effort"] === "ok" && /reasoningEffort max in agent-default-model and llm-deepseek \(options\.patch\)/.test(hint(c, "dsh-effort")), c);
+
+// The worktree and native-key warnings, with the same fakes (no dump).
+const repoGit = path.join(process.env.REPO, ".git");
+const linked = (f) => (f === repoGit ? { isFile: () => true } : realFs.stat(f));
+c = await dsh.doctorChecks(sbx, fake("linux", { PATH: fakebin, profile: sbx, stat: linked }));
+check("doctor: sandbox native in a linked worktree (.git is a file) → dsh-worktree WARN", levels(c)["dsh-worktree"] === "WARN" && /linked git worktree/.test(hint(c, "dsh-worktree")), c);
+c = await dsh.doctorChecks(base, fake("linux", { PATH: fakebin, stat: linked }));
+check("doctor: the same worktree without sandbox native → no dsh-worktree row (danger-full-access has no fence)", !("dsh-worktree" in levels(c)), c);
+const nativeFake = { ...base, auth: "native" };
+const keyFile = path.join(env.HOME, ".dsh", ".env");
+fs.chmodSync(keyFile, 0o644);
+c = await dsh.doctorChecks(nativeFake, fake("linux", { profile: nativeFake }));
+fs.chmodSync(keyFile, 0o600);
+check("doctor: native with a ~/.dsh/.env readable by others (0644) → dsh-auth WARN, expected 600", levels(c)["dsh-auth"] === "WARN" && /mode 644, expected 600/.test(hint(c, "dsh-auth")), c);
+
+// dsh-permissions on dumps dsh might print — resolved values or the bundle'"'"'s expressions (the dump format and the row
+// ids are unverified): a fake exec answers --version and --dump-config.
+const dumped = (text) => (cmd, args = []) =>
+  args.includes("--dump-config") ? { status: 0, signal: null, stdout: text, stderr: "", error: null }
+    : cmd !== "node" && args.includes("--version") ? { status: 0, signal: null, stdout: "0.2.1-rc.2\n", stderr: "", error: null }
+    : { status: 1, signal: null, stdout: "", stderr: "", error: null };
+const graded = async (text) => {
+  const g = await dsh.doctorChecks(base, core.makeCtx({ env, profile: base, profileName: "ds-doc", exec: dumped(text), writeFiles: () => {}, cwd: process.env.REPO }));
+  return [levels(g)["dsh-permissions"], hint(g, "dsh-permissions")];
+};
+const head = "- id: agent-default-model\n  config:\n    provider: \"deepseek-official\"\n";
+for (const [label, text, want, re] of [
+  ["resolved rows: read-only, approval ask", head + "- id: sandbox-policy\n  config:\n    mode: \"read-only\"\n    workspaceRoot: \"/repo\"\n- id: approval-policy\n  config:\n    policy: \"ask\"\n", "ok", /reviewer read-only: .*sandbox-policy read-only/],
+  ["the bundle'"'"'s expressions unresolved (their workspace-write fallback is not the row'"'"'s)",
+    head + "- id: sandbox-policy\n  config:\n    mode: ${{ env.DSH_PERMISSION_MODE ?? \"workspace-write\" }}\n- id: approval-policy\n  config:\n    policy: ${{ env.DSH_PERMISSION_MODE === \"danger-full-access\" ? \"never\" : \"ask\" }}\n",
+    "ok", /sandbox-policy follows DSH_PERMISSION_MODE, approval-policy follows DSH_PERMISSION_MODE/],
+  ["a flow row pinning workspace-write", head + "- id: \"sandbox\"\n  config: {\"mode\": \"workspace-write\", \"workspaceRoot\": \"/repo\"}\n", "FAIL", /NOT read-only: .*shows sandbox workspace-write .*overrides DSH_PERMISSION_MODE: reviewer jobs run workspace-write;/],
+  ["a row pinning danger-full-access", head + "- id: permission-presets\n  config:\n    preset: danger-full-access\n", "FAIL", /permission-presets danger-full-access/],
+  ["approval never while the mode follows the variable", head + "- id: sandbox-policy\n  config:\n    mode: \"read-only\"\n- id: approval-policy\n  config:\n    policy: \"never\"\n", "FAIL", /reviewer read-only overridden: .*shows approval-policy never — .*no longer follow it/],
+  ["no permission row", head + "- id: tool-web\n  config: {}\n", "WARN", /not verified/],
+  ["a permission row with no mode (a path is no mode)", head + "- id: sandbox-policy\n  config:\n    workspaceRoot: \"/w/read-only/danger-full-access-repo\"\n", "WARN", /not verified/],
+]) {
+  const [level, text2] = await graded(text);
+  check(`dsh-permissions on a dump with ${label} → ${want}`, level === want && re.test(text2), [level, text2]);
+}
+check("permissionRows: ids and values of the matching rows only", typeof mod.permissionRows === "function" && JSON.stringify(mod.permissionRows(head + "- id: sandbox-policy\n  config: {\"mode\": \"read-only\"}\n- id: tool-web\n  config: {\"mode\": \"danger-full-access\"}\n")) === JSON.stringify([{ id: "sandbox-policy", value: "read-only" }]));
 
 env.AGENT_STUB_MODE = "dump-fail";
 checks = await dsh.doctorChecks(base, ctxOf(base));
@@ -1040,6 +1105,29 @@ fs.writeFileSync(path.join(process.env.REPO, ".env"), "X=1\n");
 checks = await dsh.doctorChecks(base, ctxOf(base));
 fs.rmSync(path.join(process.env.REPO, ".env"));
 check("doctor: a repo .env → WARN (read before $DSH_HOME/.env)", levels(checks)["dsh-repo-env"] === "WARN", checks);
+
+// A row of a $DSH_HOME layer outranks the bundle row that reads DSH_PERMISSION_MODE [04b §2, §7]: the stub applies the
+// layers like dsh, and doctor grades the dump it ran as a reviewer. The layers are stat'"'"'ed, never read by the adapter.
+const userHome = path.join(env.HOME, ".dsh");
+const homeLayer = path.join(userHome, "cordis.patch.yml");
+const profileLayer = path.join(userHome, "profiles", "headless", "cordis.patch.yml");
+const reads = [];
+const spyFs = { ...realFs, readFile: (f, ...rest) => (reads.push(f), realFs.readFile(f, ...rest)) };
+const layerTemplate = fs.readFileSync(profileLayer, "utf8");
+fs.writeFileSync(homeLayer, "- id: sandbox-policy\n  config: {\"mode\": \"danger-full-access\"}\n");
+checks = await dsh.doctorChecks(base, ctxOf(base, { fs: spyFs }));
+check("doctor: ~/.dsh/cordis.patch.yml pins sandbox-policy danger-full-access → dsh-permissions FAIL naming both home layers",
+  levels(checks)["dsh-permissions"] === "FAIL" && /reviewer NOT read-only: --dump-config with DSH_PERMISSION_MODE=read-only shows sandbox-policy danger-full-access/.test(hint(checks, "dsh-permissions"))
+    && hint(checks, "dsh-permissions").includes(`check ${profileLayer}, ${homeLayer} (not read here)`), checks);
+check("doctor: the home layers are never read by the adapter (stat only)", !reads.some((f) => f.startsWith(userHome)), reads);
+fs.rmSync(homeLayer);
+fs.writeFileSync(profileLayer, "- id: approval-policy\n  config: {\"policy\": \"never\"}\n");
+checks = await dsh.doctorChecks(base, ctxOf(base));
+check("doctor: profiles/headless/cordis.patch.yml pins approval never → dsh-permissions FAIL", levels(checks)["dsh-permissions"] === "FAIL" && /approval-policy never/.test(hint(checks, "dsh-permissions")), checks);
+fs.writeFileSync(profileLayer, "- id: sandbox-policy\n  config: {\"mode\": \"read-only\"}\n");
+checks = await dsh.doctorChecks(base, ctxOf(base));
+check("doctor: a layer that pins read-only → dsh-permissions ok", levels(checks)["dsh-permissions"] === "ok", checks);
+fs.writeFileSync(profileLayer, layerTemplate);
 const wrapped = { ...base, wrap: ["/usr/bin/env", "DSH_WRAPPED=yes"] };
 checks = await dsh.doctorChecks(wrapped, ctxOf(wrapped));
 check("doctor: --dump-config runs through wrap too", levels(checks)["dsh-patch"] === "ok", checks);
@@ -1066,6 +1154,20 @@ check("doctor: --dump-config runs through wrap too", levels(checks)["dsh-patch"]
     run_ad doctor --profile ds-sbx
     [[ "$OUT" == *"sandbox ds-sbx: native"* && "$OUT" == *"writer workspace-write, reviewer read-only"* ]]
     verdict "C2 doctor: sandbox native is checked and named (workspace-write for writers)" $? "$OUT"
+    run_ad doctor --profile ds-key
+    [[ "$OUT" == *"ok dsh-permissions ds-key: writer danger-full-access, reviewer read-only: --dump-config with DSH_PERMISSION_MODE=read-only shows sandbox-policy read-only"* ]]
+    verdict "C2 doctor: dsh-permissions ok only from the dump (run with the reviewer's DSH_PERMISSION_MODE=read-only)" $? "$OUT"
+    # A user's ~/.dsh/cordis.patch.yml that pins the sandbox row: every reviewer job runs with that mode, and doctor says so.
+    printf -- '- id: sandbox-policy\n  config: {"mode": "danger-full-access"}\n' >"$HOME/.dsh/cordis.patch.yml"
+    rec="$TEST_ROOT/rec-c2l.json"
+    eff="$TEST_ROOT/eff-c2l.json"
+    AGENT_STUB_RECORD="$rec" AGENT_STUB_EFFECTIVE="$eff" finish --profile ds-rev --prompt-file "$prompt"
+    [[ "$ST" == completed && "$(ffield "$rec" env.DSH_PERMISSION_MODE)" == read-only && "$(ffield "$eff" permissionMode)" == danger-full-access ]]
+    verdict "C2 the stub models the layer: a reviewer job gets DSH_PERMISSION_MODE=read-only, yet runs danger-full-access" $? "st=$ST eff=$(ffield "$eff" permissionMode)"
+    run_ad doctor --profile ds-rev
+    [[ "$RC" -eq 1 && "$OUT" == *"FAIL dsh-permissions ds-rev: writer danger-full-access, reviewer NOT read-only:"*"sandbox-policy danger-full-access"*"$HOME/.dsh/cordis.patch.yml"* ]]
+    verdict "C2 doctor: that layer → FAIL dsh-permissions naming the file, exit 1" $? "rc=$RC" "$OUT"
+    rm -f "$HOME/.dsh/cordis.patch.yml"
 
     # --- C3. doctor --probe: one read-only PONG turn, no web tools ---
     rec="$TEST_ROOT/rec-c3.json"

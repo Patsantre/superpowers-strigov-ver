@@ -6,8 +6,9 @@
 //
 // Auth modes (spec §3.4, §3.6 A1–A2):
 //   login — the user's config dir ($CLAUDE_CONFIG_DIR as inherited, else ~/.claude; "home": "isolated" uses
-//           homes/<p>/claude instead, where the user logs in through `agent-dispatch profile env <p>`), `--setting-sources
-//           user`, every inherited ANTHROPIC_* removed;
+//           homes/<p>/claude instead, where the user logs in through `agent-dispatch profile env <p> -- claude`),
+//           `--setting-sources user`, every inherited ANTHROPIC_* removed; a settings.json in that dir that would take the run off the
+//           login (a key, an apiKeyHelper, an endpoint, a cloud provider) refuses the profile (loginOverrides);
 //   key   — homes/<p>/claude, never a claude.ai login, `--setting-sources ""`, exactly one key variable: ANTHROPIC_AUTH_TOKEN
 //           (Bearer) or, with "authHeader": "x-api-key", ANTHROPIC_API_KEY; the other one is "" [01 §6, gotcha 2].
 //           ANTHROPIC_BASE_URL is the profile's endpoint (none: the Anthropic API itself);
@@ -16,8 +17,9 @@
 // CLAUDE_CODE_ENTRYPOINT / CLAUDECODE are removed [01 E23].
 //
 // Per job the adapter writes <job>/settings.json, the --settings overlay (the §3.6 Б settings, then options.settings,
-// then group A again — for a reviewer also the allow rules past its four git commands, dropped from the overlay or,
-// from a login profile's user settings, denied, and no sandbox auto-allow), and <job>/system.md, the headless preamble
+// then group A again — for a reviewer also deny rules for the git options that write or run programs, the allow rules
+// past its four git commands, dropped from the overlay or, from a login profile's user settings, denied, and no
+// sandbox auto-allow), and <job>/system.md, the headless preamble
 // plus the project's CLAUDE.md, passed with one --append-system-prompt-file (§3.6 A6). The overlay lives in the job
 // dir, not in homes/<p>/settings.json as §3.6 A1 sketches: its content depends on the role, the sandbox and the
 // profile snapshot, and parallel jobs of one profile would race on a shared file. The prompt goes on stdin; its 10 MB
@@ -25,7 +27,7 @@
 
 import os from "node:os";
 import path from "node:path";
-import { buildEnv } from "../agent-core.mjs";
+import { buildEnv, UsageError } from "../agent-core.mjs";
 
 const KEY_VARS = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"];
 // Local servers accept any key [08 §5]; this value is never a credential.
@@ -39,10 +41,34 @@ const REVIEWER_TOOLS = "Read,Glob,Grep,Bash";
 // The only commands a reviewer runs (spec §3.6 A4).
 const REVIEWER_GIT = ["git show", "git diff", "git log", "git status"];
 const REVIEWER_ALLOWED = REVIEWER_GIT.map((command) => `Bash(${command}:*)`);
+// The allow rules are prefixes: they also take the options of those commands that write files or run programs, so a
+// reviewer's overlay denies them. A deny rule wins over an allow rule from any source, and `*` matches any text, also
+// inside a rule (Claude Code permission docs; not an experiment in [01]). git takes these options only as written (no
+// abbreviation; --output as `--output=<f>` or `--output <f>`; git 2.50), so each rule covers every spelling git
+// accepts. A quoted or escaped one (`--out''put=f`) passes: the rules match the command's text.
+const REVIEWER_DENY = [
+  "Bash(git *--output*)", // writes the diff to a file (show, diff, log, diff-tree)
+  "Bash(git *--ext-diff*)", // runs the external diff program of the git config
+  "Bash(git *--textconv*)", // runs the textconv filters of the git config
+  "Bash(git *--no-index*)", // diffs any two files of the machine, outside the repository
+  "Bash(git difftool*)", // `git diff:*` read as a plain prefix would take it; --extcmd runs any command
+];
 const VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 // Environment names the adapter owns in every mode; options.settings.env cannot set them (group A).
 const OWNED_ENV = ["CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL", ...KEY_VARS, "CLAUDE_CODE_ENTRYPOINT", "CLAUDECODE", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"];
 const SANDBOX_OWNED = ["enabled", "failIfUnavailable", "allowUnsandboxedCommands", "autoAllowBashIfSandboxed"];
+// What takes a login profile's runs off the claude.ai login when its config dir's settings.json sets it (spec §3.6
+// A2): claude puts a cloud provider, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY and an apiKeyHelper before the login, and
+// ANTHROPIC_BASE_URL sends the login's token to another endpoint [01 §6]. `--setting-sources user` applies that file's
+// env and apiKeyHelper [01 §9, E18], past the removal of the inherited ANTHROPIC_* (planOf).
+const LOGIN_OVERRIDES = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"];
+// ANTHROPIC_CUSTOM_HEADERS adds "Name: value" lines to every request [01 §5]; an Authorization or x-api-key line is a
+// credential as well.
+const AUTH_HEADER_RE = /^\s*(authorization|x-api-key)\s*:/im;
+// authMethod values of `claude auth status --json` for a key, not a claude.ai login: api_key (ANTHROPIC_API_KEY, spec
+// §3.6 A1), api_key_helper [01 E20]. oauth_token is ANTHROPIC_AUTH_TOKEN [01 E20], perhaps also a CLAUDE_CODE_OAUTH_TOKEN
+// of `claude setup-token` (a subscription token; not recorded in [01]): doctor warns on it.
+const KEY_METHODS = ["api_key", "api_key_helper"];
 // The project instructions claude itself loads only with the `project` setting source [01 §9, E17].
 const PROJECT_FILES = ["CLAUDE.md", path.join(".claude", "CLAUDE.md")];
 // A 429 is a quota only by the provider's words [01 §11]; otherwise it is a rate limit.
@@ -112,6 +138,26 @@ const allowRulesOf = (settings) => {
   return Array.isArray(allow) ? allow.filter((rule) => typeof rule === "string") : [];
 };
 
+// The entries of a login profile's user settings that would take its runs off the login (LOGIN_OVERRIDES). The
+// profile is refused rather than the entries overridden: the user set them for their own claude, and a "login" profile
+// running on such a key would be reported and linked as the login (spec §3.5) while the key's account pays.
+function loginOverrides(settings) {
+  const isSet = (value) => value !== undefined && value !== null && String(value) !== "";
+  const env = isObject(settings.env) ? settings.env : {};
+  const keys = LOGIN_OVERRIDES.filter((name) => isSet(env[name])).map((name) => `env.${name}`);
+  if (typeof env.ANTHROPIC_CUSTOM_HEADERS === "string" && AUTH_HEADER_RE.test(env.ANTHROPIC_CUSTOM_HEADERS)) keys.push("env.ANTHROPIC_CUSTOM_HEADERS");
+  if (isSet(settings.apiKeyHelper)) keys.push("apiKeyHelper");
+  return keys;
+}
+
+// Why a login profile cannot run on its config dir (task exit 2, doctor FAIL); null for every other profile.
+function loginConflict(profile, ctx, profileName = ctx.profileName, settings = userSettingsOf(profile, ctx, profileName)) {
+  const keys = loginOverrides(settings);
+  if (keys.length === 0) return null;
+  const file = path.join(configDirOf(profile, ctx, profileName), "settings.json");
+  return `${file} sets ${keys.join(", ")}: claude would use that key or endpoint instead of the claude.ai login (spec §3.6 A2); remove them there, or define an API profile for the key`;
+}
+
 // profile.env CLAUDE_CODE_EFFORT_LEVEL wins over the effort field (§3.6 A7: a copied provider recipe).
 function effortOf(profile) {
   const fromEnv = isObject(profile.env) ? text(profile.env.CLAUDE_CODE_EFFORT_LEVEL) : null;
@@ -139,18 +185,16 @@ function overlayOf({ profile, mode, keyVar, writer, reviewer, native, effort, op
   if (api) settings = { ...settings, permissions: { deny: ["WebSearch", "WebFetch"] }, skipWebFetchPreflight: true };
   if (isObject(options.settings)) settings = merge(settings, options.settings);
   if (reviewer) {
-    // §3.6 A4 against allow rules: options.settings ones that widen are dropped; the user settings' ones (a login
-    // profile) cannot be, so each gets a deny rule — deny wins over allow from any source (Claude Code permission
-    // docs; not an experiment in [01]). A broad user rule (`Bash`, `Bash(git:*)`) so also denies the git commands.
+    // §3.6 A4: the git options that write or run programs are denied (REVIEWER_DENY). Against allow rules:
+    // options.settings ones that widen are dropped; the user settings' ones (a login profile) cannot be, so each gets
+    // a deny rule — deny wins over allow from any source (Claude Code permission docs; not an experiment in [01]). A
+    // broad user rule (`Bash`, `Bash(git:*)`) so also denies the git commands.
     const permissions = isObject(settings.permissions) ? { ...settings.permissions } : {};
     if (Array.isArray(permissions.allow)) permissions.allow = permissions.allow.filter((rule) => !widensReviewer(rule));
     if (permissions.allow?.length === 0) delete permissions.allow;
-    if (userWidening.length > 0) {
-      const deny = Array.isArray(permissions.deny) ? permissions.deny : [];
-      permissions.deny = [...new Set([...deny, ...userWidening])];
-    }
-    if (Object.keys(permissions).length > 0) settings.permissions = permissions;
-    else delete settings.permissions;
+    const deny = Array.isArray(permissions.deny) ? permissions.deny : [];
+    permissions.deny = [...new Set([...deny, ...REVIEWER_DENY, ...userWidening])];
+    settings.permissions = permissions;
     // A sandbox enabled by options.settings or the user settings auto-allows Bash by default (Claude Code sandbox
     // docs): off for a reviewer, like the native case below. --settings outranks the user settings [01 §9].
     if (!native && (isObject(settings.sandbox) || userSandbox)) {
@@ -185,7 +229,7 @@ const PREAMBLE = `# Headless run
 
 You run non-interactively for agent-dispatch: no one reads your messages while you work, and no one can answer a question. Never ask for confirmation or clarification; make a reasonable decision, carry on, and state your assumptions in the final message.
 Your final message is returned verbatim as the result of this task: put the complete report there, in the format the prompt asks for.`;
-const REVIEWER_LINE = "Your tools are read-only: Read, Glob, Grep, and Bash for `git show`, `git diff`, `git log` and `git status` only; any other call is denied. Do not try to change files.";
+const REVIEWER_LINE = "Your tools are read-only: Read, Glob, Grep, and Bash for `git show`, `git diff`, `git log` and `git status` only, without --output, --ext-diff, --textconv or --no-index; any other call is denied. Do not try to change files.";
 
 // The preamble plus the project's CLAUDE.md files, which `--setting-sources ""` / `user` drop [01 §9, gotcha 9].
 // @path imports and the CLAUDE.md files of subdirectories are not expanded: only these files, as written.
@@ -201,12 +245,19 @@ function systemPromptOf({ cwd, reviewer, ctx }) {
 
 // ---------- invocation ----------
 
-// invocation() and probe(): pure — the files are data the core writes, CLAUDE.md is read through ctx.fs.
-function planOf(req, ctx, { probe }) {
+// invocation() and probe(): pure — the files are data the core writes, CLAUDE.md and the user settings are read
+// through ctx.fs. `refuse: false` (doctor's auth check) plans a login profile whose user settings leave the login.
+function planOf(req, ctx, { probe, refuse = true }) {
   const profile = req.profile ?? {};
   const { mode, keyVar } = authOf(profile);
   if (mode === "none" && !profile.endpoint) {
     throw new Error('auth "none" needs an endpoint (the local server\'s URL); without one claude would call api.anthropic.com');
+  }
+  // {} for an API profile: it loads no settings source.
+  const user = userSettingsOf(profile, ctx, req.profileName);
+  if (refuse && mode === "login") {
+    const conflict = loginConflict(profile, ctx, req.profileName, user);
+    if (conflict) throw new UsageError(`profile ${req.profileName ?? ctx.profileName}: ${conflict}`);
   }
   const options = isObject(profile.options) ? profile.options : {};
   const writer = !probe && req.write === true;
@@ -215,9 +266,8 @@ function planOf(req, ctx, { probe }) {
   const effort = effortOf(profile);
   const settingsPath = path.join(req.job.dir, "settings.json");
   const systemPath = path.join(req.job.dir, "system.md");
-  const user = reviewer ? userSettingsOf(profile, ctx, req.profileName) : {};
-  const userWidening = allowRulesOf(user).filter(widensReviewer);
-  const userSandbox = isObject(user.sandbox);
+  const userWidening = reviewer ? allowRulesOf(user).filter(widensReviewer) : [];
+  const userSandbox = reviewer && isObject(user.sandbox);
 
   // §3.6 A4: a writer runs everything (acceptEdits inside the native sandbox, §3.7); a reviewer gets read tools and the
   // four git commands, and dontAsk denies the rest (allow rules that would widen it: overlayOf). Without a mode `-p`
@@ -390,7 +440,8 @@ function authStatus(profile, ctx, env, cwd) {
 }
 
 // spec §3.6 A1: an API profile's dir holds no login (without a key claude must report loggedIn false) and claude uses
-// the key variable (with a placeholder in it: oauth_token or api_key). A login profile must be logged in.
+// the key variable (with a placeholder in it: oauth_token or api_key). A login profile must be logged in, and claude
+// must take that login, not a key (spec §3.6 A2).
 function authChecks(profile, ctx) {
   const check = (level, hint) => ({ name: "auth-status", level, hint });
   const { mode, keyVar } = authOf(profile);
@@ -408,7 +459,8 @@ function authChecks(profile, ctx) {
     harness: null,
   };
   const home = prepareHome(profile, ctx);
-  const inv = planOf(req, ctx, { probe: false });
+  // Not refused here: the user-settings row names what leaves the login, and auth status shows what claude takes.
+  const inv = planOf(req, ctx, { probe: false, refuse: false });
   const isDir = (candidate) => Boolean(candidate && ctx.fs.stat?.(candidate)?.isDirectory?.());
   const cwd = [ctx.paths.root, dir].find(isDir) ?? null;
   const authStatusWith = (env) => authStatus(profile, ctx, env, cwd);
@@ -423,9 +475,17 @@ function authChecks(profile, ctx) {
   if (mode === "login") {
     const { status, error } = authStatusWith(envWith({}));
     if (error) return check("WARN", `the login was not checked: ${error}`);
-    if (status.loggedIn === true) return check("ok", `logged in (authMethod ${status.authMethod ?? "?"}) in ${dir}`);
-    const how = usesUserDir(profile) ? "claude, then /login" : `eval "$(agent-dispatch profile env ${name})", then claude and /login`;
-    return check("FAIL", `claude is not logged in in ${dir} (authMethod ${status.authMethod ?? "?"}); the user logs in: ${how}`);
+    const method = status.authMethod ?? "?";
+    const taken = `authMethod ${method}, apiKeySource ${status.apiKeySource ?? "?"}`;
+    if (status.loggedIn === true && KEY_METHODS.includes(method)) {
+      return check("FAIL", `claude takes a key in ${dir}, not the claude.ai login (${taken}); a login profile runs on the login (spec §3.6 A2): remove the key or apiKeyHelper from the settings that set it, or define an API profile for it`);
+    }
+    if (status.loggedIn === true && method === "oauth_token") {
+      return check("WARN", `claude takes a token variable in ${dir}, not the claude.ai login (${taken}): ANTHROPIC_AUTH_TOKEN would be a key; a CLAUDE_CODE_OAUTH_TOKEN of claude setup-token is a subscription token`);
+    }
+    if (status.loggedIn === true) return check("ok", `logged in (authMethod ${method}) in ${dir}`);
+    const how = usesUserDir(profile) ? "claude, then /login" : `agent-dispatch profile env ${name} -- claude, then /login`;
+    return check("FAIL", `claude is not logged in in ${dir} (authMethod ${method}); the user logs in: ${how}`);
   }
   const bare = authStatusWith(envWith({ ANTHROPIC_AUTH_TOKEN: null, ANTHROPIC_API_KEY: null }));
   if (bare.error) return check("WARN", `the profile dir was not checked: ${bare.error}`);
@@ -531,23 +591,28 @@ export default {
     launch: ["unknown option", "requires --verbose"],
   },
 
-  // `agent-dispatch profile env <p>` for a login profile with "home": "isolated".
-  loginEnv(profile, ctx) {
-    return { CLAUDE_CONFIG_DIR: path.join(ctx.paths.homes, ctx.profileName, "claude") };
-  },
+  // `agent-dispatch profile env <p>` (a login profile with "home": "isolated") exports prepareHome's env: no loginEnv.
 
   doctorChecks(profile, ctx) {
     const checks = [];
-    try {
-      checks.push(authChecks(profile, ctx));
-    } catch (error) {
-      checks.push({ name: "auth-status", level: "WARN", hint: `not checked: ${error?.message ?? error}` });
-    }
     let mode = null;
     try {
       mode = authOf(profile).mode;
     } catch {
       mode = null;
+    }
+    if (mode === "login") {
+      try {
+        const conflict = loginConflict(profile, ctx);
+        if (conflict) checks.push({ name: "user-settings", level: "FAIL", hint: `${conflict}; every task is refused` });
+      } catch (error) {
+        checks.push({ name: "user-settings", level: "WARN", hint: `not checked: ${error?.message ?? error}` });
+      }
+    }
+    try {
+      checks.push(authChecks(profile, ctx));
+    } catch (error) {
+      checks.push({ name: "auth-status", level: "WARN", hint: `not checked: ${error?.message ?? error}` });
     }
     if (mode !== "login" && profile.endpoint && !profile.model) {
       checks.push({ name: "model", level: "WARN", hint: `no model: claude would send its own claude-* model ids to ${profile.endpoint}; set "model" (it also pins ANTHROPIC_DEFAULT_*_MODEL)` });

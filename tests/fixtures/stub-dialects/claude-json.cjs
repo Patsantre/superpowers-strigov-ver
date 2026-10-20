@@ -237,6 +237,8 @@ function credentialOf(env, { helper, dir }) {
 // bypassPermissions; otherwise it is denied: dontAsk, and in -p default / acceptEdits, where no one answers the prompt
 // [01 E14]. The matcher is a simplification: `Bash` / `Bash(*)` match everything, `Bash(<prefix>:*)` the prefix as a
 // word, `*` elsewhere any text (`Bash(git diff *)` also the bare `git diff`), anything else the exact command.
+// AGENT_STUB_PLAIN_PREFIX=1 reads `Bash(<prefix>:*)` as a plain text prefix (`Bash(git diff:*)` then also takes `git
+// difftool`): a claude that matches the legacy syntax without a word boundary (not an experiment in [01]).
 const listOf = (settings, kind) => (isObject(settings.permissions) && Array.isArray(settings.permissions[kind]) ? settings.permissions[kind].filter((rule) => typeof rule === "string") : []);
 const escapeRe = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -245,7 +247,10 @@ function bashMatches(rule, command) {
   if (!match) return false;
   const body = match[1];
   if (body === undefined || body === "*") return true;
-  if (body.endsWith(":*")) return command === body.slice(0, -2) || command.startsWith(`${body.slice(0, -2)} `);
+  if (body.endsWith(":*")) {
+    const prefix = body.slice(0, -2);
+    return command === prefix || command.startsWith(process.env.AGENT_STUB_PLAIN_PREFIX === "1" ? prefix : `${prefix} `);
+  }
   if (body.includes("*")) return new RegExp(`^${body.split("*").map(escapeRe).join(".*")}$`, "s").test(command) || (body.endsWith(" *") && command === body.slice(0, -2));
   return command === body;
 }

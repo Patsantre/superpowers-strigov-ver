@@ -215,9 +215,9 @@ main() {
     unset AGENT_TEST_BOOT_ID AGENT_DISPATCH_ADAPTER_DIR CLAUDE_CONFIG_DIR WRAPPED
     unset AGENT_STUB_MODE AGENT_STUB_RECORD AGENT_STUB_DELAY_MS AGENT_STUB_MESSAGE AGENT_STUB_CLASS AGENT_STUB_EXIT AGENT_STUB_RESPONSE
     unset AGENT_STUB_SECRET_VAR AGENT_STUB_PIDS AGENT_STUB_SIGNALS AGENT_STUB_VERSION AGENT_STUB_HELP_DROP AGENT_STUB_CALL_LOG
-    unset AGENT_STUB_AUTH AGENT_STUB_AUTH_LOG AGENT_STUB_HELP_EXIT
+    unset AGENT_STUB_AUTH AGENT_STUB_AUTH_LOG AGENT_STUB_HELP_EXIT AGENT_STUB_STDERR_LINES
     export AGENT_STUB_DIALECT=pi-jsonl
-    export AGENT_ENV_PASSTHROUGH="AGENT_STUB_DIALECT,AGENT_STUB_MODE,AGENT_STUB_RECORD,AGENT_STUB_DELAY_MS,AGENT_STUB_MESSAGE,AGENT_STUB_EXIT,AGENT_STUB_RESPONSE,AGENT_STUB_SECRET_VAR,AGENT_STUB_PIDS,AGENT_STUB_SIGNALS,AGENT_STUB_VERSION,AGENT_STUB_HELP_DROP,AGENT_STUB_AUTH,AGENT_STUB_AUTH_LOG"
+    export AGENT_ENV_PASSTHROUGH="AGENT_STUB_DIALECT,AGENT_STUB_MODE,AGENT_STUB_RECORD,AGENT_STUB_DELAY_MS,AGENT_STUB_MESSAGE,AGENT_STUB_EXIT,AGENT_STUB_RESPONSE,AGENT_STUB_SECRET_VAR,AGENT_STUB_PIDS,AGENT_STUB_SIGNALS,AGENT_STUB_VERSION,AGENT_STUB_HELP_DROP,AGENT_STUB_AUTH,AGENT_STUB_AUTH_LOG,AGENT_STUB_STDERR_LINES"
     # The caller's environment carries a pi home and provider credentials: none of them may reach a keyed profile.
     export PI_CODING_AGENT_DIR="$TEST_ROOT/user-pi"
     export OPENAI_API_KEY="caller-openai-key-1" ZAI_API_KEY="caller-zai-key-2" ANTHROPIC_BASE_URL="https://caller.example"
@@ -255,6 +255,8 @@ main() {
     "pi-ext": { $login, "options": { "extensions": ["builtin:llama.cpp", "$EXT"] } },
     "pi-ext-bad": { $login, "options": { "extensions": ["$TEST_ROOT/ext/missing.ts"] } },
     "pi-ext-rel": { $login, "options": { "extensions": ["ext/provider.ts"] } },
+    "pi-ext-typo": { $login, "options": { "extensions": ["builtin:llamacpp"] } },
+    "pi-key-fast": { $zai, "timeoutMin": 0.02 },
     "pi-native": { $zai, "sandbox": "native" },
     "pi-offline0": { $zai, "env": { "PI_OFFLINE": "0" } },
     "pi-clash-home": { $zai, "env": { "PI_CODING_AGENT_DIR": "$TEST_ROOT/elsewhere" } },
@@ -277,11 +279,11 @@ EOF
     # --- 1. the adapter contract (spec §3.2) and its loading by the CLI ---
     got="$(pi_js 'const m = pi.manifest;
 console.log(JSON.stringify([pi.id, pi.idPrefix, m.sessionId, m.sessionIdFormat, m.cancel.ladder, m.helpArgv, m.requiredFlags, m.homeEnv, m.verifiedVersions,
-  ["discover", "prepareHome", "invocation", "probe", "reduce", "finalize", "resumeCheck", "doctorChecks", "loginEnv"].every((k) => typeof pi[k] === "function"),
+  ["discover", "prepareHome", "invocation", "probe", "reduce", "finalize", "scrub", "resumeCheck", "doctorChecks"].every((k) => typeof pi[k] === "function"), "loginEnv" in pi,
   Object.keys(pi.patterns).sort()]));')"
-    want='["pi","pi","preassign","job-id",[["SIGTERM",5000],["SIGKILL",0]],["--help"],["--mode","--session-dir","--session-id","--no-approve","--no-mcp","--tools"],["PI_CODING_AGENT_DIR"],["1.3.0"],true,["auth","blocked","context","launch","model-not-selected","quota","rate-limit","resume-lost","server"]]'
+    want='["pi","pi","preassign","job-id",[["SIGTERM",5000],["SIGKILL",0]],["--help"],["--mode","--session-dir","--session-id","--no-approve","--no-mcp","--tools"],["PI_CODING_AGENT_DIR"],["1.3.0"],true,false,["auth","blocked","context","launch","model-not-selected","quota","rate-limit","resume-lost","server"]]'
     [[ "$got" == "$want" ]]
-    verdict "1 contract: id/prefix pi, preassigned job-id session, ladder SIGTERM 5 s → SIGKILL (no SIGINT), required flags, home var, every hook" $? "got:  $got" "want: $want"
+    verdict "1 contract: id/prefix pi, preassigned job-id session, ladder SIGTERM 5 s → SIGKILL (no SIGINT), required flags, home var, every hook (scrub too; no loginEnv: profile env exports prepareHome's env)" $? "got:  $got" "want: $want"
     got="$(CLI="$CLI" node --input-type=module -e "
 const { pathToFileURL } = await import('node:url');
 const cli = await import(pathToFileURL(process.env.CLI).href);
@@ -317,14 +319,29 @@ console.log(a?.id, a?.idPrefix);")"
     [[ "$st" == completed/ && "$got" == "$want" ]]
     verdict "2 reviewer (no --write): --tools read,grep,find,ls — no bash, so no git; --no-mcp keeps MCP tools out" $? "st: $st" "got:  $got" "want: $want"
 
-    start AGENT_STUB_RECORD="$TEST_ROOT/rec/key-user.json" -- --profile pi-key-user --prompt-file "$prompt"
+    # pi prefers a credential it stores itself (auth.json) to the key in keyVar [03 §6]: a keyed profile runs only in its
+    # isolated home, and only while that home holds no auth.json.
+    n="$(/bin/ls "$JOBS" | wc -l | tr -d ' ')"
+    : >"$TEST_ROOT/rec/key-user.json"
+    run_env AGENT_STUB_RECORD="$TEST_ROOT/rec/key-user.json" -- task --profile pi-key-user --background --prompt-file "$prompt"
+    [[ "$RC" -eq 2 && "$OUT" == "" && "$ERR" == "agent-dispatch: profile pi-key-user: a keyed pi profile runs only in its isolated home (the default with a key): in $TEST_ROOT/user-pi a credential pi stored itself (auth.json, /login) would win over ZAI_API_KEY; remove \"home\": \"user\"" \
+        && "$(/bin/ls "$JOBS" | wc -l | tr -d ' ')" == "$n" && ! -s "$TEST_ROOT/rec/key-user.json" && ! -d "$STATE/homes/pi-key-user" ]]
+    verdict "2 auth key + home user: refused (exit 2, no job, pi never started) — a credential in the user's pi home would win over the key" $? "rc=$RC err: $ERR"
+    printf '{}\n' >"$STATE/homes/pi-key/pi/auth.json"
+    run_ad task --profile pi-key --background --prompt-file "$prompt"
+    ok=$RC
+    got="$ERR"
+    line="$(/bin/ls "$JOBS" | wc -l | tr -d ' ')"
+    rm -f "$STATE/homes/pi-key/pi/auth.json"
+    start -- --profile pi-key --prompt-file "$prompt"
     st="$(outcome "$ID")"
-    rec="$TEST_ROOT/rec/key-user.json"
-    start -u PI_CODING_AGENT_DIR AGENT_STUB_RECORD="$TEST_ROOT/rec/key-user2.json" -- --profile pi-key-user --prompt-file "$prompt"
-    got="$(outcome "$ID")"
-    [[ "$st" == completed/ && "$got" == completed/ && "$(jfield env.PI_CODING_AGENT_DIR <"$rec")" == "$TEST_ROOT/user-pi" && "$(jfield env.ZAI_API_KEY <"$rec")" == "$ZKEY" \
-        && "$(env_names "$TEST_ROOT/rec/key-user2.json" '^PI_CODING_AGENT_DIR$')" == "" && ! -d "$STATE/homes/pi-key-user" ]]
-    verdict "2 auth key + home user: the caller's PI_CODING_AGENT_DIR passes (and is absent when unset), no isolated home, the key still in keyVar" $? "st: $st/$got dir: $(jfield env.PI_CODING_AGENT_DIR <"$rec")"
+    [[ "$ok" -eq 2 && "$got" == "agent-dispatch: profile pi-key: $STATE/homes/pi-key/pi/auth.json exists: a credential stored there (pi /login) wins over ZAI_API_KEY; remove that file (a keyed profile needs no login)" \
+        && "$line" == "$n" && "$st" == completed/ ]]
+    verdict "2 auth key + an auth.json in the isolated home (a /login there): refused (exit 2, no job) until the file is gone" $? "rc=$ok err: $got" "after rm: $st"
+    start -u PI_CODING_AGENT_DIR AGENT_STUB_RECORD="$TEST_ROOT/rec/login-unset.json" -- --profile pi-login --prompt-file "$prompt"
+    st="$(outcome "$ID")"
+    [[ "$st" == completed/ && "$(env_names "$TEST_ROOT/rec/login-unset.json" '^PI_CODING_AGENT_DIR$')" == "" && ! -d "$STATE/homes/pi-login" ]]
+    verdict "2 home user with the caller's PI_CODING_AGENT_DIR unset: none in the harness env (pi's default ~/.pi/agent), no isolated home" $? "st: $st"
 
     start AGENT_STUB_RECORD="$TEST_ROOT/rec/env.json" -- --profile pi-env --prompt-file "$prompt"
     st="$(outcome "$ID")"
@@ -346,10 +363,11 @@ console.log(a?.id, a?.idPrefix);")"
 
     start AGENT_STUB_RECORD="$TEST_ROOT/rec/login-iso.json" -- --profile pi-login-iso --prompt-file "$prompt"
     st="$(outcome "$ID")"
+    got="$(jfield env.PI_CODING_AGENT_DIR <"$TEST_ROOT/rec/login-iso.json")"
     run_ad profile env pi-login-iso
-    [[ "$st" == completed/ && "$(jfield env.PI_CODING_AGENT_DIR <"$TEST_ROOT/rec/login-iso.json")" == "$STATE/homes/pi-login-iso/pi" && "$RC" -eq 0 \
-        && "$OUT" == "export PI_CODING_AGENT_DIR='$STATE/homes/pi-login-iso/pi'" ]]
-    verdict "2 auth login + home isolated: PI_CODING_AGENT_DIR=homes/<p>/pi, the dir 'profile env' prints for /login" $? "st: $st" "profile env: $OUT"
+    # One source of truth (prepareHome's env): 'profile env' prints the very dir the job ran with.
+    [[ "$st" == completed/ && "$got" == "$STATE/homes/pi-login-iso/pi" && "$RC" -eq 0 && "$OUT" == "export PI_CODING_AGENT_DIR='$got'" ]]
+    verdict "2 auth login + home isolated: PI_CODING_AGENT_DIR=homes/<p>/pi, and 'profile env' prints the same dir the job ran with" $? "st: $st job: $got" "profile env: rc=$RC $OUT $ERR"
 
     start AGENT_STUB_RECORD="$TEST_ROOT/rec/bare.json" -- --profile pi-bare --prompt-file "$prompt"
     st="$(outcome "$ID")"
@@ -407,11 +425,12 @@ console.log(a?.id, a?.idPrefix);")"
     [[ "$st" == completed/ && "$(jfield argv <"$TEST_ROOT/rec/resume1.json")" == "$want" && "$RC" -eq 0 && "$OUT" == "DONE"$'\n'"session $id1 resumed=true prior=3 stdin=37" \
         && "$(job "$id2" sessionId)" == "$id1" && "$(job "$id2" resumeOf)" == "$id1" ]] && ! grep -q 'No project session found' "$JOBS/$id2.log"
     verdict "3 --resume-task: the same --session-dir and --session-id from the same cwd; pi reopens the session (no warning), the job completes" $? "st: $st result: $OUT" "argv: $(jfield argv <"$TEST_ROOT/rec/resume1.json")"
-    start AGENT_STUB_MODE=context-echo AGENT_STUB_RECORD="$TEST_ROOT/rec/resume2.json" -- --profile pi-key --resume-task "$id2" --prompt-file "$prompt"
+    start AGENT_STUB_MODE=context-echo AGENT_STUB_STDERR_LINES=250 AGENT_STUB_RECORD="$TEST_ROOT/rec/resume2.json" -- --profile pi-key --resume-task "$id2" --prompt-file "$prompt"
     st="$(outcome "$ID")"
     run_ad result "$ID"
-    [[ "$st" == completed/ && "$(jfield argv <"$TEST_ROOT/rec/resume2.json")" == *"\"--session-dir\",\"$dir\",\"--session-id\",\"$id1\""* && "$OUT" == *"resumed=true prior=6"* ]]
-    verdict "3 a resumed job resumes again: the chain keeps the first job's session dir and id" $? "st: $st result: $OUT"
+    [[ "$st" == completed/ && "$(jfield argv <"$TEST_ROOT/rec/resume2.json")" == *"\"--session-dir\",\"$dir\",\"--session-id\",\"$id1\""* && "$OUT" == *"resumed=true prior=6"* \
+        && "$(job "$ID" meta.sessionFilesBefore)" == "[\"$(basename "$dir"/*_"$id1".jsonl)\"]" && "$(/bin/ls "$dir" | wc -l | tr -d ' ')" == 1 ]]
+    verdict "3 a resumed job resumes again: the chain keeps the first job's session dir and id; its meta lists the session file it started with, no new one appeared (stderr chatter or not)" $? "st: $st result: $OUT" "before: $(job "$ID" meta.sessionFilesBefore)"
     local chain_last="$ID"
 
     start AGENT_STUB_MODE=lose-session -- --profile pi-key --resume-task "$chain_last" --prompt-file "$prompt"
@@ -419,6 +438,14 @@ console.log(a?.id, a?.idPrefix);")"
     run_ad result "$ID"
     [[ "$st" == failed/resume-lost && "$RC" -eq 1 && "$ERR" == *"errorClass=resume-lost"* && "$(job "$ID" errorText)" == "No project session found with id '$id1'; creating a new session with that id." ]]
     verdict "3 a resume where pi still warns 'No project session found with id …' (it answered in a new session): failed/resume-lost, result exit 1" $? "st: $st err: $(head -1 <<<"$ERR")"
+    # The warning comes at startup; 250 lines of extension chatter push it out of the core's 200-line stderr tail. The
+    # new session file pi created still tells.
+    start AGENT_STUB_MODE=lose-session AGENT_STUB_STDERR_LINES=250 -- --profile pi-key --resume-task "$chain_last" --prompt-file "$prompt"
+    st="$(outcome "$ID")"
+    got="$(job "$ID" errorText)"
+    [[ "$st" == failed/resume-lost && "$got" == "pi started a new session file "*"_$id1.jsonl in $dir instead of resuming session $id1" && "$(/bin/ls "$dir" | wc -l | tr -d ' ')" == 3 \
+        && "$(grep -c '\[extension\] chatter line' "$JOBS/$ID.log")" -ge 250 ]] && grep -q "No project session found with id '$id1'" "$JOBS/$ID.log"
+    verdict "3 a lost resume whose warning fell out of the 200-line stderr tail: still failed/resume-lost, from the new session file pi created" $? "st: $st errorText: $got"
 
     start -- --profile pi-key --prompt-file "$prompt"
     local fresh="$ID"
@@ -534,18 +561,57 @@ const h = JSON.parse(lines[0]); h.cwd = "/somewhere/else"; lines[0] = JSON.strin
     [[ "$st" == failed/timeout ]] && grep -q 'timeout after 1200 ms: SIGTERM, 5000 ms → SIGKILL' "$JOBS/$ID.log"
     verdict "5 timeoutMin: the same ladder stops pi; failed/timeout" $? "st: $st" "$(grep timeout "$JOBS/$ID.log")"
 
-    # --- 6. secrets never in argv, logs, records or results (spec §3.5, §3.6 A11) ---
+    # --- 6. secrets never in argv, logs, records, results or pi's own session files (spec §3.5, §3.6 A11) ---
+    # pi writes each message into its session file as it is (<session dir>/<time>_<id>.jsonl), beyond the core's stream
+    # redaction; after every run the core writes back what the adapter's scrub() returns: those files through the
+    # job's redactor. So outside keys/zai nothing under the data root may hold the key, on any path.
+    # leaks_of <id> — the files under the data root (keys/ aside) that hold the key, once the job's runner finished.
+    leaks_of() {
+        local i=0
+        while ((i < 50)) && ! grep -q "finish $1: " "$JOBS/$1.log" 2>/dev/null; do
+            sleep 0.2
+            i=$((i + 1))
+        done
+        grep -rlF "$ZKEY" "$STATE" | grep -v "^$STATE/keys/" | tr '\n' ' '
+    }
     start AGENT_STUB_MODE=leak-secret AGENT_STUB_SECRET_VAR=ZAI_API_KEY AGENT_STUB_RECORD="$TEST_ROOT/rec/leak.json" -- --profile pi-key --prompt-file "$prompt"
+    local leak="$ID"
+    st="$(outcome "$leak")"
+    run_ad result "$leak"
+    got="$(leaks_of "$leak")"
+    rec="$(/bin/ls "$JOBS/$leak/sessions/"*.jsonl)"
+    [[ "$st" == completed/ && "$OUT" == $'DONE\nkey=<redacted>' && -z "$got" && ! -e "$JOBS/$leak/secret" && "$(jfield argv <"$TEST_ROOT/rec/leak.json")" != *"$ZKEY"* \
+        && "$(grep -c 'key=<redacted>' "$rec")" -ge 1 && "$(mode_of "$rec")" == 644 ]] && grep -q 'leaked: <redacted>' "$JOBS/$leak.log" \
+        && node -e 'for (const l of require("node:fs").readFileSync(process.argv[1], "utf8").split("\n").filter(Boolean)) JSON.parse(l);' -- "$rec"
+    # 644: the mode pi's session file was created with (umask 022 here), kept by the rewrite.
+    verdict "6 a key the model prints is redacted everywhere outside keys/zai: log, record, result and pi's own session file (<redacted>, valid JSONL, its mode kept); the handoff file is gone" $? "st: $st result: $OUT mode: $(mode_of "$rec")" "files with the key: $got"
+    start AGENT_STUB_MODE=context-echo -- --profile pi-key --resume-task "$leak" --prompt-file "$prompt"
     st="$(outcome "$ID")"
     run_ad result "$ID"
-    # pi's own session transcript (<job>/sessions/*.jsonl) records what the model said, so a key the model prints is
-    # there verbatim: the core's redactor covers only what the core writes, and finalize() never sees the key. That
-    # gap is the integration step's (see the report); every file the core writes holds <redacted>.
-    got="$(grep -rlF "$ZKEY" "$STATE" | grep -v "^$STATE/keys/" | grep -v "^$JOBS/[^/]*/sessions/" | tr '\n' ' ')"
-    line="$(grep -rlF "$ZKEY" "$JOBS/$ID/sessions" | wc -l | tr -d ' ')"
-    [[ "$st" == completed/ && "$OUT" == $'DONE\nkey=<redacted>' && -z "$got" && "$line" == 1 && ! -e "$JOBS/$ID/secret" && "$(jfield argv <"$TEST_ROOT/rec/leak.json")" != *"$ZKEY"* ]] \
-        && grep -q 'leaked: <redacted>' "$JOBS/$ID.log"
-    verdict "6 a key the model prints is redacted in the log, the record and the result; outside keys/zai only pi's own session transcript holds it; the handoff file is gone" $? "st: $st result: $OUT" "files: $got transcripts: $line"
+    [[ "$st" == completed/ && "$OUT" == "DONE"$'\n'"session $leak resumed=true prior=3 stdin=37" ]]
+    verdict "6 the redacted session still resumes (pi reads the header's id and cwd, which redaction leaves alone)" $? "st: $st result: $OUT"
+    start AGENT_STUB_MODE=leak-error AGENT_STUB_SECRET_VAR=ZAI_API_KEY -- --profile pi-key --prompt-file "$prompt"
+    st="$(outcome "$ID")"
+    got="$(leaks_of "$ID")"
+    [[ "$st" == failed/server && -z "$got" ]] && grep -qF 'ZAI_API_KEY=<redacted>' "$JOBS/$ID/sessions/"*.jsonl
+    verdict "6 a failed job: the key a bash tool printed (a toolResult entry) is redacted in its session file too" $? "st: $st files with the key: $got"
+    start AGENT_STUB_MODE=leak-hang AGENT_STUB_SECRET_VAR=ZAI_API_KEY AGENT_STUB_RECORD="$TEST_ROOT/rec/leak-hang.json" -- --profile pi-key --prompt-file "$prompt"
+    id1="$ID"
+    wait_file "$TEST_ROOT/rec/leak-hang.json"
+    i=0
+    while ((i < 50)) && ! grep -qF "$ZKEY" "$JOBS/$id1/sessions/"*.jsonl 2>/dev/null; do
+        sleep 0.2
+        i=$((i + 1))
+    done
+    run_ad cancel "$id1"
+    got="$(leaks_of "$id1")"
+    [[ "$OUT" == "cancelled $id1" && "$(job "$id1" status)" == cancelled && -z "$got" ]] && grep -qF 'ZAI_API_KEY=<redacted>' "$JOBS/$id1/sessions/"*.jsonl
+    verdict "6 a cancelled job: its session file is redacted once the runner stopped pi" $? "out: $OUT files with the key: $got"
+    start AGENT_STUB_MODE=leak-hang AGENT_STUB_SECRET_VAR=ZAI_API_KEY -- --profile pi-key-fast --prompt-file "$prompt"
+    st="$(outcome "$ID")"
+    got="$(leaks_of "$ID")"
+    [[ "$st" == failed/timeout && -z "$got" ]] && grep -qF 'ZAI_API_KEY=<redacted>' "$JOBS/$ID/sessions/"*.jsonl
+    verdict "6 a timed-out job: its session file is redacted too" $? "st: $st files with the key: $got"
 
     # --- 7. two read-only jobs at once: distinct sessions ---
     start AGENT_STUB_MODE=slow AGENT_STUB_DELAY_MS=600 AGENT_STUB_RECORD="$TEST_ROOT/rec/par1.json" -- --profile pi-many --prompt-file "$prompt"
@@ -567,13 +633,25 @@ const h = JSON.parse(lines[0]); h.cwd = "/somewhere/else"; lines[0] = JSON.strin
     got="$(tail -1 "$TEST_ROOT/auth.log")"
     [[ "$(jfield argv <<<"$got")" == '["check","--provider","zai","--json"]' && "$(jfield agentDir <<<"$got")" == "$STATE/homes/pi-key/pi" && "$(jfield keyVars <<<"$got")" == '[]' ]]
     verdict "8 the auth check runs 'pi auth check --provider zai --json' in the profile's home, without the key in its environment" $? "$got"
-    run_env AGENT_STUB_AUTH=ready -- doctor --profile pi-key-user
+    : >"$TEST_ROOT/auth.log"
+    run_env AGENT_STUB_AUTH=ready AGENT_STUB_AUTH_LOG="$TEST_ROOT/auth.log" -- doctor --profile pi-key-user
+    ok=$RC
+    got="$OUT"
+    printf '{}\n' >"$STATE/homes/pi-key/pi/auth.json"
+    run_env AGENT_STUB_AUTH=not_ready AGENT_STUB_AUTH_LOG="$TEST_ROOT/auth.log" -- doctor --profile pi-key
+    rm -f "$STATE/homes/pi-key/pi/auth.json"
+    [[ "$ok" -eq 1 && "$got" == *"ok env pi-key-user: no conflict"* \
+        && "$got" == *"FAIL pi-auth pi-key-user: a keyed pi profile runs only in its isolated home (the default with a key): in $TEST_ROOT/user-pi a credential pi stored itself (auth.json, /login) would win over ZAI_API_KEY; remove \"home\": \"user\"; task refuses the profile (exit 2)"* \
+        && "$RC" -eq 1 && "$OUT" == *"FAIL pi-auth pi-key: $STATE/homes/pi-key/pi/auth.json exists: a credential stored there (pi /login) wins over ZAI_API_KEY; remove that file (a keyed profile needs no login); task refuses the profile (exit 2)"* \
+        && ! -s "$TEST_ROOT/auth.log" ]]
+    verdict "8 doctor FAILs a keyed profile that task refuses — home user, an auth.json in its isolated home — without running pi" $? "home user rc=$ok: $(grep -E 'pi-auth|env' <<<"$got")" "auth.json rc=$RC: $(grep pi-auth <<<"$OUT")"
+    run_env AGENT_STUB_AUTH=ready -- doctor --profile pi-key
     ok=$RC
     got="$OUT"
     run_env AGENT_STUB_AUTH=invalid -- doctor --profile pi-key
-    [[ "$ok" -eq 0 && "$got" == *"WARN pi-auth pi-key-user: pi already holds a credential for zai in $TEST_ROOT/user-pi (api_key); pi prefers it to the key in ZAI_API_KEY"*'use "home": "isolated"'* \
+    [[ "$ok" -eq 1 && "$got" == *"FAIL pi-auth pi-key: pi already holds a credential for zai in $STATE/homes/pi-key/pi (api_key); pi prefers it to the key in ZAI_API_KEY, so the key from agent-dispatch is not used — remove it from $STATE/homes/pi-key/pi (the provider's apiKey in models.json)"* \
         && "$RC" -eq 1 && "$OUT" == *"FAIL pi-auth pi-key: pi holds an invalid credential for zai"* ]]
-    verdict "8 a credential pi holds itself overrides our key: WARN (ready), FAIL (invalid)" $? "ready rc=$ok: $(grep pi-auth <<<"$got")" "invalid rc=$RC: $(grep pi-auth <<<"$OUT")"
+    verdict "8 a credential pi reports for a keyed profile (auth check ready or invalid) overrides our key: FAIL" $? "ready rc=$ok: $(grep pi-auth <<<"$got")" "invalid rc=$RC: $(grep pi-auth <<<"$OUT")"
     run_env AGENT_STUB_AUTH=ready -- doctor --profile pi-login
     ok=$RC
     got="$OUT"
@@ -584,8 +662,8 @@ const h = JSON.parse(lines[0]); h.cwd = "/somewhere/else"; lines[0] = JSON.strin
     rm -rf "$STATE/homes/pi-login-iso"
     : >"$TEST_ROOT/auth.log"
     run_env AGENT_STUB_AUTH=ready AGENT_STUB_AUTH_LOG="$TEST_ROOT/auth.log" -- doctor --profile pi-login-iso
-    [[ "$RC" -eq 1 && "$OUT" == *"FAIL pi-auth pi-login-iso: the isolated home $STATE/homes/pi-login-iso/pi does not exist yet"*"eval \"\$(agent-dispatch profile env pi-login-iso)\"; pi, then /login openai"* && ! -s "$TEST_ROOT/auth.log" ]]
-    verdict "8 a login profile with a missing isolated home: FAIL with the profile env hint, pi not even run" $? "rc=$RC $(grep pi-auth <<<"$OUT")"
+    [[ "$RC" -eq 1 && "$OUT" == *"FAIL pi-auth pi-login-iso: the isolated home $STATE/homes/pi-login-iso/pi does not exist yet"*"the user logs in: agent-dispatch profile env pi-login-iso -- pi, then /login openai"* && ! -s "$TEST_ROOT/auth.log" ]]
+    verdict "8 a login profile with a missing isolated home: FAIL with the 'profile env P -- pi' hint (no eval), pi not even run" $? "rc=$RC $(grep pi-auth <<<"$OUT")"
     run_ad doctor --profile pi-fdrg
     ok=$RC
     got="$OUT"
@@ -602,6 +680,14 @@ const h = JSON.parse(lines[0]); h.cwd = "/somewhere/else"; lines[0] = JSON.strin
     [[ "$ok" -eq 0 && "$got" == *"ok pi-extension pi-ext: -e builtin:llama.cpp -e $EXT"* && "$n" -eq 1 && "$line" == *"FAIL pi-extension pi-ext-bad: $TEST_ROOT/ext/missing.ts does not exist"* \
         && "$RC" -eq 0 && "$OUT" == *"WARN pi-extension pi-ext-rel: ext/provider.ts is not checked"* ]]
     verdict "8 doctor checks options.extensions: present → ok, a missing absolute path → FAIL, a relative one → WARN" $? "rc: $ok $n $RC" "$(grep -h extension <<<"$got"$'\n'"$line"$'\n'"$OUT")"
+    run_env AGENT_STUB_AUTH=ready -- doctor --profile pi-ext-typo
+    ok=$RC
+    got="$OUT"
+    start -- --profile pi-ext-typo --prompt-file "$prompt"
+    st="$(outcome "$ID")"
+    [[ "$ok" -eq 0 && "$got" == *"WARN pi-extension pi-ext-typo: builtin:llamacpp is not one of pi's built-in extensions (builtin:mcp, builtin:llama.cpp, builtin:codemode, builtin:tool-search); pi would stop with \"Failed to load extension\""* \
+        && "$got" != *"ok pi-extension"* && "$st" == failed/launch ]] && grep -q 'Failed to load extension "builtin:llamacpp": unknown built-in extension' "$JOBS/$ID.log"
+    verdict "8 an unknown builtin: extension (a typo) → WARN naming pi's built-in set; the task stops with 'Failed to load extension' (failed/launch, the stub reads the same set)" $? "doctor rc=$ok: $(grep extension <<<"$got")" "task: $st"
     run_ad doctor --profile pi-native
     [[ "$OUT" == *'WARN sandbox pi-native: pi has no sandbox of its own; "sandbox": "native" does nothing — use "wrap"'* ]]
     verdict "8 sandbox native on pi: doctor says it does nothing and points at wrap" $? "$(grep sandbox <<<"$OUT")"
@@ -641,6 +727,11 @@ console.log(lines.length, lines.filter((l) => l.argv[0] !== "check" || l.keyVars
     run_env AGENT_STUB_MODE=quota -- doctor --profile pi-key --probe
     [[ "$RC" -eq 1 && "$(tail -1 <<<"$OUT")" == "FAIL probe pi-key: failed/quota: 429 "*insufficient_quota* ]]
     verdict "8 a failed probe is classified from the events like a job" $? "rc=$RC $(tail -1 <<<"$OUT")"
+    rm -f "$TEST_ROOT/rec/probe-user.json"
+    run_env AGENT_STUB_RESPONSE=PONG AGENT_STUB_RECORD="$TEST_ROOT/rec/probe-user.json" -- doctor --profile pi-key-user --probe
+    # doctor stops at the FAIL row; probe() itself refuses too (section 9).
+    [[ "$RC" -eq 1 && "$OUT" == *"FAIL pi-auth pi-key-user: a keyed pi profile runs only in its isolated home"* && "$OUT" != *"ok probe"* && ! -e "$TEST_ROOT/rec/probe-user.json" ]]
+    verdict "8 doctor --probe on a keyed profile task refuses: FAIL, no PONG from a credential pi holds itself, pi not started" $? "rc=$RC out: $(tail -2 <<<"$OUT") err: $ERR"
 
     # --- 9. the pure hooks, called directly ---
     got="$(pi_js 'const ev = [
@@ -693,6 +784,49 @@ console.log(JSON.stringify([
     [[ "$got" == '[null,{"ok":false,"response":null,"errorClass":"resume-lost","errorText":"No project session found with id '"'"'pi-0001'"'"'; creating a new session with that id."},null]' ]]
     verdict "9 finalize: the lost-session warning means resume-lost only for a resumed job" $? "got: $got"
 
+    # Without the warning (gone from the 200-line tail): a session file of this id and cwd that was not there when the
+    # job started (meta.sessionFilesBefore) is the new session pi started instead.
+    got="$(pi_js 'const head = (cwd) => JSON.stringify({ type: "session", version: 3, id: "pi-0001", cwd }) + "\n{}\n";
+const [f0, f1, f2] = ["2026-10-21T00-00-00-000Z_pi-0001.jsonl", "2026-10-21T01-00-00-000Z_pi-0001.jsonl", "2026-10-21T02-00-00-000Z_pi-0001.jsonl"];
+const files = { "/d": [f2, f0, "notes.txt", f1], [`/d/${f0}`]: head("/w"), [`/d/${f1}`]: head("/w"), [`/d/${f2}`]: head("/elsewhere") };
+const ctx = { fs: { readdir: (d) => files[d] ?? null, readFile: (f) => files[f] ?? null } };
+const job = (before, extra = {}) => ({ cwd: "/w", record: { resumeOf: "pi-0001", sessionId: "pi-0001", meta: { sessionDir: "/d", ...(before ? { sessionFilesBefore: before } : {}) }, ...extra }, io: { stderrTail: "[extension] chatter line 250" } });
+console.log(JSON.stringify([pi.finalize(job([f0]), ctx), pi.finalize(job([f0, f1]), ctx), pi.finalize(job(null), ctx), pi.finalize(job([f0], { resumeOf: null }), ctx), pi.finalize(job([f0]))]));')"
+    want='[{"ok":false,"response":null,"errorClass":"resume-lost","errorText":"pi started a new session file 2026-10-21T01-00-00-000Z_pi-0001.jsonl in /d instead of resuming session pi-0001"},null,null,null,null]'
+    [[ "$got" == "$want" ]]
+    verdict "9 finalize: a new session file of the id and cwd (not in meta.sessionFilesBefore) → resume-lost; one of another cwd, a record without the list, a fresh job → not" $? "got:  $got" "want: $want"
+
+    # scrub(): the session dir's text files that hold a registered value, redacted, with their mode — what the core
+    # writes back (writeAdapterFiles: atomic, the given mode, under the data root). Real files under the run's temp root.
+    got="$(pi_js 'const fs = await import("node:fs");
+const path = await import("node:path");
+const root = fs.mkdtempSync(path.join(process.argv[1], "scrub-"));
+const env = { AGENT_DISPATCH_STATE_DIR: root };
+const key = "zai-key-value-424242", key2 = "q\"uoted\\key-77";
+const dir = path.join(root, "jobs", "pi-0001", "sessions");
+fs.mkdirSync(path.join(dir, "nested"), { recursive: true });
+const put = (name, content, mode) => { const f = path.join(dir, name); fs.writeFileSync(f, content); fs.chmodSync(f, mode); return f; };
+const entry = (text) => JSON.stringify({ type: "message", id: "a1", parentId: null, message: { role: "toolResult", content: [{ type: "text", text }] } });
+const session = put("2026-10-21T00-00-00-000Z_pi-0001.jsonl", [JSON.stringify({ type: "session", version: 3, id: "pi-0001", cwd: "/w" }), entry(`ZAI_API_KEY=${key}\n`), entry(`the other: ${key2}`)].join("\n") + "\n", 0o640);
+const clean = put("other.jsonl", entry("nothing secret") + "\n", 0o600);
+const nested = put("nested/notes.txt", `raw ${key}\n`, 0o600);
+const blob = put("blob.bin", Buffer.concat([Buffer.from([0xff, 0x00]), Buffer.from(key)]), 0o600);
+const inode = (f) => fs.statSync(f).ino;
+const before = [inode(clean), inode(blob)];
+const ctx = { fs: core.makeCtx({ env }).fs, redact: core.redactor([key, key2]) };
+const job = { dir: path.join(root, "jobs", "pi-0001"), record: { meta: { sessionDir: dir } } };
+const plan = pi.scrub(job, ctx);
+core.writeAdapterFiles({ files: plan }, env);
+const text = fs.readFileSync(session, "utf8");
+const holds = (f) => fs.readFileSync(f).includes(key);
+console.log(JSON.stringify([plan.map((e) => [path.relative(dir, e.path), e.mode.toString(8)]), [session, nested].map((f) => (fs.statSync(f).mode & 0o777).toString(8)),
+  holds(session) || holds(nested) || text.includes("uoted"), text.split("<redacted>").length - 1, text.trim().split("\n").every((l) => JSON.parse(l)), fs.readFileSync(nested, "utf8"),
+  [inode(clean), inode(blob)].every((n, i) => n === before[i]), holds(blob),
+  pi.resumeCheck({ id: "pi-0001", cwd: "/w", sessionId: "pi-0001", meta: { sessionDir: dir } }, {}, { job: { cwd: "/w" } }, ctx), pi.scrub(job, ctx), pi.scrub(job, { fs: ctx.fs })]));' "$TEST_ROOT")"
+    want='[[["2026-10-21T00-00-00-000Z_pi-0001.jsonl","640"],["nested/notes.txt","600"]],["640","600"],false,2,true,"raw <redacted>\n",true,true,null,[],[]]'
+    [[ "$got" == "$want" ]]
+    verdict "9 scrub: every text file of the session dir holding a key (raw or JSON-escaped, nested too) comes back redacted with its mode; clean and binary files untouched; still valid JSONL that resumes; nothing left on a second pass or without a redactor" $? "got:  $got" "want: $want"
+
     got="$(pi_js 'const files = {
   "/d": ["2026-10-21T00-00-00-000Z_pi-0001.jsonl", "other.jsonl", "notes.txt"],
   "/d/2026-10-21T00-00-00-000Z_pi-0001.jsonl": JSON.stringify({ type: "session", version: 3, id: "pi-0001", cwd: "/w" }) + "\n{}\n",
@@ -722,13 +856,17 @@ status = 0; const d = short(pi.doctorChecks(login, ctx));
 status = 1; const e = short(pi.doctorChecks(login, ctx));
 const before = calls.length;
 const f = short(pi.doctorChecks({ ...login, model: "gpt-6-luna" }, ctx));
-const g = short(pi.doctorChecks({ ...login, home: "isolated", options: { extensions: ["/ext/none.ts", "rel/x.ts"] } }, { ...ctx, profileName: "q" }));
+const g = short(pi.doctorChecks({ ...login, home: "isolated", options: { extensions: ["/ext/none.ts", "rel/x.ts", "builtin:llamacpp", "builtin:mcp"] } }, { ...ctx, profileName: "q" }));
+const h = short(pi.doctorChecks({ ...keyed, home: "user" }, ctx));
+const i = short(pi.doctorChecks(keyed, { ...ctx, fs: { ...ctx.fs, exists: (file) => ["/data/homes/p/pi", "/data/homes/p/pi/auth.json", "/ext/ok.ts"].includes(file) } }));
+const noExec = calls.length === before;
+const typo = pi.doctorChecks({ ...login, options: { extensions: ["builtin:"] } }, ctx).find((c) => c.name === "pi-extension");
 const first = calls[0];
-console.log(JSON.stringify([a, b, c, d, e, f, g, calls.length === before, first.cmd, first.args, first.env.PI_CODING_AGENT_DIR, first.env.PI_OFFLINE, "ZAI_API_KEY" in first.env, "OPENAI_API_KEY" in first.env,
-  calls[3].env.PI_CODING_AGENT_DIR]));')"
-    want='["pi-tools:ok,pi-extension:ok,pi-auth:ok","pi-tools:ok,pi-extension:ok,pi-auth:WARN","pi-tools:ok,pi-extension:ok,pi-auth:FAIL","pi-tools:ok,pi-auth:ok","pi-tools:ok,pi-auth:FAIL","pi-tools:ok,pi-auth:WARN","pi-tools:ok,pi-extension:FAIL,pi-extension:WARN,pi-auth:FAIL",true,"srt",["--","pi","auth","check","--provider","zai","--json"],"/data/homes/p/pi","1",false,false,"/user-pi"]'
+console.log(JSON.stringify([a, b, c, d, e, f, g, h, i, noExec, typo.level, typo.hint, first.cmd, first.args, first.env.PI_CODING_AGENT_DIR, first.env.PI_OFFLINE, "ZAI_API_KEY" in first.env, "OPENAI_API_KEY" in first.env,
+  calls[3].env.PI_CODING_AGENT_DIR, mod.BUILTIN_EXTENSIONS]));')"
+    want='["pi-tools:ok,pi-extension:ok,pi-auth:ok","pi-tools:ok,pi-extension:ok,pi-auth:FAIL","pi-tools:ok,pi-extension:ok,pi-auth:FAIL","pi-tools:ok,pi-auth:ok","pi-tools:ok,pi-auth:FAIL","pi-tools:ok,pi-auth:WARN","pi-tools:ok,pi-extension:FAIL,pi-extension:WARN,pi-extension:WARN,pi-auth:FAIL","pi-tools:ok,pi-extension:ok,pi-auth:FAIL","pi-tools:ok,pi-extension:ok,pi-auth:FAIL",true,"WARN","builtin: is not one of pi'"'"'s built-in extensions (builtin:mcp, builtin:llama.cpp, builtin:codemode, builtin:tool-search); pi would stop with \"Failed to load extension\" (errorClass launch)","srt",["--","pi","auth","check","--provider","zai","--json"],"/data/homes/p/pi","1",false,false,"/user-pi",["builtin:mcp","builtin:llama.cpp","builtin:codemode","builtin:tool-search"]]'
     [[ "$got" == "$want" ]]
-    verdict "9 doctorChecks: [{name, level, hint}] — fd/rg, extensions, pi auth check (through wrap, the profile home, no key, no caller credentials); no exec without a provider or home" $? "got:  $got" "want: $want"
+    verdict "9 doctorChecks: [{name, level, hint}] — fd/rg, extensions (an unknown builtin: → WARN naming the set), pi auth check (through wrap, the profile home, no key, no caller credentials; a credential pi holds for a keyed profile → FAIL); no exec without a provider or home, nor for a keyed profile task refuses" $? "got:  $got" "want: $want"
 
     got="$(pi_js 'const ctx = { profileName: "p", env: {}, paths: { homes: "/data/homes" } };
 const profile = { harness: "pi", auth: { key: "zai" }, keyVar: "ZAI_API_KEY", model: "zai/glm-5.3", effort: "low", home: "isolated", options: { extensions: ["builtin:llama.cpp"] } };
@@ -738,25 +876,48 @@ const probe = pi.probe({ ...req, sessionId: "0f0f" }, ctx);
 let refused = null;
 try { pi.invocation({ ...req, profile: { ...profile, keyVar: undefined } }, ctx); } catch (error) { refused = error.message.slice(0, 32); }
 const home = pi.prepareHome(profile, ctx);
-console.log(JSON.stringify([doctorPlan.argv, doctorPlan.dirs, doctorPlan.meta, probe.argv, probe.secretEnv, probe.stdinPath, refused, home, pi.prepareHome({ ...profile, home: "user" }, ctx), pi.loginEnv(profile, ctx)]));')"
-    want='[["/opt/pi","--mode","json","--model","zai/glm-5.3","--thinking","low","--no-session","--no-approve","-ne","-ns","-np","--no-mcp","--tools","read,grep,find,ls","-e","builtin:llama.cpp"],[],null,["/opt/pi","--mode","json","--model","zai/glm-5.3","--thinking","low","--no-session","--no-approve","-ne","-ns","-np","-nc","--no-mcp","-nt","-e","builtin:llama.cpp"],["ZAI_API_KEY"],"/scratch/prompt.md","a pi profile with a key needs ke",{"env":{"PI_CODING_AGENT_DIR":"/data/homes/p/pi"},"dirs":["/data/homes/p/pi"],"files":[]},{"env":{},"dirs":[],"files":[]},{"PI_CODING_AGENT_DIR":"/data/homes/p/pi"}]'
+console.log(JSON.stringify([doctorPlan.argv, doctorPlan.dirs, doctorPlan.meta, probe.argv, probe.secretEnv, probe.stdinPath, refused, home, pi.prepareHome({ ...profile, home: "user" }, ctx)]));')"
+    want='[["/opt/pi","--mode","json","--model","zai/glm-5.3","--thinking","low","--no-session","--no-approve","-ne","-ns","-np","--no-mcp","--tools","read,grep,find,ls","-e","builtin:llama.cpp"],[],null,["/opt/pi","--mode","json","--model","zai/glm-5.3","--thinking","low","--no-session","--no-approve","-ne","-ns","-np","-nc","--no-mcp","-nt","-e","builtin:llama.cpp"],["ZAI_API_KEY"],"/scratch/prompt.md","a pi profile with a key needs ke",{"env":{"PI_CODING_AGENT_DIR":"/data/homes/p/pi"},"dirs":["/data/homes/p/pi"],"files":[]},{"env":{},"dirs":[],"files":[]}]'
     [[ "$got" == "$want" ]]
-    verdict "9 invocation without a job (doctor): --no-session, nothing to create; probe(): -nc, -nt; a keyed profile without keyVar is refused; prepareHome / loginEnv" $? "got:  $got" "want: $want"
+    verdict "9 invocation without a job (doctor): --no-session, nothing to create; probe(): -nc, -nt; a keyed profile without keyVar is refused; prepareHome (also what profile env exports)" $? "got:  $got" "want: $want"
+
+    # A stored credential would win over the key [03 §6]: invocation (with a job) and probe() refuse a keyed profile
+    # with "home": "user" or with an auth.json in its isolated home (UsageError: exit 2 at task time); a job-less
+    # request (doctor's env check) and a login profile are not refused. A resume records the session files of its id.
+    got="$(pi_js 'const ctx = { profileName: "p", env: { PI_CODING_AGENT_DIR: "/user-pi" }, paths: { homes: "/data/homes" },
+  fs: { exists: (f) => f === "/data/homes/p/pi/auth.json", readdir: (d) => (d === "/data/jobs/pi-0001/sessions" ? ["x_pi-0009.jsonl", "2026-10-21T00-00-00-000Z_pi-0001.jsonl", "notes.txt"] : null), readFile: () => null, stat: () => null } };
+const keyed = { harness: "pi", auth: { key: "zai" }, keyVar: "ZAI_API_KEY", model: "zai/glm-5.3" };
+const login = { harness: "pi", auth: "login", model: "openai/x" };
+const req = (profile, extra = {}) => ({ profile, profileName: "p", write: false, job: { id: "pi-0002", dir: "/data/jobs/pi-0002", cwd: "/w" }, prompt: { path: "/w/p.md" }, sessionId: "pi-0002", resume: null, harness: null, ...extra });
+const err = (fn) => { try { fn(); return null; } catch (error) { return `${error instanceof core.UsageError ? "UsageError" : "Error"}: ${error.message}`; } };
+const resume = { sessionId: "pi-0001", resume: { sessionId: "pi-0001", prev: { id: "pi-0001", meta: { sessionDir: "/data/jobs/pi-0001/sessions" } } } };
+console.log(JSON.stringify([
+  err(() => pi.invocation(req({ ...keyed, home: "user" }), ctx)),
+  err(() => pi.invocation(req({ ...keyed, home: "isolated" }), ctx)),
+  err(() => pi.probe(req({ ...keyed, home: "user" }), ctx)),
+  err(() => pi.invocation(req({ ...keyed, home: "user" }, { job: { id: null, dir: "/d", cwd: "/d" }, sessionId: null }), ctx)),
+  err(() => pi.invocation(req({ ...login, home: "isolated" }), ctx)),
+  pi.invocation(req(login, resume), ctx).meta,
+  pi.invocation(req(login), ctx).meta,
+]));')"
+    want='["UsageError: profile p: a keyed pi profile runs only in its isolated home (the default with a key): in /user-pi a credential pi stored itself (auth.json, /login) would win over ZAI_API_KEY; remove \"home\": \"user\"","UsageError: profile p: /data/homes/p/pi/auth.json exists: a credential stored there (pi /login) wins over ZAI_API_KEY; remove that file (a keyed profile needs no login)","UsageError: profile p: a keyed pi profile runs only in its isolated home (the default with a key): in /user-pi a credential pi stored itself (auth.json, /login) would win over ZAI_API_KEY; remove \"home\": \"user\"",null,null,{"sessionDir":"/data/jobs/pi-0001/sessions","agentDir":"/user-pi","sessionFilesBefore":["2026-10-21T00-00-00-000Z_pi-0001.jsonl"]},{"sessionDir":"/data/jobs/pi-0002/sessions","agentDir":"/user-pi"}]'
+    [[ "$got" == "$want" ]]
+    verdict "9 a keyed profile on a stored credential: invocation and probe refuse it (UsageError) — home user, an auth.json in its isolated home — not doctor's job-less request nor a login profile; a resume's meta lists its id's session files" $? "got:  $got" "want: $want"
 
     # "home": "user" with PI_CODING_AGENT_DIR in profile.env (allowed: not mandatory there): pi runs in that dir, so the
     # auth check, its hints and meta.agentDir name it; null removes it (pi's default ~/.pi/agent).
     got="$(pi_js 'const calls = [];
 const ctx = { profileName: "p", env: { PATH: "/b", PI_CODING_AGENT_DIR: "/user-pi" }, paths: { homes: "/data/homes" },
   fs: { stat: () => null, exists: () => false, readdir: () => null, readFile: () => null },
-  exec: (cmd, args, opts) => { calls.push(opts.env.PI_CODING_AGENT_DIR ?? null); return { status: 0, stdout: JSON.stringify({ authType: "api_key" }), stderr: "", error: null }; } };
-const keyed = { harness: "pi", auth: { key: "zai" }, keyVar: "ZAI_API_KEY", model: "zai/glm-5.3", home: "user" };
-const own = { ...keyed, env: { PI_CODING_AGENT_DIR: "/profile-pi" } };
-const none = { ...keyed, env: { PI_CODING_AGENT_DIR: null } };
+  exec: (cmd, args, opts) => { calls.push(opts.env.PI_CODING_AGENT_DIR ?? null); return { status: 1, stdout: JSON.stringify({ authType: null }), stderr: "", error: null }; } };
+const login = { harness: "pi", auth: "login", model: "zai/glm-5.3", home: "user" };
+const own = { ...login, env: { PI_CODING_AGENT_DIR: "/profile-pi" } };
+const none = { ...login, env: { PI_CODING_AGENT_DIR: null } };
 const auth = (profile) => pi.doctorChecks(profile, ctx).find((c) => c.name === "pi-auth");
 const req = (profile) => ({ profile, write: false, job: { id: "pi-0001", dir: "/data/jobs/pi-0001", cwd: "/w" }, prompt: { path: "/w/p.md" }, sessionId: "pi-0001", resume: null, harness: null });
-const hints = [own, none, keyed].map((profile) => { const c = auth(profile); return `${c.level} ${/ in (\S+) \(/.exec(c.hint)?.[1]}`; });
-console.log(JSON.stringify([hints, calls, [own, none, keyed].map((profile) => pi.invocation(req(profile), ctx).meta.agentDir)]));')"
-    want='[["WARN /profile-pi","WARN ~/.pi/agent","WARN /user-pi"],["/profile-pi",null,"/user-pi"],["/profile-pi",null,"/user-pi"]]'
+const hints = [own, none, login].map((profile) => { const c = auth(profile); return `${c.level} ${/ in (\S+);/.exec(c.hint)?.[1]}`; });
+console.log(JSON.stringify([hints, calls, [own, none, login].map((profile) => pi.invocation(req(profile), ctx).meta.agentDir)]));')"
+    want='[["FAIL /profile-pi","FAIL ~/.pi/agent","FAIL /user-pi"],["/profile-pi",null,"/user-pi"],["/profile-pi",null,"/user-pi"]]'
     [[ "$got" == "$want" ]]
     verdict "9 home user + profile.env PI_CODING_AGENT_DIR: pi auth check runs there and its hint and meta.agentDir name it (not the caller's); null → ~/.pi/agent" $? "got:  $got" "want: $want"
 

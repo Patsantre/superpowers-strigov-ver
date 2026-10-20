@@ -80,8 +80,13 @@ const PROXY_REFUSAL_RE = /\bproxy\b[^\n]*\.env\b|\.env\b[^\n]*\bproxy\b/i;
 export const LOST_SESSION_RE = /\b(?:cannot|could not|unable to|failed to) (?:resume|adopt|load|find) (?:the )?session\b|\b(?:unknown|no such) session\b|\bsession\b[^\n]{0,80}\b(?:not found|does not exist)\b/i;
 // Row ids whose rows carry the permission mode (`sandbox/mode`, `approval/policy`, `sandbox-policy.workspaceRoot`
 // [04b §2, §7, §8]): options.patch must not touch them (spec §3.6 A4). The exact row ids are unverified — matched by
-// name; doctor shows the effective rows (--dump-config).
+// name, here and in doctor, which grades those rows of its --dump-config (permissionRows).
 const PERMISSION_ROW_RE = /sandbox|approval|permission/;
+// A mode or approval-policy literal in such a row [04b §7]; `ask` goes with every mode but danger-full-access, so it
+// says nothing. Not part of a path or a longer word.
+const MODE_LITERAL_RE = /(?<![\w./-])(read-only|workspace-write|danger-full-access|never)(?![\w./-])/g;
+// The layers of $DSH_HOME that outrank the bundle's rows, in dsh's order (the home layer outranks the profile's) [04b §2].
+const HOME_LAYERS = [["profiles", "headless", "cordis.patch.yml"], ["cordis.patch.yml"]];
 // The row that loads AGENTS.md / CLAUDE.md [04b §9]: it must not be disabled (spec §3.6 A6).
 const INSTRUCTIONS_ROW = "agent-instructions";
 
@@ -139,8 +144,8 @@ function checkedPatch(patch, baseURL) {
 }
 
 // The rows of the patch file for a profile, in file order: the pinned rows, the defaults, then options.patch's other
-// rows. Effort goes into both pinned rows: which one wins in headless is unverified [04b open question 3] — doctor
-// shows the effective config (--dump-config).
+// rows. Effort goes into both pinned rows: which one wins in headless is unverified [04b open question 3], so doctor
+// checks the value of each against dsh's vocabulary (dsh-effort); --dump-config only shows that dsh accepts the file.
 export function patchRows(profile) {
   const baseURL = baseUrlOf(profile);
   const effort = profile?.effort ?? DEFAULT_EFFORT;
@@ -324,17 +329,58 @@ function doctorEnv(home, inv, profile, ctx) {
 // The rows the dump shows for one id: the lines from `id: <id>` to the next row.
 function dumpSection(dump, id) {
   const lines = String(dump ?? "").split("\n");
-  const start = lines.findIndex((line) => new RegExp(`\\bid:\\s*["']?${id}["']?\\s*$`).test(line.trim()));
+  const name = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const start = lines.findIndex((line) => new RegExp(`\\bid:\\s*["']?${name}["']?\\s*$`).test(line.trim()));
   if (start < 0) return null;
   const rest = lines.slice(start + 1);
   const end = rest.findIndex((line) => /^\s*-\s+id:/.test(line));
   return rest.slice(0, end < 0 ? rest.length : end).join("\n");
 }
 
-// doctor (spec §4.3, §5.4; [04b §16 doctor row]): permissions, effort vocabulary, Node, the native key file (its mode
-// only, never its content), the repo .env, worktrees under the sandbox, and `dsh --profile headless --patch <template>
-// --dump-config`, which also initializes the headless profile of the job's DSH_HOME (no first-run race between
-// parallel jobs [04b open question 4]). The binary and its version are the CLI's (discover).
+// What the permission rows of a dump say (spec §3.6 A4): [{ id, value }], value a mode or policy literal of the row
+// itself, or "DSH_PERMISSION_MODE" for a line that names the variable — the bundle row is `DSH_PERMISSION_MODE ??
+// 'workspace-write'` [04b §7], and whether the dump prints it resolved or as written is unverified, so the fallback
+// literal of such a line is not the row's. Empty when no row matches PERMISSION_ROW_RE or none names a mode.
+export function permissionRows(dump) {
+  const ids = [...String(dump ?? "").matchAll(/^\s*-\s+id:\s*["']?([A-Za-z0-9._:/-]+)["']?\s*$/gm)].map((m) => m[1]);
+  const found = [];
+  for (const id of new Set(ids.filter((name) => PERMISSION_ROW_RE.test(name)))) {
+    for (const line of (dumpSection(dump, id) ?? "").split("\n")) {
+      if (/\bDSH_PERMISSION_MODE\b/.test(line)) found.push({ id, value: "DSH_PERMISSION_MODE" });
+      else for (const m of line.matchAll(MODE_LITERAL_RE)) found.push({ id, value: m[1] });
+    }
+  }
+  return found;
+}
+
+// The dsh-permissions row from a dump doctor ran as a reviewer (DSH_PERMISSION_MODE=read-only): ok when the
+// permission rows show read-only or follow the variable; FAIL when one shows another mode or approval never (the
+// danger-full-access preset [04b §7]), i.e. a layer replaced the bundle's row; WARN when the dump shows none of them.
+// The home layers are only stat'ed, never read: the hint names those that exist.
+function permissionCheck(dump, writer, dshHome, ctx) {
+  const found = permissionRows(dump);
+  const shown = (list) => [...new Set(list.map(({ id, value }) => (value === "DSH_PERMISSION_MODE" ? `${id} follows DSH_PERMISSION_MODE` : `${id} ${value}`)))].join(", ");
+  const wider = found.filter(({ value }) => value !== "read-only" && value !== "DSH_PERMISSION_MODE");
+  if (wider.length > 0) {
+    const layers = HOME_LAYERS.map((parts) => path.join(dshHome, ...parts)).filter((file) => ctx.fs.stat(file)?.isFile?.());
+    const modes = [...new Set(wider.map(({ value }) => value).filter((value) => value !== "never"))];
+    const effect = modes.length > 0 ? `reviewer jobs run ${modes.join(" / ")}` : "the rows no longer follow it (approval never is the danger-full-access preset's)";
+    return {
+      level: "FAIL",
+      hint: `writer ${writer}, reviewer ${modes.length > 0 ? "NOT read-only" : "read-only overridden"}: --dump-config with DSH_PERMISSION_MODE=read-only shows ${shown(wider)} — a row of $DSH_HOME/cordis.patch.yml (or profiles/headless/cordis.patch.yml) overrides DSH_PERMISSION_MODE: ${effect}; ${layers.length > 0 ? `check ${layers.join(", ")} (not read here)` : `no such file in ${dshHome}: check the bundle's rows`}`,
+    };
+  }
+  if (found.length > 0) {
+    return { level: "ok", hint: `writer ${writer}, reviewer read-only: --dump-config with DSH_PERMISSION_MODE=read-only shows ${shown(found)} (headless has no approval answerer, so an escalation is denied)` };
+  }
+  return { level: "WARN", hint: `writer ${writer}, reviewer read-only (DSH_PERMISSION_MODE) not verified: --dump-config shows no sandbox / approval / permission row with a mode; check the dump by hand` };
+}
+
+// doctor (spec §4.3, §5.4; [04b §16 doctor row]): the effort vocabulary of the patch rows, Node, the native key file
+// (its mode only, never its content), the repo .env, worktrees under the sandbox, and `dsh --profile headless --patch
+// <template> --dump-config` with the reviewer's env, which also initializes the headless profile of the job's DSH_HOME
+// (no first-run race between parallel jobs [04b open question 4]) and whose permission rows grade dsh-permissions.
+// The binary and its version are the CLI's (discover).
 export async function doctorChecks(profile, ctx) {
   const checks = [];
   const add = (name, level, hint) => checks.push({ name, level, hint });
@@ -345,7 +391,10 @@ export async function doctorChecks(profile, ctx) {
   const root = top?.status === 0 && top.stdout.trim() ? top.stdout.trim() : cwd;
   const dshHome = dshHomeOf(profile, ctx);
 
-  add("dsh-permissions", "ok", `writer ${permissionMode(profile, true)}, reviewer read-only (DSH_PERMISSION_MODE; headless has no approval answerer, so an escalation is denied)`);
+  // Graded from the dump below (permissionCheck); until then, and when the dump cannot run, not verified.
+  const writer = permissionMode(profile, true);
+  const permissions = { name: "dsh-permissions", level: "WARN", hint: `writer ${writer}, reviewer read-only (DSH_PERMISSION_MODE) not verified: no --dump-config ran (see dsh-patch)` };
+  checks.push(permissions);
 
   // read-only (every reviewer) and workspace-write run dsh's OS sandbox runner; without one dsh fails closed with
   // SANDBOX_UNAVAILABLE [04b §7, §8, §16 doctor row]. danger-full-access bypasses it.
@@ -375,12 +424,20 @@ export async function doctorChecks(profile, ctx) {
   if (patched && (patched.model !== (profile.model ?? DEFAULT_MODEL) || patched.provider !== PROVIDER)) {
     add("dsh-model", "WARN", `options.patch runs ${patched.provider}/${patched.model}, not the profile's ${PROVIDER}/${profile.model ?? DEFAULT_MODEL}: status and routing show the profile's model`);
   }
+  // The efforts the patch file carries in each pinned row (options.patch may replace the profile's): on
+  // deepseek-official dsh refuses any outside its vocabulary before the first request [04b §5].
   const provider = rows?.[0].config.provider ?? PROVIDER;
   const effort = profile.effort ?? DEFAULT_EFFORT;
-  if (provider === PROVIDER && !EFFORTS.includes(effort)) {
-    add("dsh-effort", "WARN", `effort ${effort} is not one of dsh's ${EFFORTS.join("|")} on ${PROVIDER}: every task fails with UNSUPPORTED_REASONING_EFFORT before any request`);
+  const efforts = PINNED_ROWS.map((id, i) => [id, rows ? rows[i].config.reasoningEffort : effort]);
+  const said = (value) => (typeof value === "string" ? value : JSON.stringify(value ?? null));
+  const shown = efforts[0][1] === efforts[1][1] ? `reasoningEffort ${said(efforts[0][1])} in ${PINNED_ROWS.join(" and ")}` : efforts.map(([id, value]) => `reasoningEffort ${said(value)} in ${id}`).join(", ");
+  const source = efforts.some(([, value]) => value !== effort) ? " (options.patch)" : profile.effort ? "" : " (dsh's default, written explicitly)";
+  const bad = efforts.filter(([, value]) => value !== undefined && value !== null && !EFFORTS.includes(value));
+  if (provider === PROVIDER && bad.length > 0) {
+    const values = [...new Set(bad.map(([, value]) => said(value)))].join(", ");
+    add("dsh-effort", "WARN", `${shown}${source}: ${values} is not one of dsh's ${EFFORTS.join("|")} on ${PROVIDER}: every task fails with UNSUPPORTED_REASONING_EFFORT before any request`);
   } else {
-    add("dsh-effort", "ok", `reasoningEffort ${effort}${profile.effort ? "" : " (dsh's default, written explicitly)"} in agent-default-model and llm-deepseek`);
+    add("dsh-effort", "ok", `${shown}${source}`);
   }
 
   const node = run("node", ["--version"]);
@@ -449,6 +506,8 @@ export async function doctorChecks(profile, ctx) {
   }
   add("dsh-patch", "ok", `--dump-config accepts ${patch}; the headless profile of ${dshHome} is initialized`);
   const text = `${dump.stdout ?? ""}`;
+  // The dump ran with the reviewer's env (req.write false): its permission rows are what a reviewer job gets.
+  Object.assign(permissions, permissionCheck(text, writer, dshHome, ctx));
   const baseURL = baseUrlOf(profile);
   if (text.includes(baseURL)) add("dsh-endpoint", "ok", `baseURL ${baseURL} (pinned: a repo .env cannot move it)`);
   else add("dsh-endpoint", "WARN", `--dump-config does not show baseURL ${baseURL} in llm-deepseek; check the dump by hand`);
@@ -557,11 +616,7 @@ const dsh = {
   },
 
   doctorChecks,
-
-  // `profile env` for "home": "isolated": the DSH_HOME the jobs use.
-  loginEnv(profile, ctx) {
-    return { DSH_HOME: path.join(ctx.paths.homes, ctx.profileName ?? "-", "dsh") };
-  },
+  // No loginEnv: `profile env` exports prepareHome().env, the DSH_HOME the jobs use.
 };
 
 export default dsh;

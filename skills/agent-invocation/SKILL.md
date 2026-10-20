@@ -46,7 +46,7 @@ The same idiom as `$DISPATCH` (`codex-invocation`) and `$ZDISPATCH` (`zcode-invo
   route <role>: <profile> harness=<h> model=<m> effort=<e> readOnly=<os|tools|rules|none|-> maxParallel=<n|-> (chain: <a>, <b>; skipped: <c>=<state>)
   ```
 
-  The profile is the word after the colon. `harness=` picks the dispatch command (step 3); `model=` and `effort=` go into it. `readOnly=` says how the profile keeps a reviewer read-only: `os` (an OS sandbox), `tools` (a restricted tool set), `rules` (prompt rules only), `none` (it cannot: `glm` always runs `--mode yolo` — a reviewer on it is allowed, and `route` adds a one-line warning on stderr). `maxParallel=` is the profile's limit of concurrent jobs. An `inproc` profile shows `-` for both.
+  The profile is the word after the colon. `harness=` picks the dispatch command (step 3); `model=` and `effort=` go into it. `readOnly=` says how the profile keeps a reviewer read-only: `os` (an OS sandbox), `tools` (a restricted tool set), `rules` (the harness's permission rules, not a sandbox), `none` (it cannot: `glm` always runs `--mode yolo` — a reviewer on it is allowed, and `route` adds a one-line warning on stderr). `maxParallel=` is the profile's limit of concurrent jobs. An `inproc` profile shows `-` for both.
 - **`--skip`** takes the profiles the session lost: one entry per line of dev-orchestrator's `channels` marker (`<p>:<class>` for `down`, `<p>` for `off`), plus `glm` while the `glm-channel` marker says `down` or `off`. With class `auth` or `quota`, `route` also skips every profile linked to that one (the same `key`, the same harness login — an OpenCode or pi login counts per provider — the same `shares` label — the built-in `glm` carries `zai-coding-plan`) and lists them under `skipped`.
 - **The next profile** after the current one `c` (a switch; an implementer's in the phase's chain — dev-orchestrator "## Routing" item 4): add `c` and every profile before it in the chain to `--skip` (`c:<class>` when it went down with `auth` / `quota`); `route <role>` without `--skip` prints the whole chain. Exit 2 → nothing comes after `c`.
 - **Exit 2 `route <role>: no profile left (skipped: …)`** → the chain is exhausted: ask the user exactly one question — wait, retry, or name a profile. No waiting loops.
@@ -115,7 +115,7 @@ Exit codes everywhere, as in `zcode-dispatch`: **0** success · **1** runtime fa
 | `channels` | Every profile: harness, model, the key or login it pays with, and the profiles that share it. Bookkeeping read. |
 | `doctor [--profile P] [--probe]` | Offline checks without a model call; `--probe` adds one paid "PONG" request — the user runs it. |
 | `key set NAME` · `key list` · `key rm NAME` | The user's keys. `key set` reads a hidden prompt or a pipe in the user's own terminal (`! pbpaste \| "$AD" key set <name>`; Linux `wl-paste` or `xclip -o -selection clipboard`). Never run by the orchestrator. |
-| `profile list` · `profile show P` · `profile add NAME --from PRESET …` · `profile env P` · `preset list` | Profile management — user actions; `list` / `show` are reads. |
+| `profile list` · `profile show P` · `profile add NAME --from PRESET …` · `profile env P [-- COMMAND]` · `preset list` | Profile management — user actions; `list` / `show` are reads. |
 
 ## Failure handling
 
@@ -134,7 +134,7 @@ The failure rules depend on the job's harness (dev-orchestrator Step 3, "GLM inf
 | `rate-limit` | 429 without signs of an exhausted limit, 529; dsh `RATE_LIMIT` | the same |
 | `server` | 5xx, `ECONNREFUSED`; dsh `TRANSPORT`, `SERVER`, `TIMEOUT`, `HTTP_5xx`, `EMPTY_RESPONSE`, `MALFORMED_RESPONSE`, `STREAM_CLOSED` | the same |
 | `auth` | claude `api_error_status` 401/403; dsh `AUTH`, `MISSING_CREDENTIAL`, `INVALID_CREDENTIAL`; pi `No API key found for`; no login; a key that did not resolve | the profile and every profile linked to it are `down`; the next profile |
-| `quota` | claude 402, or 429 with a limit or balance text; dsh `QUOTA`; OpenCode only with `insufficient_quota`, `usage_not_included`, `GoUsageLimitError` or `FreeUsageLimitError` in the body | the same |
+| `quota` | claude 402, or 429 with a limit or balance text; dsh `QUOTA`; OpenCode 402 or `Insufficient Balance`, and a 429 only with `insufficient_quota`, `usage_not_included`, `GoUsageLimitError` or `FreeUsageLimitError` in the body | the same |
 | `model-not-selected` | 404 on the model; claude "There's an issue with the selected model"; dsh `INVALID_REQUEST`, `MODEL_UNSUPPORTED`, `UNSUPPORTED_REASONING_EFFORT`; OpenCode `Model not found:`; pi `Model "…" not found`, `Unknown provider` | the profile is `down`; the next profile |
 | `context` | `prompt_too_long`; dsh `CONTEXT_WINDOW_EXCEEDED`; a context overflow in pi | the next profile for this job |
 | `blocked` | OpenCode's remaining `ask` (`auto-rejecting` on stderr); a permission refusal without a result | the next profile |

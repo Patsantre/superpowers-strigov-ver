@@ -14,7 +14,7 @@
 //   doctor [--profile P] [--probe]
 //   key set NAME | key list | key rm NAME
 //   profile list [--json] | profile show P | profile add NAME --from PRESET [--model M] [--key K] [--set k=v]… |
-//   profile env P
+//   profile env P [-- COMMAND [ARGS…]]
 //   preset list [--json]
 //   __run <id> <jobs-dir> <token|->            (internal: the detached runner of a core job)
 //
@@ -25,9 +25,12 @@
 // four ship (increments 2–5), each loaded on demand — a runner loads only its job's. A harness without its file is
 // refused (`harness <h> is not available in this version`). $AGENT_DISPATCH_ADAPTER_DIR names a directory searched
 // first (tests put a stand-in adapter there), like $AGENT_DISPATCH_ZCODE / $AGENT_DISPATCH_CODEX name the wrappers.
-// Besides the hooks of the core contract the CLI reads two of its own: loginEnv(profile, ctx) → the variables
-// `profile env` exports for an isolated home, and doctorChecks(profile, ctx) → doctor rows; doctor's ctx also carries
-// cwd and writeFiles(spec), the core's writer of adapter files under the data root (dsh's --dump-config template).
+// An adapter that fails to load stops only what needs it: doctor reports it as a FAIL row of each profile on that
+// harness, and a runner loads only its job's adapter.
+// Besides the hooks of the core contract the CLI reads two optional ones of its own: loginEnv(profile, ctx) → the
+// variables `profile env` gives an isolated home (without it, the env of prepareHome: the home the jobs use), and
+// doctorChecks(profile, ctx) → doctor rows; doctor's ctx also carries cwd and writeFiles(spec), the core's writer of
+// adapter files under the data root (dsh's --dump-config template).
 //
 // Pure Node ESM, no dependencies, no shell: every child process gets an argv array.
 
@@ -588,7 +591,8 @@ function cmdChannels(args) {
 
 const coreAdapters = new Map();
 
-// The core adapter of a harness, or null when this version has none (spec §3.2: adapters/<harness>.mjs).
+// The core adapter of a harness, or null when this version has none (spec §3.2: adapters/<harness>.mjs). A file that
+// fails to import or exports the wrong id throws "<file>: <why>" (not cached: each caller sees the failure).
 export async function loadCoreAdapter(harness, env = process.env) {
   if (!CORE_HARNESSES.includes(harness)) return null;
   if (coreAdapters.has(harness)) return coreAdapters.get(harness);
@@ -596,8 +600,13 @@ export async function loadCoreAdapter(harness, env = process.env) {
   for (const dir of [env[ADAPTER_DIR_VAR], ADAPTERS_DIR].filter(Boolean)) {
     const file = path.join(path.resolve(dir), `${harness}.mjs`);
     if (!fs.existsSync(file)) continue;
-    const loaded = (await import(pathToFileURL(file).href)).default;
-    if (!isObject(loaded) || loaded.id !== harness) throw new Error(`adapter ${file}: its id is ${JSON.stringify(loaded?.id)}, not ${JSON.stringify(harness)}`);
+    let loaded;
+    try {
+      loaded = (await import(pathToFileURL(file).href)).default;
+    } catch (error) {
+      throw new Error(`${file}: ${oneLine(error?.message ?? error, 300)}`, { cause: error });
+    }
+    if (!isObject(loaded) || loaded.id !== harness) throw new Error(`${file}: its id is ${JSON.stringify(loaded?.id)}, not ${JSON.stringify(harness)}`);
     adapter = loaded;
     break;
   }
@@ -624,7 +633,12 @@ async function runnerAdapters(id, jobsDir) {
 }
 
 async function requireCoreAdapter(name, harness) {
-  const adapter = await loadCoreAdapter(harness);
+  let adapter;
+  try {
+    adapter = await loadCoreAdapter(harness);
+  } catch (error) {
+    throw new Error(`profile ${name}: adapter ${harness} failed to load: ${error?.message ?? error}`);
+  }
   if (!adapter) throw new UsageError(`profile ${name}: harness ${harness} is not available in this version`);
   return adapter;
 }
@@ -1031,44 +1045,70 @@ function profileAdd(rest) {
 }
 
 // The one-time action of spec §4.3 before a profile works: store its key, or log in (in its isolated home through
-// profile env), or give dsh its key file. Null when there is none (keyEnv, keyCmd, none).
+// `profile env P -- <login command>`), or give dsh its key file. Null when there is none (keyEnv, keyCmd, none).
 function firstStep(name, p) {
   if (isObject(p.auth)) return "key" in p.auth ? `${CLI_NAME} key set ${p.auth.key}` : null;
-  const isolated = p.home === "isolated" ? `eval "$(${CLI_NAME} profile env ${name})"; ` : "";
-  if (p.auth === "login") return `log in: ${isolated}${LOGIN_STEP[p.harness] ?? p.harness}`;
-  if (p.auth === "native" && p.harness === "dsh") return `${isolated}put DEEPSEEK_API_KEY=… into $DSH_HOME/.env (default ~/.dsh/.env, mode 0600)`;
+  const isolated = p.home === "isolated";
+  if (p.auth === "login") return `log in: ${isolated ? `${CLI_NAME} profile env ${name} -- ` : ""}${LOGIN_STEP[p.harness] ?? p.harness}`;
+  if (p.auth === "native" && p.harness === "dsh") {
+    if (isolated) return `put DEEPSEEK_API_KEY=… into .env (mode 0600) of the DSH_HOME that ${CLI_NAME} profile env ${name} prints`;
+    return "put DEEPSEEK_API_KEY=… into $DSH_HOME/.env (default ~/.dsh/.env, mode 0600)";
+  }
   return null;
 }
 
 const shellQuote = (text) => `'${String(text).replace(/'/g, "'\\''")}'`;
 
-// spec §3.3, §4.3: the `export` lines that point the harness at a profile's isolated home, so the user logs in
-// there (`eval "$(agent-dispatch profile env P)"; opencode auth login`). The adapter names its variables (loginEnv);
-// the directories are created 0700. A claude API profile has nothing to log into: its home must hold no login
-// (spec §3.6 A1), so nothing is exported for it.
+// `profile env P -- COMMAND`: COMMAND runs with stdio inherited and the profile's variables over the caller's
+// environment, and its exit code is ours (128 + the signal's number when a signal ended it; 127 when it cannot be
+// found and 126 when it cannot start, as env(1) does). Only its name is ever echoed: an argument may be a secret.
+function runWithEnv(argv, vars) {
+  const r = spawnSync(argv[0], argv.slice(1), { stdio: "inherit", env: { ...process.env, ...vars } });
+  if (r.error) {
+    errOut(`${CLI_NAME}: cannot run ${argv[0]}: ${r.error.code ?? r.error.message}\n`);
+    return r.error.code === "ENOENT" ? 127 : 126;
+  }
+  if (r.status !== null) return r.status;
+  return 128 + (os.constants.signals[r.signal] ?? 0);
+}
+
+// spec §3.3, §4.3: the variables that point the harness at a profile's isolated home, so the user logs in there.
+// `profile env P -- opencode auth login` runs the login with them: no eval, nothing stays in the user's shell, and a
+// refusal runs nothing (an eval of the empty output of a refused `profile env P` would log in to the default home).
+// `profile env P` alone prints them as `export` lines. The variables are the adapter's loginEnv when it has one, else
+// the env of its prepareHome — the home the jobs use; the directories are created 0700. A claude API profile has
+// nothing to log into: its home must hold no login (spec §3.6 A1), so nothing is exported for it and no command runs.
+// A keyed opencode or pi profile is told that a login stored in its home would win over its key.
 async function profileEnv(rest) {
-  const { positionals } = parse(rest, {}, 1, 1);
+  const sep = rest.indexOf("--");
+  const command = sep < 0 ? null : rest.slice(sep + 1);
+  const { positionals } = parse(sep < 0 ? rest : rest.slice(0, sep), {}, 1, 1);
+  if (command?.length === 0) throw new UsageError(`usage: ${CLI_NAME} profile env P [-- COMMAND [ARGS…]] (no command after --)`);
   const state = lenientState();
   const { name, p } = requireProfile(state, positionals[0]);
   if (!CORE_HARNESSES.includes(p.harness)) throw new UsageError(`profile env applies to claude, opencode, pi and dsh profiles; ${name} is harness ${p.harness}`);
-  if (p.home !== "isolated") {
-    out(`# profile ${name} uses the harness's own home ("home": "user"); nothing to export\n`);
-    return 0;
-  }
-  if (p.harness === "claude" && p.auth !== "login") {
-    out(`# profile ${name} is a claude API profile: its isolated home must hold no claude.ai login (spec §3.6 A1); nothing to export\n`);
+  const nothing =
+    p.home !== "isolated"
+      ? `profile ${name} uses the harness's own home ("home": "user"); nothing to export`
+      : p.harness === "claude" && p.auth !== "login"
+        ? `profile ${name} is a claude API profile: its isolated home must hold no claude.ai login (spec §3.6 A1); nothing to export`
+        : null;
+  if (nothing && command) throw new UsageError(`${nothing}; ${command[0]} not run`);
+  if (nothing) {
+    out(`# ${nothing}\n`);
     return 0;
   }
   const adapter = await requireCoreAdapter(name, p.harness);
-  if (typeof adapter.loginEnv !== "function") throw new UsageError(`profile ${name}: the ${p.harness} adapter names no home variables (loginEnv); nothing to export`);
   const ctx = core.makeCtx({ profile: p, profileName: name });
-  const env = await adapter.loginEnv(p, ctx);
-  const entries = isObject(env) ? Object.entries(env) : [];
-  const bad = entries.find(([variable, value]) => !ENV_NAME_RE.test(variable) || typeof value !== "string" || value === "");
-  if (entries.length === 0 || bad) throw new Error(`the ${p.harness} adapter's loginEnv() returned ${bad ? `an invalid entry ${JSON.stringify(bad[0])}` : "no variables"}`);
   // The home as a task prepares it (its dirs and files, e.g. opencode's git config that points git back at the
-  // user's), so the shell that evals these lines finds the same home as the jobs.
+  // user's), so the login finds the same home as the jobs.
   const home = typeof adapter.prepareHome === "function" ? ((await adapter.prepareHome(p, ctx)) ?? {}) : {};
+  const source = typeof adapter.loginEnv === "function" ? "loginEnv()" : "prepareHome() env";
+  const env = typeof adapter.loginEnv === "function" ? await adapter.loginEnv(p, ctx) : home.env;
+  const entries = (isObject(env) ? Object.entries(env) : []).filter(([, value]) => value !== null && value !== undefined);
+  if (entries.length === 0) throw new UsageError(`profile ${name}: the ${p.harness} adapter names no home variables (${source}); nothing to export`);
+  const bad = entries.find(([variable, value]) => !ENV_NAME_RE.test(variable) || typeof value !== "string" || value === "");
+  if (bad) throw new Error(`the ${p.harness} adapter's ${source} returned an invalid entry ${JSON.stringify(bad[0])}`);
   const paths = core.dataPaths();
   const dir = path.join(paths.homes, name);
   core.ensurePrivateDir(paths.root);
@@ -1076,6 +1116,14 @@ async function profileEnv(rest) {
   core.ensurePrivateDir(dir);
   core.writeAdapterFiles({ dirs: home.dirs ?? [], files: home.files ?? [] });
   for (const [, value] of entries) if (value.startsWith(`${dir}${path.sep}`)) core.ensurePrivateDir(value);
+  // A keyed profile's home is isolated so that no stored login outranks the key (spec §3.4).
+  const keyed = (p.harness === "opencode" || p.harness === "pi") && authMode(p.auth) === "key";
+  const keyedNote = keyed ? `keyed profile: nothing to log into here; a login stored in this home would win over ${p.keyVar}` : null;
+  if (command) {
+    if (keyedNote) errOut(`${CLI_NAME}: WARN profile ${name}: ${keyedNote}\n`);
+    return runWithEnv(command, Object.fromEntries(entries));
+  }
+  if (keyedNote) out(`# ${keyedNote}\n`);
   for (const [variable, value] of entries) out(`export ${variable}=${shellQuote(value)}\n`);
   return 0;
 }
@@ -1099,7 +1147,7 @@ async function cmdProfile(args) {
   }
   if (action === "add") return profileAdd(rest);
   if (action === "env") return await profileEnv(rest);
-  throw new UsageError(`usage: ${CLI_NAME} profile <list|show P|add NAME --from PRESET …|env P>`);
+  throw new UsageError(`usage: ${CLI_NAME} profile <list|show P|add NAME --from PRESET …|env P [-- COMMAND [ARGS…]]>`);
 }
 
 function cmdPreset(args) {
@@ -1146,7 +1194,8 @@ function checkKey(name, p, report) {
   const auth = p.auth;
   if (!isObject(auth)) {
     const scope = loginScope(p);
-    const where = scope === "isolated" ? ` in its isolated home (${CLI_NAME} profile env ${name})` : scope === "provider" ? ` of provider ${loginProvider(p)}` : "";
+    const enter = auth === "login" ? `log in there: ${CLI_NAME} profile env ${name} -- ${LOGIN_STEP[p.harness] ?? p.harness}` : `${CLI_NAME} profile env ${name} prints it`;
+    const where = scope === "isolated" ? ` in its isolated home (${enter})` : scope === "provider" ? ` of provider ${loginProvider(p)}` : "";
     const what = { login: `the ${p.harness} login${where}`, native: `${p.harness}'s own configuration${scope === "isolated" ? where : ""}`, none: "no key (a local model)" }[auth];
     report("ok", `auth ${name}`, `${auth}: ${what}`);
     return;
@@ -1271,7 +1320,16 @@ async function doctorProfile(state, name, report, checks) {
     }
     return;
   }
-  const adapter = await loadCoreAdapter(p.harness);
+  let adapter;
+  try {
+    adapter = await loadCoreAdapter(p.harness);
+  } catch (error) {
+    // A broken adapter file (a throw at import, a syntax error, a wrong id) is a FAIL of this profile only; its key
+    // or login is still checked, and so are the other profiles.
+    report("FAIL", `profile ${name}`, `adapter ${p.harness} failed to load: ${oneLine(error?.message ?? error, 400)}`);
+    checkKey(name, p, report);
+    return;
+  }
   if (!adapter) report("FAIL", `profile ${name}`, `harness ${p.harness} is not available in this version`);
   else report("ok", `profile ${name}`, `harness ${p.harness}, model ${p.model ?? "-"}, effort ${p.effort ?? "-"}, home ${p.home}, sandbox ${p.sandbox}`);
   checkKey(name, p, report);
@@ -1383,7 +1441,14 @@ async function cmdDoctor(args) {
   const names = values.profile ? [values.profile] : [...state.profiles.keys()];
   const used = new Set(Object.keys(DEFAULTS.roles).flatMap((role) => effectiveChain(state, role).chain));
   const checks = { single: Boolean(values.profile), used, codexSetup: null };
-  for (const name of names) await doctorProfile(state, name, report, checks);
+  for (const name of names) {
+    // Whatever escapes one profile's checks is that profile's FAIL row: the report and its verdict always print.
+    try {
+      await doctorProfile(state, name, report, checks);
+    } catch (error) {
+      report("FAIL", `profile ${name}`, `its checks stopped: ${oneLine(error?.message ?? error, 300)}`);
+    }
+  }
 
   out(`${lines.join("\n")}\ndoctor: ${failed ? "FAIL" : "ok"}\n`);
   if (failed) return 1;

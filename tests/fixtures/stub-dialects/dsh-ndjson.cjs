@@ -6,7 +6,10 @@
 // Like dsh it:
 // - parses the launcher's argv (--profile, --patch…, --dump-config first; then --json, --session-id, the task "-")
 //   [04b §2]; only `--profile headless --json … -` is implemented (anything else is the stub's exit 2);
-// - layers the --patch files over its base rows, a row replacing that row's whole config [04b §2, §5];
+// - layers $DSH_HOME/profiles/headless/cordis.patch.yml, then $DSH_HOME/cordis.patch.yml, then the --patch files over
+//   its base rows, a row replacing that row's whole config [04b §2, §5]; the base permission rows (ids unverified:
+//   sandbox-policy {mode, workspaceRoot}, approval-policy {policy}) follow DSH_PERMISSION_MODE ?? workspace-write,
+//   approval never only with danger-full-access [04b §7], until a layer replaces them;
 // - resolves the key like headless does: the process env (an exported empty value shadows the rest), then
 //   <cwd>/.env, then $DSH_HOME/.env; baseURL: explicit config, then DEEPSEEK_BASE_URL from any layer, then
 //   https://api.deepseek.com/anthropic [04b §5, §6];
@@ -16,11 +19,12 @@
 // - prints `session` first, `status` turn/step events (usage on step_end), `text`, `turn_end` with a reason, `final`;
 //   failures as turn_end reason {kind: "error", error: {code, message}} plus the stderr line `dsh: <CODE>: <message>`
 //   and an empty final; exit 0 only for a completed turn [04b §3, §11];
-// - on SIGINT / SIGTERM disposes (aborted turn, empty final) and exits 130 / 0; a second signal exits at once
-//   [04b §10].
+// - on SIGINT / SIGTERM disposes (aborted turn) and exits 130 / 0; a second signal exits at once [04b §10]. The final
+//   is empty after SIGINT and a partial answer after SIGTERM (dsh's final is only "often empty" [04b §3]).
 // Extra outputs for the tests:
 //   AGENT_STUB_EFFECTIVE  a JSON file: the effective config the run booted with (rows, model, efforts, baseURL, the key's
-//                         source — never the key —, permission mode, homes, telemetry, session id)
+//                         source — never the key —, permission mode and approval policy as the rows resolved them,
+//                         homes, telemetry, session id)
 //   AGENT_STUB_SIGNALS    "<SIGNAL> <epoch ms>" per signal received (busy, stuck, sigterm-final, late-session)
 //   AGENT_STUB_READY      written once the signal handlers of those modes are in place
 // AGENT_STUB_MODE (dialect):
@@ -32,7 +36,8 @@
 //   no-final        a completed turn without a final event, exit 0
 //   empty-final     a completed turn with no assistant text: final "", exit 1
 //   late-session    the whole stream only after AGENT_STUB_SESSION_DELAY_MS (default 3000); SIGINT → 130, SIGTERM → 0
-//   busy            session + turn start, then waits; a signal disposes in ~150 ms (aborted turn) and exits 130 / 0
+//   busy            session + turn start, then waits; a signal disposes in ~150 ms (aborted turn) and exits 130 / 0,
+//                   SIGTERM with a partial final ("DONE\npartial answer before the abort")
 //   stuck           session + turn start, then waits and ignores SIGINT / SIGTERM / SIGHUP (a disposal that hangs)
 //   sigterm-final   waits, ignores SIGINT; SIGTERM prints a completed turn with a final answer and exits 0
 //   boot-fail       a required plugin fails: report + "Full diagnostics: …/logs/startup-*.log", exit 1, no session
@@ -162,8 +167,14 @@ function parsePatch(file) {
   return rows;
 }
 
-// dsh's base rows as far as the report names them [04b §5, §9]; each --patch row replaces a row's whole config.
-function effectiveRows(patches) {
+// The layers of $DSH_HOME that exist, in dsh's order: the home layer outranks the profile's [04b §2].
+const homeLayers = () =>
+  [path.join(dshHome(), "profiles", "headless", "cordis.patch.yml"), path.join(dshHome(), "cordis.patch.yml")].filter((file) => fs.existsSync(file));
+
+// dsh's base rows as far as the report names them [04b §5, §7, §9] (the permission rows resolved from the env); each
+// row of a home layer, then of a --patch, replaces a row's whole config.
+function effectiveRows(patches, cwd) {
+  const permission = env.DSH_PERMISSION_MODE ?? "workspace-write";
   const rows = [
     { id: "agent-default-model", config: { provider: "deepseek-official", model: "deepseek-flash" } },
     { id: "llm-deepseek", config: { apiKeyEnv: "DEEPSEEK_API_KEY" } },
@@ -171,8 +182,10 @@ function effectiveRows(patches) {
     { id: "plugin-package-inventory-deepseek", config: { enabled: true } },
     { id: "session-title-llm", config: {} },
     { id: "tool-web", config: {} },
+    { id: "sandbox-policy", config: { mode: permission, workspaceRoot: cwd } },
+    { id: "approval-policy", config: { policy: permission === "danger-full-access" ? "never" : "ask" } },
   ];
-  for (const file of patches) {
+  for (const file of [...homeLayers(), ...patches]) {
     for (const patch of parsePatch(file)) {
       let row = rows.find((entry) => entry.id === patch.id);
       if (!row) {
@@ -253,7 +266,8 @@ function effective(rows, cwd) {
     sessionTitle: enabled("session-title-llm"),
     toolWeb: enabled("tool-web"),
     telemetryDisabled: Boolean(env.DSH_TELEMETRY_DISABLED),
-    permissionMode: env.DSH_PERMISSION_MODE ?? "workspace-write", // dsh's default [04b §7]
+    permissionMode: (row("sandbox-policy").config ?? {}).mode ?? null, // DSH_PERMISSION_MODE unless a layer pinned it
+    approvalPolicy: (row("approval-policy").config ?? {}).policy ?? null,
     dshHome: dshHome(),
     agentsHome: env.DSH_AGENTS_HOME || path.join(env.HOME || os.homedir(), ".agents"),
     rows: Object.fromEntries(rows.map((entry) => [entry.id, { config: entry.config ?? null, disabled: entry.disabled === true }])),
@@ -311,7 +325,7 @@ function dumpConfig(launcher) {
   }
   let rows;
   try {
-    rows = effectiveRows(launcher.patches);
+    rows = effectiveRows(launcher.patches, process.cwd());
   } catch (error) {
     err(`dsh: invalid patch ${error.file ?? "-"}: ${error.message}\n`);
     process.exit(1);
@@ -370,7 +384,7 @@ module.exports = {
     }
     let rows;
     try {
-      rows = effectiveRows(launcher.patches);
+      rows = effectiveRows(launcher.patches, cwd);
     } catch (error) {
       err(`dsh: invalid patch ${error.file ?? "-"}: ${error.message}\n`);
       process.exit(1);
@@ -486,8 +500,10 @@ module.exports = {
         const code = signal === "SIGINT" ? 130 : 0;
         if (first) process.exit(code); // a second signal forces an immediate exit
         first = signal;
+        // After SIGTERM the turn leaves a partial answer behind: exit 0 with a non-empty final, still not a success.
+        const partial = signal === "SIGTERM" ? "DONE\npartial answer before the abort" : "";
         setTimeout(() => {
-          out(turnEnd({ kind: "aborted" }) + finalEvent(""));
+          out((partial ? line({ type: "text", text: partial }) : "") + turnEnd({ kind: "aborted" }) + finalEvent(partial));
           process.exit(code);
         }, 150);
       };

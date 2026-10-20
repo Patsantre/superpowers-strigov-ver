@@ -1,6 +1,6 @@
 // A trivial adapter for the core tests (tests/test-agent-core.sh): drives tests/fixtures/agent-stub.cjs in its
 // "plain" dialect (newline-delimited JSON events). It exercises the whole adapter contract of spec §3.2 — discover,
-// prepareHome, invocation, reduce, finalize, resumeCheck, patterns — with no harness behind it.
+// prepareHome, invocation, reduce, finalize, scrub, resumeCheck, patterns — with no harness behind it.
 //
 // Environment it asks for: defaults PLAIN_TELEMETRY / PLAIN_MODE (§3.6 Б), mandatory PLAIN_SAFE / PLAIN_JOB_DIR and
 // a removed PLAIN_DROPPED (§3.6 А), the key in PLAIN_API_KEY when the profile has a key-based `auth`, and
@@ -79,7 +79,9 @@ const plain = {
         ...(req.resume ? ["--resume", req.resume.sessionId] : []),
         ...(req.profile.model ? ["--model", req.profile.model] : []),
       ],
-      env: { PLAIN_TELEMETRY: "0", PLAIN_MODE: "default" },
+      // With profile.checkScrub the stub records its environment (the key too) into the job dir, as pi keeps what it
+      // saw in its session files; scrub() hands that file back to the core.
+      env: { PLAIN_TELEMETRY: "0", PLAIN_MODE: "default", ...(req.profile.checkScrub ? { AGENT_STUB_RECORD: path.join(req.job.dir, "transcript.json") } : {}) },
       mandatoryEnv: { PLAIN_SAFE: "1", PLAIN_JOB_DIR: req.job.dir, PLAIN_DROPPED: null },
       secretEnv: keyed ? ["PLAIN_API_KEY"] : [],
       stdinPath: req.prompt.path,
@@ -94,6 +96,15 @@ const plain = {
     if (!ctx.profile.checkFinalize) return null;
     const show = (name) => ctx.execHarness(["--print-env", name]).stdout.trim();
     return { meta: { finalize: { wrapped: show("WRAPPED"), safe: show("PLAIN_SAFE"), key: show("PLAIN_API_KEY"), envHasKey: "PLAIN_API_KEY" in job.env, wrap: job.wrap } } };
+  },
+  // With profile.checkScrub: the stub's transcript.json, redacted, mode 0640 (profile.checkScrub "throw": a scrub()
+  // that fails).
+  scrub(job, ctx) {
+    if (!ctx.profile.checkScrub) return [];
+    if (ctx.profile.checkScrub === "throw") throw new Error("scrub broke on purpose");
+    const file = path.join(job.dir, "transcript.json");
+    const text = ctx.fs.readFile(file);
+    return text === null ? [] : [{ path: file, mode: 0o640, content: ctx.redact(text) }];
   },
   patterns: {
     "resume-lost": ["No conversation found"],

@@ -1096,6 +1096,29 @@ process.exit(r.env.WRAPPED === "yes" && r.stdin === fs.readFileSync(process.env.
         fail "18 finalize() gets the harness env without the key and the wrap (job.env, job.wrap, ctx.execHarness); its meta joins invocation()'s in the record"
         echo "    status=$st meta=$out"
     fi
+    # scrub() (spec §3.2, §3.5): after a keyed run the core writes the harness's own files back with the key redacted,
+    # in the mode the adapter names. A keyless job is not scrubbed; a scrub() that throws is only logged.
+    id="$(TEST_SECRET="$SECRET" start_task --profile scr --profile-json '{"harness":"plain","checkScrub":true,"auth":{"keyEnv":"TEST_SECRET"}}' --prompt-file "$prompt")"
+    st="$(wait_status "$id" 'completed|failed|cancelled' 20)"
+    out="$JOBS/$id/transcript.json"
+    if [[ "$st" == completed && -f "$out" && "$(mode_of "$out")" == 640 ]] && ! grep -qF "$SECRET" "$out" && grep -qF '"PLAIN_API_KEY":"<redacted>"' "$out"; then
+        pass "18 scrub(): the harness's own file comes back redacted, in the adapter's mode (0640)"
+    else
+        fail "18 scrub(): the harness's own file comes back redacted, in the adapter's mode (0640)"
+        echo "    status=$st mode=$(mode_of "$out" 2>/dev/null) key in file: $(grep -cF "$SECRET" "$out" 2>/dev/null)"
+    fi
+    id="$(start_task --profile scr0 --profile-json '{"harness":"plain","checkScrub":true}' --prompt-file "$prompt")"
+    st="$(wait_status "$id" 'completed|failed|cancelled' 20)"
+    id2="$(TEST_SECRET="$SECRET" start_task --profile scr1 --profile-json '{"harness":"plain","checkScrub":"throw","auth":{"keyEnv":"TEST_SECRET"}}' --prompt-file "$prompt")"
+    out="$(wait_status "$id2" 'completed|failed|cancelled' 20)"
+    if [[ "$st" == completed && "$(mode_of "$JOBS/$id/transcript.json")" != 640 && "$out" == completed ]] \
+        && grep -qF "scrub() failed: scrub broke on purpose" "$JOBS/$id2.log"; then
+        pass "18 scrub() runs for keyed jobs only; one that throws is logged and the job still completes"
+    else
+        fail "18 scrub() runs for keyed jobs only; one that throws is logged and the job still completes"
+        echo "    keyless=$st mode=$(mode_of "$JOBS/$id/transcript.json" 2>/dev/null) throwing=$out"
+    fi
+    rm -f "$JOBS/$id2/transcript.json" # the failed scrub left the key there
 
     # --- 19. exit codes: 2 for refusals without launch ---
     expect_exit() {

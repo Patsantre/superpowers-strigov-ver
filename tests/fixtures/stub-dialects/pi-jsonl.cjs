@@ -17,7 +17,8 @@
 // - Sessions: `--session-dir D --session-id X` resumes the file in D whose header has id X and cwd = this cwd;
 //   otherwise it warns "No project session found with id 'X'; creating a new session with that id." on stderr and
 //   creates D/<time>_X.jsonl at the first message. `--no-session` keeps nothing.
-// - `-e <x>`: builtin:{mcp,llama.cpp,codemode,tool-search} or an existing file; else "Failed to load extension".
+// - `-e <x>`: one of the adapter's BUILTIN_EXTENSIONS (bin/lib/adapters/pi.mjs, [03 §9]; loaded from there, so the
+//   stub and doctor's check cannot drift) or an existing file; else "Failed to load extension".
 // - `auth check --provider P --json`: AGENT_STUB_AUTH = ready | not_ready | invalid (default not_ready) → exit 0 / 1 /
 //   2 with {"provider","status","authType"} (pi's JSON shape beyond authType is not documented: a guess). Every `auth`
 //   call is appended to AGENT_STUB_AUTH_LOG as {argv, agentDir, keyVars}; `auth print-*` is refused (exit 3).
@@ -37,6 +38,11 @@
 //   tool-blocked        a tool call that an extension refuses headless (isError), then the model's own answer
 //   context-echo        the answer "DONE\nsession <id> resumed=<bool> prior=<n> stdin=<chars>"
 //   lose-session        acts as if the session file of --session-id were not there (the warning, a new session)
+//   leak-error          a bash tool turn whose output (`env`) prints the value of $AGENT_STUB_SECRET_VAR (default
+//                       PLAIN_API_KEY) — in the events and as a toolResult entry of the session file — then a provider
+//                       error (503); exit 0
+//   leak-hang           the same tool turn, written to the session file and to stdout, then waits forever (cancel and
+//                       timeout); SIGTERM ends it
 //   stdin-wait          answers only once stdin reached EOF, with the number of characters read
 //   pi-sigterm          starts a "bash tool" child in a process group of its own that ignores SIGTERM (its pid goes
 //                       to AGENT_STUB_PIDS) and waits; on SIGTERM it SIGKILLs that group and exits 143, as pi does;
@@ -44,8 +50,10 @@
 //                       appended to AGENT_STUB_SIGNALS as "<SIGNAL> <epoch ms>", the exit as "exit 143"
 //   term-ignore         a wedged pi: appends SIGTERM / SIGINT / SIGHUP to AGENT_STUB_SIGNALS with their time and
 //                       ignores them; only SIGKILL ends it
-// AGENT_STUB_RESPONSE, AGENT_STUB_MESSAGE as in agent-stub.cjs. Install the signal handlers here, before the stub reads
-// stdin and writes AGENT_STUB_RECORD (its readiness handshake).
+// AGENT_STUB_RESPONSE, AGENT_STUB_MESSAGE as in agent-stub.cjs. AGENT_STUB_STDERR_LINES=<n>: a run prints n lines of
+// extension chatter to stderr after its startup output (the "No project session found" warning included) — more than
+// the core's 200-line stderr tail keeps. Install the signal handlers here, before the stub reads stdin and writes
+// AGENT_STUB_RECORD (its readiness handshake).
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
@@ -61,7 +69,9 @@ const OPTIONS = {
   "--tools": 1, "-t": 1, "--exclude-tools": 1, "-xt": 1, "-nbt": 0, "-nt": 0, "-e": 1, "--skill": 1, "--prompt-template": 1,
   "--system-prompt": 1, "--append-system-prompt": 1, "--offline": 0, "--api-key": 1, "--list-models": 0,
 };
-const BUILTIN_EXTENSIONS = new Set(["builtin:mcp", "builtin:llama.cpp", "builtin:codemode", "builtin:tool-search"]);
+// The adapter's list of built-in extensions, read only when a run names one (require() of an ES module: Node 20.19+ /
+// 22.12+).
+const builtinExtensions = () => require(path.join(__dirname, "..", "..", "..", "bin", "lib", "adapters", "pi.mjs")).BUILTIN_EXTENSIONS;
 // The --help lines; AGENT_STUB_HELP_DROP removes some by their flag.
 const HELP = [
   ["--mode", "--mode <mode>", "Output mode: text (default), json or rpc"],
@@ -191,7 +201,7 @@ function prepareRun(argv) {
   state.json = values["--mode"] === "json";
   state.tools = !(values["-nt"] || values["--tools"] === ""); // -nt: no tools, so the model answers without a tool turn
   for (const extension of extensions) {
-    const ok = extension.startsWith("builtin:") ? BUILTIN_EXTENSIONS.has(extension) : fs.existsSync(extension);
+    const ok = extension.startsWith("builtin:") ? builtinExtensions().includes(extension) : fs.existsSync(extension);
     if (!ok) fail(`Failed to load extension "${extension}": ${extension.startsWith("builtin:") ? "unknown built-in extension" : "ENOENT: no such file or directory"}\nHint: check the path, or start pi with -ne to skip extensions`);
   }
   const model = values["--model"];
@@ -308,6 +318,27 @@ function toolTurn({ toolError = null } = {}) {
   };
 }
 
+// A bash tool turn whose output prints the key, as `env` would: the tool result is a message of its own (role
+// toolResult) in the events and in the session file [03 §4 "Format"].
+function leakTurn() {
+  const name = env.AGENT_STUB_SECRET_VAR || "PLAIN_API_KEY";
+  const call = { id: "call_env", name: "bash", args: { command: "env | grep _KEY" } };
+  const message = assistantMessage({ text: "Let me check the environment.", toolCall: call, stopReason: "toolUse" });
+  const output = { content: [{ type: "text", text: `${name}=${env[name] ?? ""}\n` }] };
+  const result = { role: "toolResult", toolCallId: call.id, toolName: call.name, ...output, isError: false, timestamp: Date.now() };
+  return {
+    messages: [message, result],
+    events: [
+      { type: "turn_start" },
+      ...messageEvents(message),
+      { type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.args },
+      { type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: output, isError: false, durationMs: 4 },
+      ...messageEvents(result),
+      { type: "turn_end", message, toolResults: [result] },
+    ],
+  };
+}
+
 // The complete stdout of a run: header, the user's turn, `turns` (tool turns etc.), the last assistant message, and
 // the closing events. Also writes the session file.
 function run({ turns = [], last, settle = { aborted: false }, after = [], preface = [] }) {
@@ -377,6 +408,7 @@ module.exports = {
     if (argv.includes("--version") || argv.includes("--help") || argv.includes("--print-env")) return false;
     prepareRun(argv);
     installSignals();
+    for (let i = 1; i <= Number(env.AGENT_STUB_STDERR_LINES || 0); i += 1) process.stderr.write(`[extension] chatter line ${i}\n`);
     return false;
   },
   sessionId() {
@@ -430,6 +462,14 @@ module.exports = {
       write(run({ turns: [toolTurn({ toolError: "Blocked: confirmation required, but no UI is available" })], last: assistantMessage({ text: env.AGENT_STUB_RESPONSE || "BLOCKED\nthe bash call was refused" }) })),
     "context-echo": ({ write, stdin }) => write(answer(`DONE\nsession ${state.sessionId} resumed=${state.resumed} prior=${state.prior} stdin=${stdin.trim().length}`)),
     "lose-session": ({ write }) => write(answer(env.AGENT_STUB_RESPONSE || "DONE\nanswered without the earlier context")),
+    "leak-error": ({ write }) => write(run({ turns: [leakTurn()], last: assistantMessage({ stopReason: "error", errorMessage: "503 Service Unavailable: upstream connect error" }) })),
+    "leak-hang": ({ write, forever }) => {
+      const user = userMessage();
+      const turn = leakTurn();
+      persist([user, ...turn.messages]);
+      if (state.json) write([header(), { type: "agent_start" }, { type: "turn_start" }, ...messageEvents(user), ...turn.events].map(line).join(""));
+      forever();
+    },
     "stdin-wait": ({ write, stdin }) => write(answer(`DONE\nstdin read to EOF: ${stdin.trim().length} chars`)),
     "pi-sigterm": ({ forever }) => {
       // A bash tool: pi spawns it detached (its own process group) and tracks its pid [03 §10].

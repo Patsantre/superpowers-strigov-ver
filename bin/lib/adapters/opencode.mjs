@@ -12,10 +12,10 @@
 //
 // Environment, on top of the core's allowlist (spec §3.2 order: defaults → profile.env → mandatory → key):
 //   mandatory (§3.6 А) OPENCODE_CONFIG_CONTENT  the sp-implementer / sp-reviewer primary agents with complete explicit
-//                                               permission sets (А4; options.permission merged into the role's
-//                                               agent) and `instructions`: the repo's AGENTS.md / CLAUDE.md that
-//                                               exist (А6) — config source 6, after the global and project ones
-//                                               [02 §9]
+//                                               permission sets (А4; options.permission merged into sp-implementer,
+//                                               only its deny rules into sp-reviewer) and `instructions`: the repo's
+//                                               AGENTS.md / CLAUDE.md that exist (А6) — config source 6, after the
+//                                               global and project ones [02 §9]
 //                      OPENCODE_PERMISSION      the role's set again (it overrides top-level `permission` of other
 //                                               configs, not agent.<name>.permission, so alone it guarantees nothing)
 //                      OPENCODE_DISABLE_PROJECT_CONFIG=1     a repo's opencode.json / .opencode/ cannot change the
@@ -31,7 +31,9 @@
 //   defaults (§3.6 Б)  OPENCODE_DISABLE_AUTOUPDATE=1, OPENCODE_DISABLE_EXTERNAL_SKILLS=1, OPENCODE_PURE=1 (not with
 //                      options.plugins: true; PURE leaves the built-in Copilot / ChatGPT logins alone [02 §6])
 //   the key            in profile.keyVar for auth {key | keyEnv | keyCmd} (§3.5); never in argv or the config.
-//                      OpenCode's bash tool sees it (spec §3.5: documented, `wrap` is the remedy).
+//                      OpenCode's bash tool sees it (spec §3.5: documented, `wrap` is the remedy). A login stored by
+//                      `opencode auth login` for the same provider wins over the variable [02 §5], so a keyed profile
+//                      runs only in its isolated home, and only while that home holds no auth.json (exit 2 otherwise).
 //
 // Outcome (§3.6 А9, §3.8): reduce() reads the JSONL events — the session id from any event's sessionID, the answer
 // from the text parts of the last message (the last messageID of any part, not the last one with text), usage from
@@ -42,8 +44,8 @@
 // last error event (a context overflow can be compacted away and still exit 1 [02 fact-check note 1]). Without an
 // answer in the stream, finalize() runs `opencode export <session>` in the job's environment and takes the last
 // assistant message — only a finished one of this run (a resumed session also holds the earlier jobs' messages).
-// quota needs insufficient_quota / usage_not_included / GoUsageLimitError / FreeUsageLimitError in the error; any other
-// 429 ("Quota exceeded…" after five retries included) is rate-limit.
+// quota needs insufficient_quota / usage_not_included / GoUsageLimitError / FreeUsageLimitError in the error, or a 402
+// (DeepSeek's "Insufficient Balance"); any other 429 ("Quota exceeded…" after five retries included) is rate-limit.
 //
 // Resume (§3.6 А12): -s <session> with the same --dir and the same data dir (sessions live in SQLite under
 // XDG_DATA_HOME [02 §4]); resumeCheck compares both with the original job's meta. Cancel (§3.6 А8): SIGTERM to the
@@ -69,6 +71,8 @@ const AUTO_REJECTING = /auto-rejecting/i;
 const SESSION_NOT_FOUND = /Session not found/i;
 // quota only with a sign of an exhausted quota in the error itself (spec §3.8).
 export const QUOTA_MARKERS = ["insufficient_quota", "usage_not_included", "GoUsageLimitError", "FreeUsageLimitError"];
+// HTTP 402 Payment Required: an exhausted balance, as DeepSeek reports it [04b §11] — unlike a 429, never ambiguous.
+const INSUFFICIENT_BALANCE = /insufficient[ _]balance/i;
 const NETWORK = /ECONNREFUSED|ECONNRESET|ETIMEDOUT|fetch failed|socket hang up/i;
 // A step that ended for one of these reasons is not a final answer (export fallback).
 const UNFINISHED = new Set(["tool-calls", "length", "error", "content-filter"]);
@@ -96,6 +100,15 @@ export function tempDirRules({ tmpdir = null, dataDir = null, platform = null } 
   return Object.fromEntries([...new Set(dirs)].map((dir) => [`${dir}/*`, "allow"]));
 }
 
+// The reviewer's bash: OpenCode matches a pattern against the whole command text, `*` is any run of characters (no
+// word boundary) and a trailing " *" also matches nothing, so "git diff *" matches `git diff` and `git diff HEAD`, not
+// `git difftool` or `git diff-tree` ("git diff*" did). Each command comes alone too, in case a version lacks that
+// trailing rule. Then the arguments that make the four commands write a file (--output), run a configured program
+// (--ext-diff, --textconv) or read outside the tree (--no-index; external_directory does not check git's arguments),
+// denied after the allows: the last match wins [02 §7].
+const REVIEWER_GIT = ["git show", "git diff", "git log", "git status"];
+const REVIEWER_GIT_DENY = ["* --output*", "*--ext-diff*", "*--textconv*", "*--no-index*"];
+
 // The complete explicit rule set of a role's agent: explicit `deny` comes back to the model as a tool error and the
 // loop goes on; only an `ask` left over ends the run (blocked) [02 §7]. `temp` is tempDirRules()'s input.
 export function basePermission(write, temp = {}) {
@@ -111,7 +124,11 @@ export function basePermission(write, temp = {}) {
     list: "allow",
     edit: "deny",
     task: "deny",
-    bash: { "*": "deny", "git show*": "allow", "git diff*": "allow", "git log*": "allow", "git status*": "allow" },
+    bash: {
+      "*": "deny",
+      ...Object.fromEntries(REVIEWER_GIT.flatMap((command) => [[command, "allow"], [`${command} *`, "allow"]])),
+      ...Object.fromEntries(REVIEWER_GIT_DENY.map((pattern) => [pattern, "deny"])),
+    },
     external_directory: external,
     webfetch: "deny",
     websearch: "deny",
@@ -130,6 +147,21 @@ export function mergePermission(base, extra) {
   return merged;
 }
 
+// What a reviewer takes from options.permission: its deny rules only — a plain "deny", and the "deny" patterns of an
+// object (a key left with none is dropped). An allow or an ask would widen sp-reviewer past read-only (spec §3.6 А4),
+// as an allow rule past the four git commands would widen claude's reviewer. Merged, a deny only narrows the set.
+export function denyRules(extra) {
+  const rules = {};
+  for (const [name, rule] of Object.entries(extra ?? {})) {
+    if (rule === "deny") rules[name] = rule;
+    else if (isObject(rule)) {
+      const patterns = Object.entries(rule).filter(([, action]) => action === "deny");
+      if (patterns.length > 0) rules[name] = Object.fromEntries(patterns);
+    }
+  }
+  return rules;
+}
+
 function checkPermissionOption(value, profileName) {
   if (value === undefined) return {};
   const bad = (name) => new UsageError(`profile ${profileName}: options.permission.${name} must be "allow", "deny", "ask" or an object of patterns to those`);
@@ -140,15 +172,15 @@ function checkPermissionOption(value, profileName) {
   return value;
 }
 
-// The two primary agents and the set of the job's role.
+// The two primary agents and the set of the job's role: options.permission in full for the writer, its deny rules for
+// the reviewer.
 export function agentConfig({ write, options = {}, temp = {}, profileName = "-" }) {
   const extra = checkPermissionOption(options.permission, profileName);
   const sets = {
-    [IMPLEMENTER]: basePermission(true, temp),
-    [REVIEWER]: basePermission(false, temp),
+    [IMPLEMENTER]: mergePermission(basePermission(true, temp), extra),
+    [REVIEWER]: mergePermission(basePermission(false, temp), denyRules(extra)),
   };
   const role = write ? IMPLEMENTER : REVIEWER;
-  sets[role] = mergePermission(sets[role], extra);
   return {
     role,
     permission: sets[role],
@@ -184,11 +216,31 @@ export function dataDirOf(profile, ctx) {
   return typeof home === "string" && home ? path.join(home, ".local", "share") : null;
 }
 
+// The provider of profile.model ("deepseek" of deepseek/deepseek-v4-pro), or null.
+const providerOf = (profile) => (typeof profile?.model === "string" && profile.model.includes("/") ? profile.model.split("/")[0] : null);
+
+// Why a keyed profile would not run on its key, or null. A credential stored by `opencode auth login` for the
+// provider wins over keyVar [02 §5]: the job would bill that login while `channels` names the key. The user's own data
+// dir may hold one at any time, so a keyed profile runs in its isolated home only (spec §3.4); there, an auth.json
+// (left by a login profile of the same name, or a login through `profile env`) refuses the run. Only its existence is
+// checked: the adapter never reads a credential store.
+function storedLoginProblem(profile, ctx) {
+  if (!keyed(profile)) return null;
+  const keyVar = profile.keyVar ?? "keyVar";
+  if (profile.home !== "isolated") {
+    return `a keyed opencode profile runs in its isolated home (the default): in your own home a stored ${providerOf(profile) ?? "provider"} login would win over ${keyVar}`;
+  }
+  const file = path.join(xdgOf(isolatedHome(ctx)).XDG_DATA_HOME, "opencode", "auth.json");
+  if (ctx?.fs?.exists?.(file) !== true) return null;
+  return `${file} exists: a login stored there by opencode auth login wins over ${keyVar}; remove that file (a keyed profile needs no login)`;
+}
+
 // With XDG_CONFIG_HOME set, git reads $XDG_CONFIG_HOME/git/{config,ignore,attributes} instead of the caller's
 // (~/.gitconfig still applies), so in an isolated home the model's git commands would lose the user's identity, global
 // ignores and attributes. This file restores git's own defaults: the caller's XDG config dir, or ~/.config — never
-// a dir under homes/ (a shell that ran `eval "$(agent-dispatch profile env P)"` would make the include point at
-// itself). git skips a missing include target and a missing excludes or attributes file. null when nothing to name.
+// a dir under homes/ (a caller running with the variables of `agent-dispatch profile env P` would make the include
+// point at itself). git skips a missing include target and a missing excludes or attributes file. null when nothing to
+// name.
 export function gitConfigOf(profile, ctx) {
   const absolute = (value) => typeof value === "string" && path.isAbsolute(value) && !/[\n\r\0]/.test(value);
   const underHomes = (dir) => `${path.resolve(dir)}${path.sep}`.startsWith(`${path.resolve(ctx.paths.homes)}${path.sep}`);
@@ -237,6 +289,8 @@ function invocation(req, ctx) {
   const profileName = req.profileName ?? ctx?.profileName ?? "-";
   const model = modelOf(profile, profileName);
   const keyVar = keyVarOf(profile, profileName);
+  const stored = storedLoginProblem(profile, ctx);
+  if (stored) throw new UsageError(`profile ${profileName}: ${stored}`);
   const options = isObject(profile.options) ? profile.options : {};
   const write = req.write === true;
   const temp = { tmpdir: effectiveEnv(profile, ctx, "TMPDIR"), dataDir: dataDirOf(profile, ctx), platform: ctx?.platform ?? null };
@@ -304,6 +358,7 @@ export function classifyError(error) {
   if (SESSION_NOT_FOUND.test(text)) return "resume-lost";
   if (name === "ContextOverflowError" || has("context_length_exceeded") || has("Input exceeds context window")) return "context";
   if (QUOTA_MARKERS.some((marker) => name === marker || has(marker))) return "quota";
+  if (status === 402 || INSUFFICIENT_BALANCE.test(text)) return "quota";
   if (name === "ProviderAuthError" || name === "ProviderInitError" || status === 401 || status === 403 || has("Unauthorized: request was blocked by a gateway") || has("Failed to initialize provider")) return "auth";
   if (name === "ProviderModelNotFoundError" || has("Model not found") || status === 404) return "model-not-selected";
   if (status === 429 || status === 529 || has("Quota exceeded") || /too many requests|rate limit|overloaded/i.test(text)) return "rate-limit";
@@ -445,11 +500,6 @@ function resumeCheck(prev, profile, req, ctx) {
   return null;
 }
 
-// `profile env P` for "home": "isolated": where `opencode auth login` keeps that profile's login (spec §4.3).
-function loginEnv(profile, ctx) {
-  return xdgOf(isolatedHome(ctx));
-}
-
 // The provider names of the stored credentials in `opencode auth list` output [02 §6]: the rows of its
 // "Credentials <path to auth.json>" block ("●  GitHub Copilot oauth": name, then the type), up to the "N credentials"
 // line — not the header's path, not the "Environment" block of provider variables that happen to be set.
@@ -470,41 +520,52 @@ export function authListNames(stdout) {
 
 const providerKey = (text) => String(text).toLowerCase().replace(/[^a-z0-9]/g, "");
 
-// Model-free checks for `doctor` (spec §5.4): the login through `opencode auth list` (it prints provider names, never
-// values [02 §6]), a stored login that would win over the key, and rules that end a run.
+// `opencode auth list` in the profile's home and environment (its wrap, the core's allowlist, profile.env, the
+// isolated XDG_*): { bin, r, names } — the provider names of the stored credentials, never values [02 §6].
+async function storedLogins(profile, ctx) {
+  const bin = profile.bin ?? DEFAULT_BIN;
+  const wrap = Array.isArray(profile.wrap) ? profile.wrap : [];
+  const env = filterEnv(ctx.env ?? {});
+  for (const [name, value] of Object.entries(isObject(profile.env) ? profile.env : {})) {
+    if (value === null) delete env[name];
+    else env[name] = String(value);
+  }
+  Object.assign(env, homeEnvOf(profile, ctx));
+  const argv = [...wrap, bin, "auth", "list"];
+  const r = await ctx.exec(argv[0], argv.slice(1), { env });
+  return { bin, r, names: r.error || r.status !== 0 ? null : authListNames(r.stdout) };
+}
+
+// Model-free checks for `doctor` (spec §5.4): the login through `opencode auth list`, a stored login that would win
+// over the key (FAIL, as the run refuses it), and rules that end a run or never reach the reviewer.
 async function doctorChecks(profile, ctx) {
   const checks = [];
   const add = (name, level, hint) => checks.push({ name, level, hint });
-  const provider = typeof profile?.model === "string" && profile.model.includes("/") ? profile.model.split("/")[0] : null;
-  if (keyed(profile) && profile.home !== "isolated") {
-    add("home", "WARN", `"home": "user" with a key: a ${provider ?? "provider"} login stored by opencode auth login in your data dir wins over ${profile.keyVar ?? "keyVar"}; "home": "isolated" (the default for keys) avoids that`);
+  const provider = providerOf(profile);
+  // Display names ("GitHub Copilot" for github-copilot, the id when the catalog has no name): equal to the provider
+  // id without case and punctuation. A provider listed under another name costs a WARN for a login and goes unseen
+  // for a key; the auth.json check still refuses that.
+  const lists = (names) => names.some((name) => providerKey(name) === providerKey(provider));
+  const stored = storedLoginProblem(profile, ctx);
+  if (stored) add("home", "FAIL", stored);
+  if (keyed(profile) && profile.home === "isolated" && provider && ctx?.fs?.exists?.(isolatedHome(ctx)) === true) {
+    const { bin, r, names } = await storedLogins(profile, ctx);
+    const keyVar = profile.keyVar ?? "keyVar";
+    if (!names) add("login", "WARN", `cannot run ${bin} auth list (${r.error?.code ?? `exit ${r.status}`}); a stored ${provider} login in the isolated home was not checked`);
+    else if (lists(names)) add("login", "FAIL", `opencode auth list in the isolated home names ${provider}: that stored login wins over ${keyVar}; remove it: agent-dispatch profile env ${ctx.profileName} -- opencode auth logout`);
+    else add("login", "ok", `no stored ${provider} login in the isolated home; the key goes in through ${keyVar}`);
   }
   if (profile?.auth === "login" && provider) {
-    const bin = profile.bin ?? DEFAULT_BIN;
-    const wrap = Array.isArray(profile.wrap) ? profile.wrap : [];
-    const env = filterEnv(ctx.env ?? {});
-    for (const [name, value] of Object.entries(isObject(profile.env) ? profile.env : {})) {
-      if (value === null) delete env[name];
-      else env[name] = String(value);
-    }
-    Object.assign(env, homeEnvOf(profile, ctx));
-    const argv = [...wrap, bin, "auth", "list"];
-    const r = await ctx.exec(argv[0], argv.slice(1), { env });
-    const where = profile.home === "isolated" ? `in the isolated home (eval "$(agent-dispatch profile env ${ctx.profileName})"; opencode auth login)` : "(opencode auth login)";
-    if (r.error || r.status !== 0) {
-      add("login", "WARN", `cannot run ${bin} auth list (${r.error?.code ?? `exit ${r.status}`}); the login of ${provider} was not checked`);
-    } else {
-      // Display names ("GitHub Copilot" for github-copilot, the id when the catalog has no name): equal to the
-      // provider id without case and punctuation. A provider listed under another name only costs a WARN.
-      const names = authListNames(r.stdout);
-      if (names.some((name) => providerKey(name) === providerKey(provider))) add("login", "ok", `opencode auth list names ${provider}`);
-      else add("login", "WARN", `opencode auth list shows no login for ${provider} (it lists: ${names.join(", ") || "none"}); the user logs in ${where}`);
-    }
+    const { bin, r, names } = await storedLogins(profile, ctx);
+    const where = profile.home === "isolated" ? `in the isolated home (agent-dispatch profile env ${ctx.profileName} -- opencode auth login)` : "(opencode auth login)";
+    if (!names) add("login", "WARN", `cannot run ${bin} auth list (${r.error?.code ?? `exit ${r.status}`}); the login of ${provider} was not checked`);
+    else if (lists(names)) add("login", "ok", `opencode auth list names ${provider}`);
+    else add("login", "WARN", `opencode auth list shows no login for ${provider} (it lists: ${names.join(", ") || "none"}); the user logs in ${where}`);
   }
-  const asks = Object.entries(isObject(profile?.options?.permission) ? profile.options.permission : {})
-    .filter(([, rule]) => rule === "ask" || (isObject(rule) && Object.values(rule).includes("ask")))
-    .map(([name]) => name);
-  if (asks.length > 0) add("permission", "WARN", `options.permission asks for ${asks.join(", ")}: a headless run auto-rejects an ask and ends blocked; use allow or deny`);
+  const permission = Object.entries(isObject(profile?.options?.permission) ? profile.options.permission : {});
+  const having = (action) => permission.filter(([, rule]) => rule === action || (isObject(rule) && Object.values(rule).includes(action))).map(([name]) => name);
+  if (having("ask").length > 0) add("permission", "WARN", `options.permission asks for ${having("ask").join(", ")}: a headless run auto-rejects an ask and ends blocked; use allow or deny`);
+  if (having("allow").length > 0) add("reviewer", "WARN", `options.permission allows ${having("allow").join(", ")} for sp-implementer only: sp-reviewer takes only its deny rules (spec §3.6 А4)`);
   if (profile?.options?.plugins === true) add("plugins", "ok", "options.plugins: external OpenCode plugins load (OPENCODE_PURE is not set)");
   return checks;
 }
@@ -522,6 +583,8 @@ export default {
     verifiedVersions: ["1.19.3"],
   },
   discover,
+  // The isolated home: its XDG_* are the job's and what `agent-dispatch profile env P` exports, so `opencode auth
+  // login` lands where the job looks (spec §4.3).
   prepareHome(profile, ctx) {
     if (profile?.home !== "isolated") return { env: {}, dirs: [], files: [] };
     const env = homeEnvOf(profile, ctx);
@@ -539,13 +602,12 @@ export default {
   reduce,
   finalize,
   resumeCheck,
-  loginEnv,
   doctorChecks,
   patterns: {
     "resume-lost": ["Session not found"],
     "model-not-selected": ["Model not found:", "ProviderModelNotFoundError"],
     auth: ["ProviderAuthError", "Failed to initialize provider", "Unauthorized: request was blocked by a gateway"],
-    quota: QUOTA_MARKERS,
+    quota: [...QUOTA_MARKERS, INSUFFICIENT_BALANCE],
     context: ["ContextOverflowError", "context_length_exceeded", "Input exceeds context window"],
     blocked: ["auto-rejecting"],
     "rate-limit": ["Quota exceeded", "Too Many Requests", "rate limit"],

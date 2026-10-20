@@ -8,15 +8,17 @@
 # of the adapter are unit-tested directly. Runs on macOS and Linux.
 #
 # Covered (spec §8 row 4 and the adapter contract): golden argv / env / stdin for each auth mode and role; the sp-
-# agents in OPENCODE_CONFIG_CONTENT, the role's set in OPENCODE_PERMISSION, options.permission / options.plugins; the
-# project's instructions; home isolated for a key and user for a login, with git still reading the caller's config;
-# profile.env overriding the defaults and its own TMPDIR in external_directory; sandbox native changes nothing; stdin
-# closed after the prompt (stdin-wait); exit 1 with a valid answer is success; the answer of the last message, only once
-# its step finished (a narration before a crash or a kill is none); the export fallback, only for a finished message of
-# this run; a surviving ask → blocked; "agent … not found" → launch; quota only with markers in the body; the error
-# classes; resume with the same --dir and data dir, "Session not found" → resume-lost; the cancel ladder (SIGTERM,
-# 5 s, SIGKILL) over detached descendants; timeout; secrets never in argv / config / logs; OpenCode 2 → launch;
-# doctorChecks (the login from the credential rows of `auth list` only) and the probe.
+# agents in OPENCODE_CONFIG_CONTENT, the role's set in OPENCODE_PERMISSION, the reviewer's git rules as OpenCode decides
+# them (bypasses denied), options.permission (never widening the reviewer) / options.plugins; the project's
+# instructions; home isolated for a key and user for a login, with git still reading the caller's config; a key refused
+# in the user's home or beside a stored auth.json; profile.env overriding the defaults and its own TMPDIR in
+# external_directory; sandbox native changes nothing; stdin closed after the prompt (stdin-wait); exit 1 with a valid
+# answer is success; the answer of the last message, only once its step finished (a narration before a crash or a kill
+# is none); the export fallback, only for a finished message of this run; a surviving ask → blocked; "agent … not
+# found" → launch; quota only with markers in the body or a 402; the error classes; resume with the same --dir and data
+# dir, "Session not found" → resume-lost; the cancel ladder (SIGTERM, 5 s, SIGKILL) over detached descendants; timeout;
+# secrets never in argv / config / logs; OpenCode 2 → launch; doctorChecks (the login from the credential rows of `auth
+# list` only, a stored login beside a key) and the probe.
 #
 # Every process a run starts carries the run's temp root in its argv (runners: their jobs dir; the stub: its link under
 # the temp root; descendants: their pid file), so the cleanup and the leak check touch this run only.
@@ -243,7 +245,9 @@ main() {
     "oc-login": { "harness": "opencode", "auth": "login", "model": "github-copilot/gpt-6-mini", "bin": "$OC", "maxParallel": 30 },
     "oc-login-iso": { "harness": "opencode", "auth": "login", "home": "isolated", "model": "github-copilot/gpt-6-mini", "bin": "$OC" },
     "oc-key-user": { "harness": "opencode", "auth": { "key": "deepseek" }, "keyVar": "DEEPSEEK_API_KEY", "home": "user", "model": "deepseek/deepseek-v4-pro", "bin": "$OC" },
+    "oc-key-new": { "harness": "opencode", "auth": { "key": "deepseek" }, "keyVar": "DEEPSEEK_API_KEY", "model": "deepseek/deepseek-v4-pro", "bin": "$OC" },
     "oc-opts": { "harness": "opencode", "auth": "login", "model": "openai/gpt-6-luna", "bin": "$OC", "options": { "permission": { "bash": { "git push*": "deny" }, "webfetch": "allow" }, "plugins": true } },
+    "oc-widen": { "harness": "opencode", "auth": "login", "model": "github-copilot/gpt-6-mini", "bin": "$OC", "maxParallel": 30, "options": { "permission": { "edit": "allow", "bash": "allow", "task": "allow", "read": { "secret/*": "deny", "*.env": "allow" } } } },
     "oc-native": { "harness": "opencode", "auth": "login", "model": "github-copilot/gpt-6-mini", "bin": "$OC", "sandbox": "native" },
     "oc-ask": { "harness": "opencode", "auth": "login", "model": "github-copilot/gpt-6-mini", "bin": "$OC", "options": { "permission": { "bash": { "npm *": "ask" } } } },
     "oc-conflict": { "harness": "opencode", "auth": "login", "model": "github-copilot/gpt-6-mini", "bin": "$OC", "env": { "OPENCODE_DISABLE_PROJECT_CONFIG": "0" } },
@@ -277,7 +281,10 @@ EOF
         echo "{$rules}"
     }
     impl_set() { canon "{\"*\":\"allow\",\"read\":$READ,\"external_directory\":$(ext_rules "$1"),\"doom_loop\":\"deny\",\"question\":\"deny\",\"webfetch\":\"deny\",\"websearch\":\"deny\"}"; }
-    rev_set() { canon "{\"*\":\"deny\",\"read\":$READ,\"grep\":\"allow\",\"glob\":\"allow\",\"list\":\"allow\",\"edit\":\"deny\",\"task\":\"deny\",\"bash\":{\"*\":\"deny\",\"git show*\":\"allow\",\"git diff*\":\"allow\",\"git log*\":\"allow\",\"git status*\":\"allow\"},\"external_directory\":$(ext_rules "$1"),\"webfetch\":\"deny\",\"websearch\":\"deny\"}"; }
+    # The reviewer's bash: each git command alone and with arguments ("git diff *", not "git diff*", which also
+    # matches difftool), then the arguments that write, run or read outside the tree, denied last (the last match wins).
+    local REV_BASH='{"*":"deny","git show":"allow","git show *":"allow","git diff":"allow","git diff *":"allow","git log":"allow","git log *":"allow","git status":"allow","git status *":"allow","* --output*":"deny","*--ext-diff*":"deny","*--textconv*":"deny","*--no-index*":"deny"}'
+    rev_set() { canon "{\"*\":\"deny\",\"read\":$READ,\"grep\":\"allow\",\"glob\":\"allow\",\"list\":\"allow\",\"edit\":\"deny\",\"task\":\"deny\",\"bash\":$REV_BASH,\"external_directory\":$(ext_rules "$1"),\"webfetch\":\"deny\",\"websearch\":\"deny\"}"; }
     local IMPL REV
     IMPL="$(impl_set "$STATE/homes/oc-key/data")"
     REV="$(rev_set "$STATE/homes/oc-key/data")"
@@ -377,13 +384,24 @@ EOF
     got="$(printf '%s\n' "$OUT" | sed -e "s/^export [A-Z_]*='//" -e "s/'\$//" | tr '\n' ' ')"
     [[ "$RC" -eq 0 && "$got" == "$iso_xdg " && "$(grep -c '^export XDG_' <<<"$OUT")" -eq 4 ]]
     verdict "4 profile env oc-login-iso exports the same four XDG dirs the job ran with (opencode auth login lands where the job looks)" $? "out: $OUT"
-    rec="$REC/key-user.json"
-    id="$(AGENT_STUB_RECORD="$rec" XDG_DATA_HOME="$TEST_ROOT/xdg-data" start oc-key-user)"
-    st="$(finish "$id")"
-    [[ "$st" == "completed -" && "$(rjs "$rec" "$xdg")" == "- $TEST_ROOT/xdg-data - -" && "$(rjs "$rec" 'r.env.DEEPSEEK_API_KEY')" == "$KEY" ]]
-    verdict "4 key + home user: the key in keyVar, the caller's XDG_* unchanged" $? "st=$st xdg: $(rjs "$rec" "$xdg")"
+    # A login stored for the provider wins over keyVar [02 §5]: a key runs neither in the user's home nor in an isolated
+    # home that holds an auth.json (a login profile renamed to a key, a login through profile env) — exit 2, no job.
+    local n0 authjson="$STATE/homes/oc-key/data/opencode/auth.json"
+    n0="$(find "$STATE/state" -name 'oc-*.json' | wc -l | tr -d ' ')"
+    run_ad task --profile oc-key-user --background --prompt-file "$PROMPT"
+    [[ "$RC" -eq 2 && "$ERR" == *'profile oc-key-user: a keyed opencode profile runs in its isolated home (the default): in your own home a stored deepseek login would win over DEEPSEEK_API_KEY'* ]]
+    verdict "4 key + home user is refused (exit 2): a deepseek login stored in the user's data dir would win over the key" $? "rc=$RC err: $ERR"
+    printf '{}\n' >"$authjson" # a stand-in: the adapter only checks that the file exists
+    run_ad task --profile oc-key --background --prompt-file "$PROMPT"
+    ok=$RC
+    local erra="$ERR"
+    rm -f "$authjson"
+    n="$(find "$STATE/state" -name 'oc-*.json' | wc -l | tr -d ' ')"
+    [[ "$ok" -eq 2 && "$erra" == *"profile oc-key: $authjson exists: a login stored there by opencode auth login wins over DEEPSEEK_API_KEY; remove that file"* && "$n" == "$n0" ]]
+    verdict "4 a key whose isolated home holds an auth.json is refused (exit 2), naming the file to remove; neither refusal left a job" $? "rc=$ok err: $erra" "records: $n0 → $n"
 
-    # --- 5. options: permission merged into the role's agent, plugins drop OPENCODE_PURE (spec §3.6 Б) ---
+    # --- 5. options: permission merged into the writer's agent, only its deny rules into the reviewer's; plugins drop
+    # OPENCODE_PURE (spec §3.6 А4, Б) ---
     rec="$REC/opts.json"
     id="$(AGENT_STUB_RECORD="$rec" start oc-opts --write)"
     st="$(finish "$id")"
@@ -392,12 +410,40 @@ const impl = JSON.parse(process.argv[1]);
 impl.webfetch = "allow";
 impl.bash = { "git push*": "deny" };
 process.stdout.write(JSON.stringify(impl));' -- "$(impl_set "$HOME/.local/share")")"
+    local want_rev
+    want_rev="$(node -e '
+const rev = JSON.parse(process.argv[1]);
+rev.bash["git push*"] = "deny";
+process.stdout.write(JSON.stringify(rev));' -- "$(rev_set "$HOME/.local/share")")"
     [[ "$st" == "completed -" && "$(rjs "$rec" 'r.env.OPENCODE_PERMISSION')" == "$want" \
         && "$(rjs "$rec" 'JSON.stringify(JSON.parse(r.env.OPENCODE_CONFIG_CONTENT).agent["sp-implementer"].permission)')" == "$want" \
-        && "$(rjs "$rec" 'JSON.stringify(JSON.parse(r.env.OPENCODE_CONFIG_CONTENT).agent["sp-reviewer"].permission)')" == "$(rev_set "$HOME/.local/share")" ]]
-    verdict "5 options.permission merges into the writer's set (webfetch replaced in place, bash patterns added last); the reviewer's set is untouched" $? "st=$st" "want: $want" "got:  $(rjs "$rec" 'r.env.OPENCODE_PERMISSION')"
+        && "$(rjs "$rec" 'JSON.stringify(JSON.parse(r.env.OPENCODE_CONFIG_CONTENT).agent["sp-reviewer"].permission)')" == "$want_rev" ]]
+    verdict "5 options.permission merges into the writer's set (webfetch replaced in place, bash patterns added last); the reviewer's set takes its deny rule only (no webfetch: allow)" $? "st=$st" "want: $want" "got:  $(rjs "$rec" 'r.env.OPENCODE_PERMISSION')" "want reviewer: $want_rev" "got reviewer:  $(rjs "$rec" 'JSON.stringify(JSON.parse(r.env.OPENCODE_CONFIG_CONTENT).agent["sp-reviewer"].permission)')"
     [[ "$(rjs "$rec" '"OPENCODE_PURE" in r.env')" == false && "$(rjs "$rec" 'r.env.OPENCODE_DISABLE_AUTOUPDATE + r.env.OPENCODE_DISABLE_EXTERNAL_SKILLS')" == 11 ]]
     verdict "5 options.plugins: true leaves OPENCODE_PURE unset; the other defaults stay" $? "$(rjs "$rec" "$oc_vars")"
+    # options.permission never widens a reviewer (spec §3.6 А4): edit / bash / task: allow and read *.env: allow reach
+    # the writer only; the reviewer takes the deny pattern (read secret/*) and nothing else — in both roles' jobs.
+    rec="$REC/widen-rev.json"
+    id="$(AGENT_STUB_RECORD="$rec" start oc-widen)"
+    id2="$(AGENT_STUB_RECORD="$REC/widen-impl.json" start oc-widen --write)"
+    st="$(finish "$id") $(finish "$id2")"
+    want_rev="$(node -e '
+const rev = JSON.parse(process.argv[1]);
+rev.read["secret/*"] = "deny";
+process.stdout.write(JSON.stringify(rev));' -- "$(rev_set "$HOME/.local/share")")"
+    want="$(node -e '
+const impl = JSON.parse(process.argv[1]);
+Object.assign(impl, { edit: "allow", bash: "allow", task: "allow" });
+Object.assign(impl.read, { "*.env": "allow", "secret/*": "deny" });
+process.stdout.write(JSON.stringify(impl));' -- "$(impl_set "$HOME/.local/share")")"
+    local rev_of='JSON.stringify(JSON.parse(r.env.OPENCODE_CONFIG_CONTENT).agent["sp-reviewer"].permission)'
+    [[ "$st" == "completed - completed -" && "$(rjs "$rec" 'r.env.OPENCODE_PERMISSION')" == "$want_rev" && "$(rjs "$rec" "$rev_of")" == "$want_rev" ]]
+    verdict "5 a reviewer job: options.permission's allow rules (edit, bash, task; read *.env) are dropped, its deny pattern (read secret/*) is merged" $? "st=$st" "want: $want_rev" "got:  $(rjs "$rec" 'r.env.OPENCODE_PERMISSION')"
+    [[ "$(rjs "$REC/widen-impl.json" 'r.env.OPENCODE_PERMISSION')" == "$want" && "$(rjs "$REC/widen-impl.json" "$rev_of")" == "$want_rev" ]]
+    verdict "5 a writer job on the same profile: options.permission merges in full into sp-implementer; sp-reviewer's set stays the same" $? "want: $want" "got:  $(rjs "$REC/widen-impl.json" 'r.env.OPENCODE_PERMISSION')"
+    run_ad doctor --profile oc-widen
+    [[ "$RC" -eq 0 && "$OUT" == *"WARN reviewer oc-widen: options.permission allows edit, bash, task, read for sp-implementer only: sp-reviewer takes only its deny rules (spec §3.6 А4)"* ]]
+    verdict "5 doctor: options.permission's allow rules are one WARN line (they never reach the reviewer)" $? "rc=$RC" "$OUT"
     # profile.env overrides the defaults of §3.6 Б (a value, or null to drop one) — unlike the mandatory settings (test 1).
     rec="$REC/override.json"
     id="$(AGENT_STUB_RECORD="$rec" start oc-override)"
@@ -508,15 +554,16 @@ process.stdout.write(JSON.stringify(impl));' -- "$(impl_set "$HOME/.local/share"
         esac
     done
 
-    # --- 9. error classes from the error event (spec §3.8): quota only with its markers ---
-    local pairs="auth:auth auth-401:auth quota:quota quota-plan:quota quota-go:quota quota-free:quota rate-limit:rate-limit overloaded:rate-limit server:server context:context balance:crash unknown:crash"
+    # --- 9. error classes from the error event (spec §3.8): quota only with its markers or a 402 ---
+    local pairs="auth:auth auth-401:auth quota:quota quota-plan:quota quota-go:quota quota-free:quota rate-limit:rate-limit overloaded:rate-limit server:server context:context balance:quota unknown:crash"
     ids=""
     local pair cls
     for pair in $pairs; do
         id="$(AGENT_STUB_MODE=error AGENT_STUB_CLASS="${pair%%:*}" start oc-login)"
         ids="$ids $pair=$id"
     done
-    id="$(AGENT_STUB_MODE=exit0-error AGENT_STUB_CLASS=auth start oc-login)"
+    # (the generic mode's default message is "Insufficient balance", a quota sign before any other)
+    id="$(AGENT_STUB_MODE=exit0-error AGENT_STUB_CLASS=auth AGENT_STUB_MESSAGE="Invalid API key" start oc-login)"
     ids="$ids exit0:auth=$id"
     id="$(AGENT_STUB_MODE=quota start oc-login)"
     ids="$ids mode-quota:quota=$id"
@@ -537,7 +584,8 @@ process.stdout.write(JSON.stringify(impl));' -- "$(impl_set "$HOME/.local/share"
                 verdict "9 an error event with exit 0 is still a failure: ProviderAuthError → auth" $? "st=$st exit=$(jfield job.exitCode <<<"$sj")" ;;
             *)
                 [[ "$st" == "failed $want" && "$(jfield job.exitCode <<<"$sj")" == 1 ]]
-                verdict "9 error ${cls} ($(jfield job.errorText <<<"$sj" | head -c 70)) → $want" $? "st=$st" ;;
+                ok=$? # before the label: its command substitution would reset $?
+                verdict "9 error ${cls} ($(jfield job.errorText <<<"$sj" | head -c 70)) → $want" "$ok" "st=$st" ;;
         esac
     done
 
@@ -627,12 +675,16 @@ process.stdout.write(JSON.stringify(impl));' -- "$(impl_set "$HOME/.local/share"
     verdict "12 the job's wall-clock limit (timeoutMin) → failed/timeout (OpenCode's own retries are invisible in run JSON)" $? "st=$st/$(st_json "$id" | jfield job.errorClass)"
 
     # --- 13. secrets: the key printed by the harness is redacted in the log, status and result (spec §3.6 А11) ---
-    id="$(AGENT_STUB_MODE=leak-secret AGENT_STUB_SECRET_VAR=DEEPSEEK_API_KEY XDG_DATA_HOME="$TEST_ROOT/xdg-data" start oc-key-user)"
+    # OpenCode's own session store (its DB under the data dir; the stub's stub-sessions) keeps what the model said, as
+    # it would in the user's data dir: the core redacts the files it writes, not the harness's. So the scan leaves out
+    # the isolated home's opencode/ dir (a key profile runs in its isolated home only).
+    local store="$STATE/homes/oc-key/data/opencode/"
+    id="$(AGENT_STUB_MODE=leak-secret AGENT_STUB_SECRET_VAR=DEEPSEEK_API_KEY start oc-key)"
     st="$(finish "$id")"
     run_ad result "$id"
-    got="$(grep -rlF "$KEY" "$STATE" 2>/dev/null | tr '\n' ' ')"
+    got="$(grep -rlF "$KEY" "$STATE" 2>/dev/null | grep -vF "$store" | tr '\n' ' ')"
     [[ "$st" == "completed -" && "$OUT" == *"key=<redacted>"* && "$OUT" != *"$KEY"* && "$got" == "$STATE/keys/deepseek " ]] && grep -rqF "<redacted>" "$STATE/state"
-    verdict "13 a key the harness prints reaches no result, record or log: <redacted>" $? "st=$st out=$OUT files: $got"
+    verdict "13 a key the harness prints reaches no result, record or log: <redacted> (only OpenCode's own session store keeps it)" $? "st=$st out=$OUT files: $got"
 
     # --- 14. discovery: version, OpenCode 2, flags, binary (spec §2, §3.2) ---
     id="$(AGENT_STUB_VERSION=2.1.0 start oc-login)"
@@ -662,7 +714,7 @@ process.stdout.write(JSON.stringify(impl));' -- "$(impl_set "$HOME/.local/share"
     rm -f "$TEST_ROOT/calls.txt"
     AGENT_STUB_CALL_LOG="$TEST_ROOT/calls.txt" run_ad doctor --profile oc-login-iso
     ok=$?
-    [[ "$OUT" == *"WARN login oc-login-iso: opencode auth list shows no login for github-copilot (it lists: none); the user logs in in the isolated home (eval \"\$(agent-dispatch profile env oc-login-iso)\"; opencode auth login)"* \
+    [[ "$OUT" == *"WARN login oc-login-iso: opencode auth list shows no login for github-copilot (it lists: none); the user logs in in the isolated home (agent-dispatch profile env oc-login-iso -- opencode auth login)"* \
         && "$(grep '^auth-list' "$TEST_ROOT/calls.txt")" == "auth-list $STATE/homes/oc-login-iso/data" ]]
     verdict "15 doctor of an isolated login runs 'opencode auth list' in that home (the user's login does not count)" $? "$OUT" "calls: $(cat "$TEST_ROOT/calls.txt" 2>/dev/null)"
     mkdir -p "$STATE/homes/oc-login-iso/data/opencode"
@@ -681,9 +733,31 @@ process.stdout.write(JSON.stringify(impl));' -- "$(impl_set "$HOME/.local/share"
     run_ad doctor --profile oc-zen
     [[ "$OUT" == *"WARN login oc-zen: opencode auth list shows no login for opencode (it lists: OpenCode Go, OpenCode Zen)"* ]]
     verdict "15 doctor: a provider listed under a display name other than its id is a WARN that names what is listed" $? "$OUT"
-    run_ad doctor --profile oc-key-user
-    [[ "$RC" -eq 0 && "$OUT" == *'WARN home oc-key-user: "home": "user" with a key: a deepseek login stored by opencode auth login in your data dir wins over DEEPSEEK_API_KEY'* && "$OUT" == *"ok key oc-key-user: deepseek in"* ]]
-    verdict "15 doctor: a key with home user → WARN (a stored login of the provider would win)" $? "$OUT"
+    rm -f "$TEST_ROOT/calls.txt"
+    AGENT_STUB_CALL_LOG="$TEST_ROOT/calls.txt" run_ad doctor --profile oc-key-user
+    [[ "$RC" -eq 1 && "$OUT" == *'FAIL home oc-key-user: a keyed opencode profile runs in its isolated home (the default): in your own home a stored deepseek login would win over DEEPSEEK_API_KEY'* \
+        && "$OUT" == *"ok key oc-key-user: deepseek in"* && "$(grep -c '^auth-list' "$TEST_ROOT/calls.txt")" -eq 0 ]]
+    verdict "15 doctor: a key with home user → FAIL, as the run refuses it (a stored login of the provider would win); no auth list" $? "rc=$RC" "$OUT"
+    # A key in its isolated home: auth list runs there once the home exists; a stored login of the provider is a FAIL.
+    rm -f "$TEST_ROOT/calls.txt"
+    AGENT_STUB_CALL_LOG="$TEST_ROOT/calls.txt" run_ad doctor --profile oc-key-new
+    [[ "$RC" -eq 0 && "$OUT" != *"login oc-key-new"* && "$OUT" != *"home oc-key-new"* && ! -e "$STATE/homes/oc-key-new" && "$(grep -c '^auth-list' "$TEST_ROOT/calls.txt")" -eq 0 ]]
+    verdict "15 doctor: a key whose isolated home does not exist yet → nothing to check there (no auth list)" $? "rc=$RC" "$OUT" "calls: $(cat "$TEST_ROOT/calls.txt" 2>/dev/null)"
+    rm -f "$TEST_ROOT/calls.txt"
+    AGENT_STUB_CALL_LOG="$TEST_ROOT/calls.txt" run_ad doctor --profile oc-key
+    [[ "$RC" -eq 0 && "$OUT" == *"ok login oc-key: no stored deepseek login in the isolated home; the key goes in through DEEPSEEK_API_KEY"* \
+        && "$(grep '^auth-list' "$TEST_ROOT/calls.txt")" == "auth-list $STATE/homes/oc-key/data" ]]
+    verdict "15 doctor: a key in its isolated home → 'opencode auth list' there; no deepseek login → ok" $? "rc=$RC" "$OUT" "calls: $(cat "$TEST_ROOT/calls.txt" 2>/dev/null)"
+    printf '{"deepseek":{"type":"api"}}\n' >"$STATE/homes/oc-key/data/opencode/stub-auth.json"
+    run_ad doctor --profile oc-key
+    rm -f "$STATE/homes/oc-key/data/opencode/stub-auth.json"
+    [[ "$RC" -eq 1 && "$OUT" == *"FAIL login oc-key: opencode auth list in the isolated home names deepseek: that stored login wins over DEEPSEEK_API_KEY; remove it: agent-dispatch profile env oc-key -- opencode auth logout"* ]]
+    verdict "15 doctor: a deepseek login stored in the key's isolated home → FAIL with the logout command" $? "rc=$RC" "$OUT"
+    printf '{}\n' >"$STATE/homes/oc-key/data/opencode/auth.json"
+    run_ad doctor --profile oc-key
+    rm -f "$STATE/homes/oc-key/data/opencode/auth.json"
+    [[ "$RC" -eq 1 && "$OUT" == *"FAIL home oc-key: $STATE/homes/oc-key/data/opencode/auth.json exists: a login stored there by opencode auth login wins over DEEPSEEK_API_KEY; remove that file"* ]]
+    verdict "15 doctor: an auth.json in the key's isolated home → FAIL naming the file, as the run refuses it" $? "rc=$RC" "$OUT"
     run_ad doctor --profile oc-ask
     [[ "$OUT" == *"WARN permission oc-ask: options.permission asks for bash: a headless run auto-rejects an ask and ends blocked"* ]]
     verdict "15 doctor: an 'ask' in options.permission → WARN (it can only end blocked)" $? "$OUT"
@@ -719,7 +793,7 @@ const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 // mergePermission / tempDirRules
 const base = mod.basePermission(false, { tmpdir: "/t/" });
 let m = mod.mergePermission(base, { bash: { "npm test*": "allow" } });
-check("merge: patterns go after a key's patterns", eq(Object.keys(m.bash), ["*", "git show*", "git diff*", "git log*", "git status*", "npm test*"]) && m.bash["npm test*"] === "allow");
+check("merge: patterns go after a key's patterns", eq(Object.keys(m.bash), [...Object.keys(base.bash), "npm test*"]) && Object.keys(m.bash).at(-2) === "*--no-index*" && m.bash["npm test*"] === "allow");
 m = mod.mergePermission(base, { edit: { "docs/*": "allow" } });
 check("merge: a plain action becomes the * pattern", eq(m.edit, { "*": "deny", "docs/*": "allow" }));
 m = mod.mergePermission(base, { webfetch: "allow", lsp: "allow" });
@@ -727,6 +801,45 @@ check("merge: an action replaces in place, a new key goes last", m.webfetch === 
 check("merge: the base set is not changed", base.webfetch === "deny" && base.edit === "deny" && !("npm test*" in base.bash));
 check("tempDirRules: $TMPDIR, /tmp and the truncation dir under the data dir", eq(mod.tempDirRules({ tmpdir: "/t/", dataDir: "/d", platform: "linux" }), { "/t/*": "allow", "/tmp/*": "allow", "/d/opencode/tool-output/*": "allow" }) && eq(mod.tempDirRules({}), { "/tmp/*": "allow" }) && eq(mod.tempDirRules({ tmpdir: "/tmp/" }), { "/tmp/*": "allow" }) && eq(mod.tempDirRules({ tmpdir: "rel" }), { "/tmp/*": "allow" }));
 check("tempDirRules: macOS adds the /private names of /tmp and /var dirs, nothing else", eq(Object.keys(mod.tempDirRules({ tmpdir: "/var/folders/x/T/", dataDir: "/Users/u/.local/share", platform: "darwin" })), ["/var/folders/x/T/*", "/tmp/*", "/Users/u/.local/share/opencode/tool-output/*", "/private/var/folders/x/T/*", "/private/tmp/*"]));
+
+// The reviewer's rules as OpenCode decides them (spec §3.6 А4). OpenCode flattens a permission set in key order and
+// takes the last rule whose permission and pattern both match; no match is ask [02 §7]. The matcher is a
+// reconstruction of v1's Wildcard.match (util/wildcard.ts; [02] pins the order, not the matcher): regex specials
+// escaped, `*` any run of characters, `?` one, a trailing " *" optional, the whole text. The bash text is a command's
+// own text (its env assignments and redirections included); a pipeline or list asks once per command.
+const wildcard = (text, pattern) => {
+  let re = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+  if (re.endsWith(" .*")) re = `${re.slice(0, -3)}( .*)?`;
+  return new RegExp(`^${re}$`, "s").test(text);
+};
+const decide = (set, permission, text) =>
+  Object.entries(set)
+    .flatMap(([key, rule]) => (typeof rule === "string" ? [[key, "*", rule]] : Object.entries(rule).map(([pattern, action]) => [key, pattern, action])))
+    .findLast(([key, pattern]) => wildcard(permission, key) && wildcard(text, pattern))?.[2] ?? "ask";
+const temp = { tmpdir: "/t", dataDir: "/d", platform: "linux" };
+const reviewerSet = mod.agentConfig({ write: false, temp }).permission;
+const BYPASS = [
+  "git difftool -y -x 'touch PWNED;' HEAD~1", "git difftool --extcmd=sh HEAD~1", "git diff --output=src/index.js HEAD~1",
+  "git diff --output src/index.js", "git log -1 --format=ARBITRARY --output=README.md", "git show --output=/Users/me/.zshrc HEAD",
+  "git diff --ext-diff HEAD~1", "git log -p --textconv", "git show --textconv HEAD:a.js", "git diff --no-index /etc/passwd a.txt",
+  "git diff-tree -p HEAD", "git show-branch --all", "GIT_EXTERNAL_DIFF=sh git diff", "git -c diff.external=sh diff", "git push origin main", "rm -rf src",
+];
+const ORDINARY = ["git diff", "git diff --stat HEAD~1 -- src", "git show HEAD:a.js", "git show", "git log --oneline -20", "git log", "git status --short", "git status"];
+// The commands of a list whose decision is not `want`, each with what it got.
+const otherThan = (set, list, want) => list.map((cmd) => [decide(set, "bash", cmd), cmd]).filter(([got]) => got !== want).map(([got, cmd]) => `${got}: ${cmd}`);
+check("reviewer rules: difftool -x / --extcmd, --output (diff, log, show), --ext-diff, --textconv, --no-index, diff-tree, show-branch, an env prefix, -c → deny", otherThan(reviewerSet, BYPASS, "deny").length === 0, otherThan(reviewerSet, BYPASS, "deny").join(" | "));
+check("reviewer rules: git diff / show / log / status, bare and with ordinary arguments → allow", otherThan(reviewerSet, ORDINARY, "allow").length === 0, otherThan(reviewerSet, ORDINARY, "allow").join(" | "));
+check("reviewer rules: the same set is agent sp-reviewer's", eq(mod.agentConfig({ write: false, temp }).agent["sp-reviewer"].permission, reviewerSet));
+// options.permission: in full for the writer, only its deny rules for the reviewer (spec §3.6 А4)
+const widening = { edit: "allow", bash: "allow", task: "allow", webfetch: "ask", external_directory: { "/etc/*": "allow" }, read: { "secret/*": "deny", "*.env": "allow" } };
+check("denyRules: a plain deny and the deny patterns of an object; allow, ask and a key left empty are dropped", eq(mod.denyRules?.(widening), { read: { "secret/*": "deny" } }) && eq(mod.denyRules?.({ bash: "deny", edit: { "*": "ask" } }), { bash: "deny" }) && eq(mod.denyRules?.(undefined), {}));
+const widened = mod.agentConfig({ write: false, temp, options: { permission: widening } });
+const changed = [...BYPASS, ...ORDINARY].filter((cmd) => decide(widened.permission, "bash", cmd) !== decide(reviewerSet, "bash", cmd));
+check("options.permission edit / bash / task: allow → a reviewer still edits nothing, runs no task, fetches nothing, and decides every command as before", decide(widened.permission, "edit", "src/a.js") === "deny" && decide(widened.permission, "task", "general") === "deny" && decide(widened.permission, "webfetch", "https://x") === "deny" && decide(widened.permission, "external_directory", "/etc/passwd") === "deny" && changed.length === 0, `changed: ${changed.join(" | ")}`);
+check("options.permission read: a reviewer takes the deny pattern (secret/*), not the allow (*.env)", decide(widened.permission, "read", "secret/k.txt") === "deny" && decide(widened.permission, "read", ".env") === "deny" && decide(widened.permission, "read", "src/a.js") === "allow");
+check("options.permission: the agent sp-reviewer of a writer's job has the same narrowed set", eq(mod.agentConfig({ write: true, temp, options: { permission: widening } }).agent["sp-reviewer"].permission, widened.permission));
+const writerSet = mod.agentConfig({ write: true, temp, options: { permission: widening } }).permission;
+check("options.permission: a writer takes all of it (edit, bash, task allow; read *.env allow; secret/* deny)", decide(writerSet, "edit", "src/a.js") === "allow" && decide(writerSet, "bash", "rm -rf src") === "allow" && decide(writerSet, "read", ".env") === "allow" && decide(writerSet, "read", "secret/k.txt") === "deny" && decide(writerSet, "external_directory", "/etc/passwd") === "allow");
 
 // classifyError: OpenCode error objects → classes (spec §3.8, [02 §11])
 const api = (statusCode, message, responseBody) => ({ name: "APIError", data: { message, statusCode, isRetryable: false, ...(responseBody ? { responseBody } : {}) } });
@@ -742,7 +855,9 @@ const table = [
   [api(403, "plan", '{"detail":{"code":"usage_not_included"}}'), "quota"],
   [{ name: "GoUsageLimitError", data: { message: "limit" } }, "quota"],
   [{ name: "FreeUsageLimitError", data: { message: "Free usage exceeded, subscribe to Go" } }, "quota"],
-  [api(402, "Insufficient Balance"), null],
+  [api(402, "Insufficient Balance"), "quota"],
+  [api(402, "Payment Required"), "quota"],
+  [{ name: "UnknownError", data: { message: '{"error":{"code":"insufficient_balance"}}' } }, "quota"],
   [api(529, "Overloaded"), "rate-limit"],
   [api(503, "Service Unavailable"), "server"],
   [{ name: "ProviderHeaderTimeoutError", data: { message: "Provider response headers timed out after 300000ms" } }, "server"],
@@ -808,6 +923,7 @@ check("patterns: Model not found → model-not-selected", outcome("Error: Model 
 check("patterns: provider init → auth", outcome('Error: Failed to initialize provider "deepseek". Check credentials and configuration.\n') === "auth");
 check("patterns: an invalid config → launch", outcome("Error: Config file at /x/opencode.json is not valid JSON(C)\n") === "launch");
 check("patterns: ECONNREFUSED → server", outcome("Error: connect ECONNREFUSED 127.0.0.1:443\n") === "server");
+check("patterns: Insufficient Balance on stderr → quota", outcome("Error: APIError 402: Insufficient Balance\n") === "quota");
 check("patterns: anything else with exit 1 → crash", outcome("Error: something else\n") === "crash");
 
 // finalize: export only when the stream had neither an answer nor a recognised error
@@ -861,7 +977,8 @@ check("invocation: the profile's TMPDIR replaces the caller's in external_direct
 inv = oc.invocation(req({ harness: "opencode", auth: "login", model: "a/b", home: "user", env: { TMPDIR: null } }), ctx);
 check("invocation: a profile that removes TMPDIR keeps only /tmp", !extOf(inv).includes("/t/*") && extOf(inv).includes("/tmp/*"));
 const home = await oc.prepareHome({ home: "isolated" }, ctx);
-check("prepareHome: isolated → XDG_* under homes/<profile>, dirs to create", home.env.XDG_DATA_HOME === path.join(root, "unit-state", "homes", "u1", "data") && home.dirs.length === 6 && eq(await oc.loginEnv({ home: "isolated" }, ctx), home.env));
+check("prepareHome: isolated → XDG_* under homes/<profile>, dirs to create", home.env.XDG_DATA_HOME === path.join(root, "unit-state", "homes", "u1", "data") && home.dirs.length === 6);
+check("no loginEnv hook: `profile env` exports prepareHome().env, the home the jobs get", !("loginEnv" in oc) && eq(Object.keys(home.env), ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]));
 check("prepareHome: isolated → config/git/config pointing git at the caller's ~/.config/git (0600)", home.files.length === 1 && home.files[0].path === path.join(home.env.XDG_CONFIG_HOME, "git", "config") && home.files[0].mode === 0o600 && home.files[0].content.includes('path = "/h/.config/git/config"') && home.files[0].content.includes('excludesFile = "/h/.config/git/ignore"') && home.dirs.includes(path.join(home.env.XDG_CONFIG_HOME, "git")));
 const gctx = (env) => core.makeCtx({ env: { AGENT_DISPATCH_STATE_DIR: path.join(root, "unit-state"), ...env }, profile: {}, profileName: "u1" });
 check("gitConfigOf: the caller's XDG_CONFIG_HOME wins over ~/.config", mod.gitConfigOf({ home: "isolated" }, gctx({ HOME: "/h", XDG_CONFIG_HOME: "/xdg" })).includes('path = "/xdg/git/config"'));
@@ -888,8 +1005,33 @@ for (const [label, profile, want] of [
   }
   check(`invocation refuses (UsageError): ${label}`, error instanceof core.UsageError && want.test(error.message), error?.message);
 }
-inv = oc.invocation(req({ harness: "opencode", auth: { keyEnv: "X" }, keyVar: "OPENCODE_API_KEY", model: "opencode-go/m" }), ctx);
+inv = oc.invocation(req({ harness: "opencode", auth: { keyEnv: "X" }, keyVar: "OPENCODE_API_KEY", model: "opencode-go/m", home: "isolated" }), ctx);
 check("invocation: keyVar OPENCODE_API_KEY (OpenCode Go's own provider variable) is accepted", eq(inv.secretEnv, ["OPENCODE_API_KEY"]));
+
+// A key and a stored login (spec §3.4): a keyed profile runs in its isolated home only, and only while that home has
+// no auth.json — whose existence alone is checked (fs.exists), never its content.
+const asked = [];
+const authFile = path.join(root, "unit-state", "homes", "u1", "data", "opencode", "auth.json");
+const fsWith = (present) => ({ exists: (file) => (asked.push(file), present.includes(file)), readFile: (file) => { throw new Error(`read ${file}`); }, stat: () => null });
+const keyedProfile = (extra) => ({ harness: "opencode", auth: { key: "deepseek" }, keyVar: "DEEPSEEK_API_KEY", model: "deepseek/deepseek-v4-pro", home: "isolated", ...extra });
+const refusal = (profile, c) => {
+  try {
+    oc.invocation(req(profile), c);
+    return null;
+  } catch (e) {
+    return e;
+  }
+};
+for (const [label, profile] of [["home user", keyedProfile({ home: "user" })], ["no home (the user's)", keyedProfile({ home: undefined })]]) {
+  const e = refusal(profile, ctx);
+  check(`invocation refuses (UsageError) a key with ${label}: a stored login in the user's data dir would win`, e instanceof core.UsageError && e.message === "profile u1: a keyed opencode profile runs in its isolated home (the default): in your own home a stored deepseek login would win over DEEPSEEK_API_KEY", e?.message);
+}
+let e = refusal(keyedProfile(), { ...ctx, fs: fsWith([authFile]) });
+check("invocation refuses (UsageError) a key whose isolated home holds an auth.json, naming the file; it is never read", e instanceof core.UsageError && e.message.startsWith(`profile u1: ${authFile} exists: a login stored there by opencode auth login wins over DEEPSEEK_API_KEY; remove that file`) && asked.includes(authFile), e?.message);
+e = refusal(keyedProfile(), { ...ctx, fs: fsWith([]) });
+check("invocation: a key in an isolated home without auth.json runs", e === null, e?.message);
+e = refusal({ harness: "opencode", auth: "login", model: "a/b", home: "isolated" }, { ...ctx, fs: fsWith([authFile]) });
+check("invocation: a login profile's auth.json is its login (no refusal)", e === null, e?.message);
 
 // resumeCheck
 check("resumeCheck: same --dir and data dir → null", oc.resumeCheck({ meta: { dir, dataDir: "/h/.local/share" } }, { home: "user" }, req({}), ctx) === null);
@@ -915,8 +1057,26 @@ check("authListNames: the rows of the Credentials block, without the type, the h
 check("authListNames: an empty store or no Credentials header → none", eq(mod.authListNames("\u250c  Credentials /x/opencode/auth.json\n\u2502\n\u2514  0 credentials\n"), []) && eq(mod.authListNames("garbage"), []));
 
 // doctorChecks shapes
-const checks = await oc.doctorChecks({ harness: "opencode", auth: { key: "k" }, keyVar: "K", home: "user", model: "deepseek/x", options: { permission: { edit: "ask" }, plugins: true } }, { ...ctx, exec: () => { throw new Error("no process for a key profile"); } });
-check("doctorChecks: [{name, level, hint}] — home WARN, permission WARN, plugins ok; no auth list for a key", eq(checks.map((c) => `${c.name}:${c.level}`), ["home:WARN", "permission:WARN", "plugins:ok"]) && checks.every((c) => typeof c.hint === "string" && c.hint));
+const checks = await oc.doctorChecks({ harness: "opencode", auth: { key: "k" }, keyVar: "K", home: "user", model: "deepseek/x", options: { permission: { edit: "ask" }, plugins: true } }, { ...ctx, exec: () => { throw new Error("no process for a key in the user's home"); } });
+check("doctorChecks: [{name, level, hint}] — home FAIL (as the run refuses it), permission WARN, plugins ok; no auth list for a key in the user's home", eq(checks.map((c) => `${c.name}:${c.level}`), ["home:FAIL", "permission:WARN", "plugins:ok"]) && checks.every((c) => typeof c.hint === "string" && c.hint));
+// A key in its isolated home: `opencode auth list` there once the home exists; the provider listed is a FAIL.
+const isoHome = path.join(root, "unit-state", "homes", "u1");
+const listing2 = (rows) => `┌  Credentials /x/opencode/auth.json\n│\n${rows.map((r) => `●  ${r} api\n│\n`).join("")}└  ${rows.length} credentials\n`;
+const dexecs = [];
+const dctx2 = (present, reply) => ({ ...ctx, fs: fsWith(present), exec: (cmd, args, options) => (dexecs.push([cmd, ...args, options?.env?.XDG_DATA_HOME]), reply) });
+const levels = async (profile, c) => (await oc.doctorChecks(profile, c)).map((x) => `${x.name}:${x.level}`);
+let got = await levels(keyedProfile(), dctx2([], { status: 0, stdout: listing2(["DeepSeek"]) }));
+check("doctorChecks: a key whose isolated home does not exist yet → no check, no auth list", eq(got, []) && dexecs.length === 0, JSON.stringify(got));
+got = await levels(keyedProfile(), dctx2([isoHome], { status: 0, stdout: listing2(["DeepSeek"]) }));
+check("doctorChecks: a key in its isolated home → auth list there (its XDG_DATA_HOME); the provider listed → login FAIL", eq(got, ["login:FAIL"]) && eq(dexecs.at(-1), ["opencode", "auth", "list", path.join(isoHome, "data")]), `${JSON.stringify(got)} ${JSON.stringify(dexecs)}`);
+got = await levels(keyedProfile(), dctx2([isoHome], { status: 0, stdout: listing2(["GitHub Copilot"]) }));
+check("doctorChecks: … another provider listed → login ok", eq(got, ["login:ok"]), JSON.stringify(got));
+got = await levels(keyedProfile(), dctx2([isoHome], { status: 1, stdout: "" }));
+check("doctorChecks: … auth list failing → login WARN (not checked)", eq(got, ["login:WARN"]), JSON.stringify(got));
+got = await levels(keyedProfile(), dctx2([isoHome, authFile], { status: 0, stdout: listing2([]) }));
+check("doctorChecks: … an auth.json there → home FAIL naming the file, as the run refuses it", eq(got, ["home:FAIL", "login:ok"]), JSON.stringify(got));
+got = await levels({ harness: "opencode", auth: "login", model: "a/b", options: { permission: { bash: { "npm *": "allow", "rm *": "deny" }, webfetch: "allow", edit: "deny" } } }, dctx2([], { status: 0, stdout: listing2(["a"]) }));
+check("doctorChecks: options.permission's allow rules → one reviewer WARN (sp-implementer only)", eq(got, ["login:ok", "reviewer:WARN"]), JSON.stringify(got));
 
 console.log(results.join("\n"));
 EOF

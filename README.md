@@ -154,7 +154,7 @@ agent-dispatch doctor --profile deepseek-claude --probe             # 3. offline
 ```
 
 1. `profile add <name> --from <preset> [--model M] [--key K] [--set k=v]` copies a preset into `config.json`. A preset with a `<…>` placeholder needs it filled by a flag; otherwise nothing is written.
-2. Store the key yourself, in your own terminal. `key set <name>` asks for it at a hidden prompt. From a Claude Code session you can pipe it instead: `! pbpaste | agent-dispatch key set <name>`, or on Linux `wl-paste` / `xclip -o -selection clipboard`. A key passed as an argument is refused. A `login` profile uses the harness's own login. For a profile with its own isolated directory, run `eval "$(agent-dispatch profile env <name>)"` first.
+2. Store the key yourself, in your own terminal. `key set <name>` asks for it at a hidden prompt. From a Claude Code session you can pipe it instead: `! pbpaste | agent-dispatch key set <name>`, or on Linux `wl-paste` / `xclip -o -selection clipboard`. A key passed as an argument is refused. A `login` profile uses the harness's own login. For a profile with its own isolated directory, log in there with `agent-dispatch profile env <name> -- <login command>`: `-- opencode auth login`, or `-- claude` and then `/login`, or `-- pi` and then `/login`.
 3. `doctor --profile <name>` checks everything that can be checked without a model call. `--probe` adds one short paid request on your key or subscription; you run it, the pipeline never does.
 
 In 0.12.0 every preset targets `claude`, `dsh`, OpenCode or pi, so step 3 of this example ends in `harness claude is not available in this version` until that harness's adapter ships. The profiles that work today are written by hand: another Codex model or effort, or another Claude model in the session. For example, a cheaper control review and a Sonnet plan writer:
@@ -189,7 +189,7 @@ In 0.12.0 every preset targets `claude`, `dsh`, OpenCode or pi, so step 3 of thi
   - Linux: `["secret-tool", "lookup", "service", "deepseek"]`
   - any OS: `["op", "read", "op://…"]`
 
-A key reaches only the harness process's environment, never its argv, a settings file or the chat. The pipeline never runs `key set` and never asks you for a key.
+A key reaches only the harness process's environment, never its argv, a settings file or the chat. pi writes what it sees into its own session files; after every run they are rewritten with the key redacted. The pipeline never runs `key set` and never asks you for a key.
 
 Profiles that share a key, a harness login (an OpenCode or pi login counts per provider) or a `shares` label drop out together on `auth` or `quota`. The built-in `glm` carries `zai-coding-plan`, so a Z.ai API fallback with that label is not tried against the same exhausted quota.
 

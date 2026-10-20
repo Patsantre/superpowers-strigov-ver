@@ -178,6 +178,9 @@ main() {
         printf 'x\n' >"$TEST_ROOT/$r/a.txt"
         (cd "$TEST_ROOT/$r" && git add a.txt && git "${git_id[@]}" commit -qm c0)
     done
+    # The fixtures dir as a file: URL, for the adapters a test writes under the temp root (they import plain.mjs).
+    local FIX_URL
+    FIX_URL="$(node -e 'process.stdout.write(require("node:url").pathToFileURL(process.argv[1]).href)' -- "$FIX")"
     local repo repo2
     repo="$(cd "$TEST_ROOT/repo" && git rev-parse --show-toplevel)"
     repo2="$(cd "$TEST_ROOT/repo2" && git rev-parse --show-toplevel)"
@@ -273,7 +276,8 @@ EOF
             fi
             got="$(last_call "$wrapper" task)"
             [[ "$want" != MISSING && "$RC" -eq 0 && "$got" == "$want" && "$OUT" == "$line" && "$(calls_of "$wrapper" task)" -eq 1 && "$(calls_of "$other" task)" -eq 0 ]]
-            verdict "3 golden $role → $prof: $wrapper gets $(jwords "$want" | sed "s|$prompt|F|")" $? "rc=$RC want: $want" "got:  $got" "out: $OUT" "err: $ERR"
+            golden_st=$? # before the label: its $(jwords …) would reset $?
+            verdict "3 golden $role → $prof: $wrapper gets $(jwords "$want" | sed "s|$prompt|F|")" "$golden_st" "rc=$RC want: $want" "got:  $got" "out: $OUT" "err: $ERR"
         done
     done
     [[ "$cases" -eq 21 ]]
@@ -980,7 +984,8 @@ console.log(["maxParallel" in p, "timeoutMin" in p, "options" in p, p.env.ANTHRO
     run_ad profile add x2 --from claude-sub --set efort=high
     [[ "$ok" -eq 2 && "$rc_np" -eq 2 && "$RC" -eq 2 && "$ERR" == *'unknown field "efort"'* ]]
     verdict "12 profile add refuses a built-in name, an unknown preset and an unknown field" $? "rc=$ok/$rc_np/$RC err: $ERR"
-    # profile env asks the real adapter (loginEnv): AGENT_DISPATCH_ADAPTER_DIR is dropped for these calls.
+    # profile env asks the real adapter (its loginEnv, else its prepareHome's env): AGENT_DISPATCH_ADAPTER_DIR is
+    # dropped for these calls.
     real_ad() { OUT="$(env -u AGENT_DISPATCH_ADAPTER_DIR node "$CLI" "$@" 2>"$TEST_ROOT/stderr.txt")"; RC=$?; ERR="$(cat "$TEST_ROOT/stderr.txt")"; }
     real_ad profile env glm-api
     [[ "$RC" -eq 0 && "$OUT" == "# profile glm-api is a claude API profile: its isolated home must hold no claude.ai login (spec §3.6 A1); nothing to export" \
@@ -988,16 +993,65 @@ console.log(["maxParallel" in p, "timeoutMin" in p, "options" in p, p.env.ANTHRO
     verdict "12 profile env of a claude API profile exports nothing (its home must hold no claude.ai login; spec §3.6 A1)" $? "rc=$RC out: $OUT err: $ERR"
     run_ad profile add cl-iso --from claude-sub --set home=isolated
     ok=$RC
+    local add_next
+    add_next="$(grep '^next: ' <<<"$OUT")"
     real_ad profile env cl-iso
     [[ "$ok" -eq 0 && "$RC" -eq 0 && "$OUT" == "export CLAUDE_CONFIG_DIR='$STATE/homes/cl-iso/claude'" && "$(mode_of "$STATE/homes/cl-iso/claude")" == 700 \
         && "$(mode_of "$STATE/homes/cl-iso")" == 700 ]]
     verdict "12 profile env of an isolated claude login profile prints the export line of its home (created 0700)" $? "add rc=$ok" "rc=$RC out: $OUT err: $ERR"
+    run_ad doctor --profile cl-iso
+    [[ "$add_next" == "next: log in: agent-dispatch profile env cl-iso -- claude, then /login, then agent-dispatch doctor --profile cl-iso --probe" \
+        && "$OUT" == *"ok auth cl-iso: login: the claude login in its isolated home (log in there: agent-dispatch profile env cl-iso -- claude, then /login)"* ]]
+    verdict "12 profile add's next: line and doctor's auth row log in to an isolated home through 'profile env P -- <login command>' (no eval)" $? "$add_next" "$OUT"
+    # Without loginEnv the variables are prepareHome's env (the home the jobs use); a loginEnv wins when there is one;
+    # an adapter that names none is refused.
     run_ad profile env cl-iso
-    [[ "$RC" -eq 2 && "$ERR" == *"cl-iso"* ]]
-    verdict "12 profile env through an adapter without loginEnv (the stand-in claude) is refused (exit 2)" $? "rc=$RC out: $OUT err: $ERR"
+    [[ "$RC" -eq 0 && "$OUT" == "export PLAIN_HOME_DIR='$STATE/homes/cl-iso'" ]]
+    verdict "12 profile env through an adapter without loginEnv (the stand-in claude) exports its prepareHome env" $? "rc=$RC out: $OUT err: $ERR"
+    mkdir -p "$TEST_ROOT/env-adapters/login" "$TEST_ROOT/env-adapters/none"
+    cat >"$TEST_ROOT/env-adapters/login/claude.mjs" <<EOF
+import plain from "$FIX_URL/adapters/plain.mjs";
+export default { ...plain, id: "claude", idPrefix: "ct", loginEnv: (profile, ctx) => ({ PLAIN_LOGIN_DIR: \`\${ctx.paths.homes}/\${ctx.profileName}/login\` }) };
+EOF
+    cat >"$TEST_ROOT/env-adapters/none/claude.mjs" <<EOF
+import plain from "$FIX_URL/adapters/plain.mjs";
+export default { ...plain, id: "claude", idPrefix: "ct", prepareHome: () => ({ env: { PLAIN_HOME_DIR: null }, dirs: [], files: [] }) };
+EOF
+    AGENT_DISPATCH_ADAPTER_DIR="$TEST_ROOT/env-adapters/login" run_ad profile env cl-iso
+    ok=$RC
+    local login_out="$OUT"
+    AGENT_DISPATCH_ADAPTER_DIR="$TEST_ROOT/env-adapters/none" run_ad profile env cl-iso
+    [[ "$ok" -eq 0 && "$login_out" == "export PLAIN_LOGIN_DIR='$STATE/homes/cl-iso/login'" && "$RC" -eq 2 && "$ERR" == *"profile cl-iso: the claude adapter names no home variables"* ]]
+    verdict "12 profile env: an adapter's loginEnv wins over its prepareHome env; an adapter that names no variable is refused (exit 2)" $? \
+        "loginEnv: rc=$ok out: $login_out" "none: rc=$RC out: $OUT err: $ERR"
     real_ad profile env oc1
     [[ "$RC" -eq 0 && "$(grep -c '^export XDG_' <<<"$OUT")" -eq 4 && "$OUT" == *"export XDG_CONFIG_HOME='$STATE/homes/oc1/"* ]]
     verdict "12 profile env of an opencode key profile exports XDG_CONFIG/DATA/STATE/CACHE_HOME of its home" $? "rc=$RC out: $OUT err: $ERR"
+    [[ "$(head -1 <<<"$OUT")" == "# keyed profile: nothing to log into here; a login stored in this home would win over DEEPSEEK_API_KEY" ]]
+    verdict "12 profile env of a keyed opencode profile starts with a comment: nothing to log into, a login there would win over keyVar" $? "$OUT"
+    # profile env P -- CMD: CMD runs with the profile's variables; nothing is printed for eval, nothing stays in a shell.
+    real_ad profile env cl-iso -- node -e 'process.kill(process.pid, "SIGTERM")'
+    ok=$RC
+    real_ad profile env cl-iso -- node -e 'process.stdout.write(String(process.env.CLAUDE_CONFIG_DIR)); process.exit(7)'
+    [[ "$RC" -eq 7 && "$OUT" == "$STATE/homes/cl-iso/claude" && -z "$ERR" && "$ok" -eq 143 ]]
+    verdict "12 profile env P -- CMD runs CMD with the profile's variables (no eval) and exits with its code (128 + signal when killed)" $? \
+        "rc=$RC out: $OUT err: $ERR" "killed by SIGTERM: rc=$ok"
+    real_ad profile env oc1 -- node -e 'process.stdout.write(String(process.env.XDG_DATA_HOME))'
+    [[ "$RC" -eq 0 && "$OUT" == "$STATE/homes/oc1/"* && "$OUT" != *export* \
+        && "$ERR" == "agent-dispatch: WARN profile oc1: keyed profile: nothing to log into here; a login stored in this home would win over DEEPSEEK_API_KEY" ]]
+    verdict "12 profile env P -- CMD on a keyed opencode profile: CMD sees the home, the keyed-profile warning goes to stderr" $? "rc=$RC out: $OUT err: $ERR"
+    run_ad profile add oc-u --from opencode-login --model github-copilot/gpt-6-mini
+    local refused="" target
+    for target in glm-api oc-u glm no-such-profile; do
+        real_ad profile env "$target" -- touch "$TEST_ROOT/ran-$target"
+        [[ "$RC" -eq 2 && ! -e "$TEST_ROOT/ran-$target" ]] || refused="$refused [$target rc=$RC err: $ERR]"
+    done
+    real_ad profile env cl-iso --
+    ok=$RC
+    real_ad profile env cl-iso -- "no-such-command-$RANDOM"
+    [[ -z "$refused" && "$ok" -eq 2 && "$RC" -eq 127 && "$ERR" == "agent-dispatch: cannot run no-such-command-"*": ENOENT" ]]
+    verdict "12 profile env P -- CMD refuses like profile env (API profile, home user, pass-through, unknown: exit 2, CMD not run); no CMD → 2; CMD not found → 127" $? \
+        "refused:$refused" "empty: rc=$ok" "not found: rc=$RC err: $ERR"
     run_ad profile env glm
     ok=$RC
     run_ad profile list
@@ -1092,6 +1146,56 @@ EOF
     [[ "$RC" -eq 0 && "$(tail -1 <<<"$OUT")" == "WARN probe luna: agent-dispatch does not probe pass-through profiles;"* ]]
     verdict "13 doctor --probe on a pass-through profile does not call it (one WARN line)" $? "$OUT"
 
+    # An adapter that fails to load (a throw at import, a wrong id, a syntax error) or whose checks throw is that
+    # profile's FAIL row: the other profiles are still checked, and the report and its verdict always print. Each
+    # harness file of this dir is broken in its own way; claude is the stand-in, with doctor checks keyed by model.
+    local broken="$TEST_ROOT/broken-adapters"
+    mkdir -p "$broken"
+    printf 'throw new Error("pi adapter: failure at import");\n' >"$broken/pi.mjs"
+    printf 'export default { id: "pie" };\n' >"$broken/opencode.mjs"
+    printf 'export default { id: "dsh", ) };\n' >"$broken/dsh.mjs"
+    cat >"$broken/claude.mjs" <<EOF
+import plain from "$FIX_URL/adapters/plain.mjs";
+export default {
+  ...plain,
+  id: "claude",
+  idPrefix: "ct",
+  doctorChecks(profile) {
+    if (profile.model === "checks-throw") throw new Error("stand-in checks: boom");
+    if (profile.model === "row-throws") return [{ get level() { throw new Error("stand-in row: unreadable"); } }];
+    return [{ name: "stand-in", level: "ok", hint: "fine" }];
+  },
+};
+EOF
+    write_config <<'EOF'
+{
+  "version": 1,
+  "profiles": {
+    "b-pi": { "harness": "pi", "auth": "login", "model": "zai/glm-5.3" },
+    "b-oc": { "harness": "opencode", "auth": "login", "model": "github-copilot/gpt-6-mini" },
+    "b-dsh": { "harness": "dsh", "auth": { "key": "absent-dkey" }, "model": "deepseek-v4-pro" },
+    "b-checks": { "harness": "claude", "auth": "login", "model": "checks-throw" },
+    "b-row": { "harness": "claude", "auth": "login", "model": "row-throws" },
+    "b-ok": { "harness": "claude", "auth": "login" }
+  }
+}
+EOF
+    AGENT_DISPATCH_ADAPTER_DIR="$broken" run_ad doctor
+    [[ "$RC" -eq 1 && "$(head -1 <<<"$OUT")" == "ok config: $CONFIG: 6 profile(s), 0 role(s)" && "$(tail -1 <<<"$OUT")" == "doctor: FAIL" \
+        && "$OUT" == *"FAIL profile b-pi: adapter pi failed to load: $broken/pi.mjs: pi adapter: failure at import"* \
+        && "$OUT" == *"ok auth b-pi: login: the pi login of provider zai"* \
+        && "$OUT" == *"FAIL profile b-oc: adapter opencode failed to load: $broken/opencode.mjs: its id is \"pie\", not \"opencode\""* \
+        && "$OUT" == *"FAIL profile b-dsh: adapter dsh failed to load: $broken/dsh.mjs: "* && "$OUT" == *"FAIL key b-dsh: no key absent-dkey is stored"* \
+        && "$OUT" == *"FAIL checks b-checks: the claude adapter's checks failed: stand-in checks: boom"* \
+        && "$OUT" == *"FAIL profile b-row: its checks stopped: stand-in row: unreadable"* && "$OUT" == *"ok stand-in b-ok: fine"* \
+        && "$OUT" == *"ok profile glm: pass-through"* && "$OUT" == *"ok profile luna: pass-through"* ]]
+    verdict "13 doctor: an adapter failing at import, with a wrong id or a syntax error, and checks that throw are FAIL rows of their profiles; every other row and 'doctor: FAIL' print (exit 1)" $? \
+        "rc=$RC" "$OUT" "err: $ERR"
+    AGENT_DISPATCH_ADAPTER_DIR="$broken" run_ad doctor --profile b-pi
+    [[ "$RC" -eq 1 && "$OUT" == *"FAIL profile b-pi: adapter pi failed to load: $broken/pi.mjs: pi adapter: failure at import"* \
+        && "$OUT" == *"ok auth b-pi: login"* && "$(tail -1 <<<"$OUT")" == "doctor: FAIL" ]]
+    verdict "13 doctor --profile on a profile whose adapter fails to load: its FAIL row, its auth row, 'doctor: FAIL' (exit 1)" $? "rc=$RC" "$OUT" "err: $ERR"
+
     run_ad no-such-verb
     [[ "$RC" -eq 2 && "$ERR" == *"usage: agent-dispatch"* ]]
     verdict "13 an unknown verb is a usage error (exit 2)" $? "rc=$RC err: $ERR"
@@ -1119,7 +1223,7 @@ EOF
     "e-dsh": { "harness": "dsh", "auth": { "key": "e2e-ds" }, "model": "deepseek-v4-pro", "effort": "high", "bin": "$TEST_ROOT/bin/dsh" }
   },
   "roles": {
-    "implementer": ["e-csub", "glm"], "spec-reviewer": ["e-capi"], "control-review": ["e-oc"], "adhoc-review": ["e-ockey"],
+    "implementer": ["e-csub", "glm"], "spec-reviewer": ["e-capi", "e-pi", "e-oc"], "control-review": ["e-oc"], "adhoc-review": ["e-ockey"],
     "plan-reviewer": ["e-pi"], "implementer.risk": ["e-dsh", "glm"]
   }
 }
@@ -1161,12 +1265,17 @@ EOF
         && "$OUT" == *"e-oc harness=opencode model=github-copilot/gpt-6-mini effort=- auth=login:github-copilot linked=- source=config"* \
         && "$OUT" == *"e-dsh harness=dsh model=deepseek-v4-pro effort=high auth=key:e2e-ds linked=e-ockey source=config"* ]]
     verdict "14 channels links profiles across harnesses by their key (e-capi with e-pi, e-dsh with e-ockey)" $? "$OUT"
+    local e_auth
     for e_prof in e-csub e-capi e-oc e-ockey e-pi e-dsh; do
-        run_ad doctor --profile "$e_prof"
+        # pi's stub answers `pi auth check` from AGENT_STUB_AUTH: the keyed e-pi needs pi to hold no credential of its
+        # own for the provider (not_ready), or the key would not be used.
+        e_auth=ready
+        [[ "$e_prof" == e-pi ]] && e_auth=not_ready
+        AGENT_STUB_AUTH="$e_auth" run_ad doctor --profile "$e_prof"
         [[ "$RC" -eq 0 && "$OUT" == *"ok harness $e_prof: $TEST_ROOT/bin/"* && "$OUT" == *"ok env $e_prof: no conflict"* && "$OUT" != *"FAIL"* \
             && "$OUT" != *"WARN version $e_prof"* && "$(tail -1 <<<"$OUT")" == "doctor: ok" ]]
         verdict "14 doctor --profile $e_prof: harness at its verified version, no env conflict, the adapter's checks, doctor: ok" $? "rc=$RC" "$OUT" "err: $ERR"
-        OUT="$(AGENT_STUB_RESPONSE=PONG ad doctor --profile "$e_prof" --probe 2>&1)"
+        OUT="$(AGENT_STUB_AUTH="$e_auth" AGENT_STUB_RESPONSE=PONG ad doctor --profile "$e_prof" --probe 2>&1)"
         RC=$?
         [[ "$RC" -eq 0 && "$(tail -1 <<<"$OUT")" == "ok probe $e_prof: PONG in "* ]]
         verdict "14 doctor --profile $e_prof --probe: one PONG turn through the real adapter (stub)" $? "rc=$RC" "$(tail -3 <<<"$OUT")"
@@ -1174,6 +1283,38 @@ EOF
     real_ad profile env e-ockey
     [[ "$RC" -eq 0 && "$OUT" == *"export XDG_DATA_HOME='$STATE/homes/e-ockey/"* ]]
     verdict "14 profile env of an isolated opencode profile points at the home its tasks used" $? "rc=$RC out: $OUT err: $ERR"
+
+    # The fallback (spec §5.3) on a real adapter: the job fails with a quota error (the claude stub's HTTP 402) → route
+    # with --skip <profile>:<its class> names the next profile, the linked one (e-pi pays with the same key) skipped
+    # with it → the task on that profile completes.
+    OUT="$(AGENT_ENV_PASSTHROUGH="$AGENT_ENV_PASSTHROUGH,AGENT_STUB_STATUS" AGENT_STUB_MODE=api-error AGENT_STUB_STATUS=402 \
+        ad task --profile e-capi --role spec-reviewer --background --prompt-file "$prompt" 2>&1)"
+    id="${OUT##* }"
+    e_st="$(wait_status "$id" 'completed|failed|cancelled' 30)"
+    e_json="$(ad status "$id" --json 2>/dev/null)"
+    local e_class
+    e_class="$(jfield job.errorClass <<<"$e_json")"
+    run_ad route spec-reviewer --skip "e-capi:$e_class"
+    e_route="$OUT"
+    OUT="$(AGENT_STUB_RESPONSE="DONE"$'\n'"fallback" ad task --profile "$(jfield profile <<<"$(ad route spec-reviewer --skip "e-capi:$e_class" --json 2>/dev/null)")" \
+        --role spec-reviewer --background --prompt-file "$prompt" 2>&1)"
+    id2="${OUT##* }"
+    st="$(wait_status "$id2" 'completed|failed|cancelled' 30)"
+    [[ "$e_st" == failed && "$e_class" == quota && "$RC" -eq 0 \
+        && "$e_route" == "route spec-reviewer: e-oc harness=opencode model=github-copilot/gpt-6-mini effort=- readOnly=rules maxParallel=2 (chain: e-oc; skipped: e-capi=quota, e-pi=quota(via e-capi))" \
+        && "$id2" == oc-* && "$st" == completed && "$(ad result "$id2" 2>&1)" == "DONE"$'\n'"fallback" ]]
+    verdict "14 fallback: e-capi fails with quota (402) → route --skip e-capi:quota names e-oc, e-pi skipped via e-capi → the e-oc task completes" $? \
+        "failed job: $e_st class=$e_class $(head -c 300 <<<"$e_json")" "route rc=$RC: $e_route" "fallback task: $OUT → $st"
+
+    # A runner loads only its job's adapter: a pi adapter that fails at import does not stop a dsh job.
+    mkdir -p "$TEST_ROOT/pi-broken"
+    printf 'throw new Error("pi adapter: failure at import");\n' >"$TEST_ROOT/pi-broken/pi.mjs"
+    OUT="$(AGENT_DISPATCH_ADAPTER_DIR="$TEST_ROOT/pi-broken" AGENT_STUB_RESPONSE="DONE"$'\n'"isolated" \
+        ad task --profile e-dsh --role implementer.risk --background --prompt-file "$prompt" 2>&1)"
+    id="${OUT##* }"
+    e_st="$(wait_status "$id" 'completed|failed|cancelled' 30)"
+    [[ "$id" == dt-* && "$e_st" == completed && "$(ad result "$id" 2>&1)" == "DONE"$'\n'"isolated" ]]
+    verdict "14 a dsh job completes while \$AGENT_DISPATCH_ADAPTER_DIR holds a pi adapter that fails at import" $? "task: $OUT" "status: $e_st" "$(ad result "$id" 2>&1 | head -5)"
     unset AGENT_STUB_AUTH
 
     # Every preset of spec §4.2, its placeholders filled, is a valid profile whose real adapter plans a run, and whose

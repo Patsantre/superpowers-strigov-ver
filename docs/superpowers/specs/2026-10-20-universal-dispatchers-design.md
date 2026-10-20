@@ -163,6 +163,7 @@ export default {
   reduce(io),                          // → { ok, response, sessionId, usage, reportedModel, errorClass | null, errorText }
   finalize(job, ctx),                  // необязательный: второй процесс после завершения (opencode export <sid>)
   resumeCheck(prev, profile, req, ctx),// → null | причина отказа (тогда exit 2 и FRESH)
+  scrub(job, ctx),                     // необязательный: собственные файлы харнесса с вычищенным ключом (сессии pi) → [{ path, mode, content }]
   patterns: { auth: [], quota: [], "model-not-selected": [], context: [], blocked: [], "resume-lost": [], transient: [] },
   doctorChecks(profile, ctx),          // → [{ name, level: "ok" | "WARN" | "FAIL", hint }], без вызова модели
   probe(profile, ctx),                 // → invocation для одного запроса «Reply with exactly: PONG»
@@ -176,7 +177,9 @@ export default {
 
 Правила:
 
-- **Побочными эффектами владеет ядро:** процессы, файлы, сигналы, чтение ключей. Адаптер возвращает данные. `discover`, `doctorChecks`, `finalize` и `resumeCheck` запускают процессы и читают ФС только через `ctx.exec` и `ctx.fs`; в тестах они подменяются.
+- **Побочными эффектами владеет ядро:** процессы, файлы, сигналы, чтение ключей. Адаптер возвращает данные. `discover`, `doctorChecks`, `finalize`, `resumeCheck` и `scrub` запускают процессы и читают ФС только через `ctx.exec` и `ctx.fs`; `invocation` и `probe` тоже читают ФС только через `ctx.fs` (настройки каталога входа claude, наличие `auth.json`, §3.4); в тестах они подменяются.
+- **Собственные файлы харнесса.** Необязательный `scrub(job, ctx)` получает `ctx.redact` и возвращает файлы харнесса, в которых ключ заменён на `<redacted>`. Ядро вызывает его у задачи с ключом после выхода харнесса на любом исходе (completed, failed, timeout, cancel), до `reduce` и `finalize`, и атомарно перезаписывает файлы — только под каталогом данных и с правами, которые назвал адаптер. Сбой `scrub` только пишется в лог. Сейчас он есть у pi (§3.5).
+- **`profile env`** экспортирует `env` из `prepareHome` — тот каталог, который получают задачи. Необязательный хук CLI `loginEnv(profile, ctx)` его перекрывает; встроенные адаптеры его не задают.
 - **Успех определяет только `reduce()`** по выводу харнесса. Код выхода — справочная информация: `claude -p`, pi и dsh могут вернуть 0 при ошибке, а OpenCode — 1 при валидном ответе [01; 02; 03; 04b].
 - **Порядок окружения:** белый список ядра → `env` адаптера (значения по умолчанию, §3.6 Б) → `profile.env` → обязательные настройки (§3.6 А; не переопределяются) → `secretEnv`. Адаптер не задаёт переменных, которые меняют идентификацию клиента.
 - **Версия и флаги.** Каждая задача читает `<bin> --version`; вывод `<bin> <helpArgv>` кешируется в каталоге состояния по паре (bin, version). Класс `launch` бывает только в трёх случаях: бинарника нет; это не тот бинарник (`dsh` из Homebrew, OpenCode 2.x); в справке нет обязательного флага. Если флаг в справке не виден (так бывает у dsh, где аргументы headless идут после флагов лаунчера), проверяется только версия. Непроверенную версию отмечает только `doctor` — одной строкой «версия X не проверялась, проверена Y»; запуск она не блокирует. Так ловятся несовместимые изменения CLI: у `claude` релизы выходят почти ежедневно [01].
@@ -195,7 +198,7 @@ export default {
 | `channels` | Все профили: харнесс, модель, источник ключа или входа и с какими профилями он общий |
 | `doctor [--profile P] [--probe]` | Проверки без вызова модели (§5.4). `--probe` делает один платный запрос «PONG» и запускается самим пользователем |
 | `key set NAME`, `key list`, `key rm NAME` | Ключи (§3.5) |
-| `profile list`, `profile show P`, `profile add NAME --from PRESET [--model M] [--key K] [--set k=v]`, `profile env P` | `add` копирует пресет в `config.json`; профиль с незаполненным `<…>` не записывается (exit 2). `env` печатает строки `export …`, чтобы войти в харнесс в изолированном каталоге профиля |
+| `profile list`, `profile show P`, `profile add NAME --from PRESET [--model M] [--key K] [--set k=v]`, `profile env P [-- КОМАНДА [АРГУМЕНТЫ…]]` | `add` копирует пресет в `config.json`; профиль с незаполненным `<…>` не записывается (exit 2). `env` печатает строки `export …` изолированного каталога профиля; у профиля opencode или pi с ключом первая строка — комментарий: входить там не во что, а вход в этом каталоге перекрыл бы ключ. `env P -- КОМАНДА` запускает команду с этими переменными (без eval, в оболочке пользователя ничего не остаётся), например `profile env oc-copilot -- opencode auth login`; код выхода — код команды. Там, где `env` ничего не экспортирует или отказывает (`"home": "user"`, API-профиль claude, сквозной профиль, неизвестное имя), команда не запускается: exit 2 |
 | `preset list` | Встроенные пресеты (§4.2) |
 
 Коды выхода такие же, как у `zcode-dispatch`: 0 — успех, 1 — ошибка, 2 — отказ без запуска [00 §1]. Пока задача идёт, оркестратор опрашивает её тем же Monitor-циклом с `sleep 25`, что и сейчас.
@@ -245,7 +248,7 @@ state/<ws>/jobs/    задачи ct-, oc-, pi-, dt-
 | `bin` | путь | бинарник харнесса; по умолчанию ищется в `PATH`. Нужен для нестандартных установок и заглушек в тестах |
 | `env` | объект | дополнительные переменные харнесса. Перекрывают значения по умолчанию адаптера, но не обязательные настройки (§3.6 А): при конфликте `doctor` даёт FAIL, `task` — exit 2 |
 | `options` | объект | значения по умолчанию, которые можно поменять (§3.6 Б): claude — `tools`, `settings`, `maxTurns` (по умолчанию не задан); opencode — `permission`, `plugins`; pi — `extensions`; dsh — `sessionLog`, `agentsHome`, `patch` |
-| `home` | `"user"`, `"isolated"` | где харнесс хранит настройки и вход: `user` — обычный каталог пользователя, `isolated` — отдельный каталог профиля в `homes/`. По умолчанию `user` — при `login`, `native`, `none` и у dsh. По умолчанию `isolated` — у opencode и pi с ключом из `agent-dispatch` (`key`, `keyEnv`, `keyCmd`): иначе ключ того же провайдера, сохранённый в харнессе, молча перекрыл бы наш [03 §6; 02 §5]. У API-профилей claude всегда `isolated`; `user` там — exit 2 |
+| `home` | `"user"`, `"isolated"` | где харнесс хранит настройки и вход: `user` — обычный каталог пользователя, `isolated` — отдельный каталог профиля в `homes/`. По умолчанию `user` — при `login`, `native`, `none` и у dsh. По умолчанию `isolated` — у opencode и pi с ключом из `agent-dispatch` (`key`, `keyEnv`, `keyCmd`): иначе ключ того же провайдера, сохранённый в харнессе, молча перекрыл бы наш [03 §6; 02 §5]. Поэтому у opencode и pi с ключом `user` — exit 2 при `task` и FAIL в `doctor`. В изолированном каталоге такого профиля файл сохранённого входа (`homes/<p>/data/opencode/auth.json` у OpenCode, `homes/<p>/pi/auth.json` у pi) — тоже exit 2 и FAIL; адаптер проверяет только наличие файла и не читает его. У API-профилей claude всегда `isolated`; `user` там — exit 2 |
 | `sandbox` | `"off"` (по умолчанию), `"native"` | §3.7 |
 | `wrap` | массив argv | префикс команды, §3.7 |
 | `timeoutMin` | число, по умолчанию 60 | предельная длительность задачи в минутах, как `ZCODE_TASK_TIMEOUT_MIN` |
@@ -260,7 +263,7 @@ state/<ws>/jobs/    задачи ct-, oc-, pi-, dt-
 - Ключ пользователь кладёт сам, в своём терминале: `agent-dispatch key set deepseek` запрашивает его скрытым вводом. Из сессии Claude Code можно так: `! pbpaste | "$AD" key set deepseek`; на Linux вместо `pbpaste` — `wl-paste` или `xclip -o -selection clipboard`. Это тот же приём, что у `zcode-dispatch api-key set` [00 §2]. Ключ, переданный аргументом, отвергается. Проверяется только, что это одна непустая строка без пробелов: так ловится случайная вставка самой команды. Формат провайдера не проверяется. Оркестратор `key set` не запускает.
 - **Где ключ читается.** Все источники (`key`, `keyEnv`, `keyCmd`) читаются в `task`, на переднем плане и в окружении Claude Code: там менеджер паролей может попросить подтверждение. Раннеру значение передаётся через файл 0600 в каталоге задачи; раннер удаляет файл сразу после запуска харнесса. Значение регистрируется в `redactor`.
 - **Пустой ключ — без запуска.** Если ключ разрешился в пустую строку или `keyCmd` упал (таймаут 10 с, ненулевой код), харнесс не запускается: exit 2 и строка `agent-dispatch: <P>: key unavailable (<причина>) errorClass=auth` с подсказкой. Оркестратор обрабатывает это как сбой класса `auth` (§3.8). Так при пустом ключе не уйдёт вход claude.ai из каталога профиля [01 §6].
-- Ключ попадает только в окружение дочернего процесса, после белого списка. Его нет ни в argv (там его видно в `ps`), ни в файлах настроек, ни в чате.
+- Ключ попадает только в окружение дочернего процесса, после белого списка. Его нет ни в argv (там его видно в `ps`), ни в файлах настроек, ни в чате. pi сам пишет увиденное в файлы сессии `<job>/sessions`; после каждого запуска с ключом они перезаписываются с вычищенным ключом и прежними правами, двоичные файлы пропускаются (`scrub`, §3.2).
 - Куда кладётся ключ: claude — в `ANTHROPIC_AUTH_TOKEN` (или в `ANTHROPIC_API_KEY` при `authHeader: "x-api-key"`), вторая переменная — пустая строка; dsh — в `DEEPSEEK_API_KEY` (строка `apiKeyEnv` в patch-файле); opencode и pi — в переменную из `keyVar`.
 - **Почему так.** Один механизм работает для всех адаптеров и всех ОС; Keychain есть только на macOS. Он повторяет уже работающий `api-key set`. Ключ не лежит в окружении основной сессии Claude Code, где его видят все её инструменты. `apiKeyHelper` отклонён: с ним `claude` отправляет оба заголовка авторизации [01 §6], и такой механизм есть только у одного харнесса.
 - Альтернативы для тех, кто хранит ключи иначе:
@@ -283,11 +286,11 @@ state/<ws>/jobs/    задачи ct-, oc-, pi-, dt-
 #### А. Обязательные
 
 1. **`claude`, API-профиль.** Используется отдельный `CLAUDE_CONFIG_DIR` в `homes/<p>/claude` без входа claude.ai, ровно одна переменная с ключом и `--setting-sources ""` вместе с `--settings homes/<p>/settings.json`. Это даёт две гарантии. Токен входа claude.ai не будет отправлен на сторонний эндпоинт (если задать только `ANTHROPIC_BASE_URL`, он туда уходит) [01 §6; 07, итог п. 4]. Файл `.claude/settings.json` в репозитории не сможет перенаправить ключ: его `env.ANTHROPIC_BASE_URL` срабатывает даже с `--bare` [01 §9, E9]. `doctor` запускает `claude auth status --json` в этом каталоге и ожидает `loggedIn: true` и `authMethod` ∈ {`oauth_token`, `api_key`} при заданном ключе; вход claude.ai в каталоге профиля — FAIL.
-2. **`claude`, профиль со входом.** Используется каталог входа пользователя (`$CLAUDE_CONFIG_DIR`, если задан, иначе `~/.claude`) и `--setting-sources user`, чтобы проектные настройки не участвовали. Из унаследованного окружения удаляются все `ANTHROPIC_*`, `CLAUDE_CODE_ENTRYPOINT` и `CLAUDECODE`; иначе ломается атрибуция или подменяется эндпоинт [01]. В обоих режимах задаётся `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`: ключ и токены убираются из окружения Bash [01 E13].
+2. **`claude`, профиль со входом.** Используется каталог входа пользователя (`$CLAUDE_CONFIG_DIR`, если задан, иначе `~/.claude`) и `--setting-sources user`, чтобы проектные настройки не участвовали. Из унаследованного окружения удаляются все `ANTHROPIC_*`, `CLAUDE_CODE_ENTRYPOINT` и `CLAUDECODE`; иначе ломается атрибуция или подменяется эндпоинт [01]. Но `--setting-sources user` применяет `env` и `apiKeyHelper` из `settings.json` этого каталога уже после удаления [01 §9, E18]. Поэтому если этот файл задаёт `env.ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`/`_VERTEX`/`_FOUNDRY`, `ANTHROPIC_CUSTOM_HEADERS` со строкой `Authorization:` или `x-api-key:` либо `apiKeyHelper`, профиль отклоняется: `task` — exit 2 без задачи, `doctor` — FAIL `user-settings`. Иначе молча платил бы другой ключ или токен входа ушёл бы на другой эндпоинт; пустые значения и прочие настройки не мешают. `doctor` запускает `claude auth status --json` в этом каталоге и ожидает `loggedIn: true`: `authMethod` `api_key` или `api_key_helper` — FAIL, `oauth_token` — WARN (так `claude` сообщает о `ANTHROPIC_AUTH_TOKEN` [01 E20], а возможно, и о токене подписки `CLAUDE_CODE_OAUTH_TOKEN` — этого в [01] нет). В обоих режимах задаётся `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`: ключ и токены убираются из окружения Bash [01 E13].
 3. **Промпт всегда передаётся через stdin;** у `claude` предел 10 МБ [01]. `MAX_PROMPT_BYTES` остаётся только у `zcode`.
 4. **Явные права в headless-режиме** — чтобы запуск не останавливался на запросе разрешения:
    - `claude`, пишущая роль: `--permission-mode bypassPermissions` (при `sandbox: "native"` — `acceptEdits`, §3.7). По умолчанию `-p` молча отклоняет запросы разрешений и выходит с кодом 0 [01]; этот режим — аналог `--mode yolo` у ZCode.
-   - `claude`, ревьюер: `--tools "Read,Glob,Grep,Bash" --allowedTools "Bash(git show:*)" "Bash(git diff:*)" "Bash(git log:*)" "Bash(git status:*)" --permission-mode dontAsk`. Шаблоны ревью велят пользоваться `git show/diff/log`, а `dontAsk` отклоняет всё, что не разрешено заранее. Если `permission_denials` не пуст, это попадает в отчёт как замечание.
+   - `claude`, ревьюер: `--tools "Read,Glob,Grep,Bash" --allowedTools "Bash(git show:*)" "Bash(git diff:*)" "Bash(git log:*)" "Bash(git status:*)" --permission-mode dontAsk`. Шаблоны ревью велят пользоваться `git show/diff/log`, а `dontAsk` отклоняет всё, что не разрешено заранее. Если `permission_denials` не пуст, это попадает в отчёт как замечание. Опции git, которые пишут файлы или запускают программы, ревьюеру запрещены: наложение `--settings` получает `permissions.deny` `Bash(git *--output*)`, `Bash(git *--ext-diff*)`, `Bash(git *--textconv*)`, `Bash(git *--no-index*)` и `Bash(git difftool*)`; deny сильнее allow из любого источника. Сокращений этих опций git не принимает (проверено на git 2.50), поэтому одно правило покрывает каждую. Правилами не закрыто: написание в кавычках или с экранированием (`--out''put=f`) — правила сравнивают текст команды; неявный no-index (`git diff /abs/a /abs/b` вне дерева) — только чтение; внешние diff-драйверы и textconv, уже заданные в конфигурации git, которые `git diff`/`git log` запускают сами; перенаправление оболочки (`git diff > f`, §10).
    - OpenCode: адаптер задаёт собственных primary-агентов через `OPENCODE_CONFIG_CONTENT` (источник 6 — после глобального и проектного конфигов) и всегда передаёт `--agent sp-implementer` или `--agent sp-reviewer`. Набор прав каждого агента полный и явный. Явный `deny` возвращает модели ошибку инструмента, и цикл продолжается; в `blocked` уходит только оставшийся `ask` [02 §7]:
      ```json
      {"agent": {
@@ -297,12 +300,15 @@ state/<ws>/jobs/    задачи ct-, oc-, pi-, dt-
        "sp-reviewer": {"mode": "primary", "permission": {"*": "deny",
          "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"},
          "grep": "allow", "glob": "allow", "list": "allow", "edit": "deny", "task": "deny",
-         "bash": {"*": "deny", "git show*": "allow", "git diff*": "allow", "git log*": "allow", "git status*": "allow"},
+         "bash": {"*": "deny",
+           "git show": "allow", "git show *": "allow", "git diff": "allow", "git diff *": "allow",
+           "git log": "allow", "git log *": "allow", "git status": "allow", "git status *": "allow",
+           "* --output*": "deny", "*--ext-diff*": "deny", "*--textconv*": "deny", "*--no-index*": "deny"},
          "external_directory": "deny", "webfetch": "deny", "websearch": "deny"}}}}
      ```
-     Для `external_directory` временные каталоги остаются разрешены, как в наборе OpenCode по умолчанию. Тот же набор дублируется в `OPENCODE_PERMISSION`: эта переменная перекрывает верхнеуровневый `permission` конфигов, но не `agent.<name>.permission`, поэтому сама по себе она ничего не гарантирует. Строка `auto-rejecting` в stderr означает класс `blocked`.
+     В OpenCode `*` не знает границ слов, а хвостовой ` *` необязателен, поэтому команды ревьюера идут парами `cmd` / `cmd *` (прежний `git diff*` пропускал `git difftool`), а запреты `--output` (пишет файл), `--ext-diff`, `--textconv` и `--no-index` стоят последними: побеждает последнее совпадение [02 §7; проверено по исходникам OpenCode]. Перенаправление оболочки этими правилами не закрыто (§10). Для `external_directory` временные каталоги остаются разрешены, как в наборе OpenCode по умолчанию. Тот же набор дублируется в `OPENCODE_PERMISSION`: эта переменная перекрывает верхнеуровневый `permission` конфигов, но не `agent.<name>.permission`, поэтому сама по себе она ничего не гарантирует. Строка `auto-rejecting` в stderr означает класс `blocked`.
    - pi: набор `--tools` по роли; у ревьюера `read,grep,find,ls`, без git.
-   - dsh, пишущая роль: `DSH_PERMISSION_MODE=danger-full-access` — аналог `--mode yolo` у ZCode и `bypassPermissions` у claude; с `sandbox: "native"` — `workspace-write` (§3.7). Ревьюер всегда работает в `read-only`: это режим роли, а не песочница. В headless-режиме у dsh нет ответчика на запросы прав, и в `workspace-write` любая запись вне `cwd` отклоняется [04b §7, §8].
+   - dsh, пишущая роль: `DSH_PERMISSION_MODE=danger-full-access` — аналог `--mode yolo` у ZCode и `bypassPermissions` у claude; с `sandbox: "native"` — `workspace-write` (§3.7). Ревьюер всегда работает в `read-only`: это режим роли, а не песочница. Строка домашнего слоя (`$DSH_HOME/cordis.patch.yml`, `$DSH_HOME/profiles/headless/cordis.patch.yml`) перекрывает строку бандла, которая читает `DSH_PERMISSION_MODE` [04b §2, §7]. Адаптер эти файлы не переписывает (при `home: "user"` это файлы пользователя), а `doctor` проверяет: `--dump-config` с `DSH_PERMISSION_MODE=read-only` и разбор строк sandbox/approval/permission. Другой режим или `approval never` — FAIL `dsh-permissions` с именами существующих слоёв (только stat, без чтения); таких строк нет или `--dump-config` не прошёл — WARN «не проверено». В headless-режиме у dsh нет ответчика на запросы прав, и в `workspace-write` любая запись вне `cwd` отклоняется [04b §7, §8].
 5. **Репозиторий не может перенаправить ключ или эндпоинт:**
    - claude: см. п. 1–2 (источник настроек `project` не участвует);
    - OpenCode: `OPENCODE_DISABLE_PROJECT_CONFIG=1` — проектный `opencode.json` не меняет провайдера, права и агентов;
@@ -334,7 +340,7 @@ state/<ws>/jobs/    задачи ct-, oc-, pi-, dt-
 12. **Resume проверяется до запуска.** Для задач ядра исходная задача должна быть `completed` и иметь `sessionId`, её `job.profile` должен совпадать с `--profile`, а `resumeCheck` — проходить. Продолжение использует снимок профиля из записи задачи; если он расходится с текущим `config.json` (модель, эндпоинт, каталог), — exit 2. По харнессам:
     - `claude`: тот же каталог конфигурации и тот же `cwd`; stderr `No conversation found with session ID` с exit 1 → `resume-lost`;
     - OpenCode: тот же `--dir` и тот же каталог профиля (сессии лежат в SQLite в `XDG_DATA_HOME` [02 §4]); `Session not found` с exit 1 → `resume-lost`;
-    - pi: тот же `cwd` (с `--session-dir` поиск сессии фильтруется по `cwd` из заголовка) и файл сессии с совпадающим `id` в заголовке [03 §4]. pi не сообщает «сессия не найдена»: он печатает предупреждение `No project session found with id …` и создаёт новую. Если это предупреждение всё же появилось в stderr, задача получает `resume-lost`;
+    - pi: тот же `cwd` (с `--session-dir` поиск сессии фильтруется по `cwd` из заголовка) и файл сессии с совпадающим `id` в заголовке [03 §4]. pi не сообщает «сессия не найдена»: он печатает предупреждение `No project session found with id …` и создаёт новую. Если это предупреждение всё же появилось в stderr, задача получает `resume-lost`. Так же — если после запуска в каталоге сессий появился новый файл этой сессии с тем же `id` и `cwd` в заголовке (сравнение со списком `meta.sessionFilesBefore`, снятым при запуске): в хвост stderr предупреждение может не попасть;
     - dsh: тот же `cwd`; ошибка неизвестного id → `resume-lost`.
 
     При отказе (exit 2) и при `resume-lost` оркестратор делает FRESH с повторным брифом на том же профиле, как сегодня при отказе resume [00 §1]. Для `zt-` и `task-` условия прежние: у ZCode продолжается только `completed` задача с сессией, у companion — любая неактивная задача с нитью [00 §6 Q3].
@@ -348,8 +354,8 @@ state/<ws>/jobs/    задачи ct-, oc-, pi-, dt-
   - `options.settings` — объект, который накладывается на наложение `--settings` (кроме группы А);
   - env: `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `DISABLE_AUTOUPDATER=1`, `CLAUDE_CODE_MAX_RETRIES=2` (по умолчанию 10 повторов, это около 3 мин), `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`;
   - у API-профилей: `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL` и `CLAUDE_CODE_SUBAGENT_MODEL` равны модели профиля, если `env` не задаёт иное. Фоновые вызовы идут на модель уровня haiku, и сервер должен её знать; без `FABLE` вызов `claude-fable-*` мог бы уйти к провайдеру [01 §5; 06 §1; 08].
-- **OpenCode:** `OPENCODE_DISABLE_AUTOUPDATE=1`, `OPENCODE_DISABLE_EXTERNAL_SKILLS=1`, `OPENCODE_PURE=1`. PURE не загружает внешние плагины из `~/.config/opencode/plugins` (на машине владельца там плагин Orca); встроенные входы Copilot и ChatGPT — плагины по умолчанию, и PURE их не трогает [02 §6, §9]. `options.plugins: true` снимает PURE. `options.permission` — дополнительные правила, которые вливаются в набор `sp-`агента роли.
-- **pi:** `-ne -ns -np --no-mcp`, `PI_TELEMETRY=0`, `PI_SKIP_VERSION_CHECK=1`, `PI_OFFLINE=1`. Без `PI_OFFLINE` инструменты grep и find скачивают fd и rg с GitHub, если их нет в `PATH`; `doctor` проверяет, что они есть [03 §9]. `options.extensions: ["builtin:llama.cpp", "<путь>"]` даёт по `-e <x>` на каждое расширение; они загружаются и при `-ne` [03 §9]. Так друг подключает расширение-провайдер (`pi.registerProvider`).
+- **OpenCode:** `OPENCODE_DISABLE_AUTOUPDATE=1`, `OPENCODE_DISABLE_EXTERNAL_SKILLS=1`, `OPENCODE_PURE=1`. PURE не загружает внешние плагины из `~/.config/opencode/plugins` (на машине владельца там плагин Orca); встроенные входы Copilot и ChatGPT — плагины по умолчанию, и PURE их не трогает [02 §6, §9]. `options.plugins: true` снимает PURE. `options.permission` — дополнительные правила: в `sp-implementer` они вливаются целиком, а `sp-reviewer` получает из них только правила `deny` (allow и ask отбрасываются, как у ревьюера claude, иначе они расширили бы режим только чтения, А4). Оба агента в `OPENCODE_CONFIG_CONTENT` строятся так при любой роли задачи; об отброшенных allow `doctor` предупреждает строкой WARN `reviewer`.
+- **pi:** `-ne -ns -np --no-mcp`, `PI_TELEMETRY=0`, `PI_SKIP_VERSION_CHECK=1`, `PI_OFFLINE=1`. Без `PI_OFFLINE` инструменты grep и find скачивают fd и rg с GitHub, если их нет в `PATH`; `doctor` проверяет, что они есть [03 §9]. `options.extensions: ["builtin:llama.cpp", "<путь>"]` даёт по `-e <x>` на каждое расширение; они загружаются и при `-ne` [03 §9]. Так друг подключает расширение-провайдер (`pi.registerProvider`). Встроенные расширения pi: `builtin:mcp`, `builtin:llama.cpp`, `builtin:codemode`, `builtin:tool-search`. На другое имя `builtin:…` `doctor` даёт WARN, а запуск падает с `Failed to load extension` (класс `launch`).
 - **dsh:** patch-файл выключает `session-log-deepseek` (включается через `options.sessionLog: true`) и `plugin-package-inventory-deepseek`, задаёт `session-title-llm: disabled: true`; плюс `DSH_TELEMETRY_DISABLED=1`. `DSH_AGENTS_HOME` указывает на пустой каталог `agents-empty/`: иначе dsh читает общий `~/.agents` со skills и `AGENTS.md` других инструментов [04b §9]; `options.agentsHome: "user"` возвращает обычное поведение. `options.patch` — дополнительные строки patch-файла (с ограничением из А5).
 
 ### 3.7 Песочница (по желанию)
@@ -392,7 +398,7 @@ state/<ws>/jobs/    задачи ct-, oc-, pi-, dt-
 | `rate-limit` | 429 без признаков исчерпания лимита, 529; dsh `RATE_LIMIT`; OpenCode — 429 без признаков квоты из строки `quota` | так же |
 | `server` | 5xx, `ECONNREFUSED`; dsh `TRANSPORT`, `SERVER`, `TIMEOUT`, `HTTP_5xx`, `EMPTY_RESPONSE`, `MALFORMED_RESPONSE`, `STREAM_CLOSED` | так же |
 | `auth` | claude `api_error_status` 401/403; dsh `AUTH`, `MISSING_CREDENTIAL`, `INVALID_CREDENTIAL`; pi `No API key found for`; нет входа; ключ не разрешился (§3.5) | профиль и все связанные с ним профили (§3.5) помечаются `down`; дальше — следующий профиль |
-| `quota` | claude `api_error_status` 402 или 429 с текстом о лимите или балансе; dsh `QUOTA` (DeepSeek: 402 «Insufficient Balance»); OpenCode — только при `insufficient_quota`, `usage_not_included`, `GoUsageLimitError` или `FreeUsageLimitError` в теле: после 5 повторов 429 OpenCode пишет «Quota exceeded…» и без исчерпания [02 §11] | так же |
+| `quota` | claude `api_error_status` 402 или 429 с текстом о лимите или балансе; dsh `QUOTA` (DeepSeek: 402 «Insufficient Balance»); OpenCode — при HTTP 402 или «Insufficient Balance» (DeepSeek), а 429 — только при `insufficient_quota`, `usage_not_included`, `GoUsageLimitError` или `FreeUsageLimitError` в теле: после 5 повторов 429 OpenCode пишет «Quota exceeded…» и без исчерпания [02 §11] | так же |
 | `model-not-selected` | 404 на модель; claude «There's an issue with the selected model»; dsh `INVALID_REQUEST` (неверный id на маршруте `deepseek-official` приходит так), `MODEL_UNSUPPORTED`, `UNSUPPORTED_REASONING_EFFORT`; OpenCode `Model not found:`; pi `Model "…" not found`, `Unknown provider` | профиль помечается `down`; дальше — следующий профиль |
 | `context` | `prompt_too_long`; dsh `CONTEXT_WINDOW_EXCEEDED`; переполнение контекста в pi | следующий профиль для этой задачи |
 | `blocked` | оставшийся `ask` в OpenCode (`auto-rejecting` в stderr); отказ в правах без результата | следующий профиль |
@@ -541,10 +547,10 @@ state/<ws>/jobs/    задачи ct-, oc-, pi-, dt-
 |---|---|---|
 | `glm` | `zcode-dispatch api-key set` (как сейчас) | `zcode-dispatch doctor --probe` |
 | `luna`, `sol`, `astra` | `codex login` (как сейчас) | `agent-dispatch doctor --profile luna` |
-| `claude-sub` | вход в `claude` (`/login`), у владельца уже есть | `agent-dispatch doctor --profile claude-sub` (`claude auth status --json` → `loggedIn`), затем `--probe` |
+| `claude-sub` | вход в `claude` (`/login`), у владельца уже есть | `agent-dispatch doctor --profile claude-sub` (`claude auth status --json` → `loggedIn` и `authMethod`; `settings.json` каталога входа не задаёт ключ или эндпоинт, §3.6 А2), затем `--probe` |
 | `glm-api` | `agent-dispatch key set zai` | `agent-dispatch doctor --profile glm-api --probe` |
 | `deepseek-claude` | `agent-dispatch key set deepseek` | `… doctor --profile deepseek-claude --probe` |
-| `deepseek-dsh` | `npm i -g @deepseek-ai/dsh@0.2.1-rc.2` (Node `^22.19` или `>=24`); ключ `deepseek` уже сохранён | `doctor` проверяет, что `dsh` — именно DeepSeek Harness, и выполняет `dsh --profile headless --patch <шаблон> --dump-config` (§3.6 Б); затем `--probe` |
+| `deepseek-dsh` | `npm i -g @deepseek-ai/dsh@0.2.1-rc.2` (Node `^22.19` или `>=24`); ключ `deepseek` уже сохранён | `doctor` проверяет, что `dsh` — именно DeepSeek Harness, выполняет `dsh --profile headless --patch <шаблон> --dump-config` (§3.6 Б) и по его выводу проверяет, что ревьюер получает `read-only` (`dsh-permissions`, §3.6 А4), а `reasoningEffort` обеих закреплённых строк после `options.patch` входит в `off\|low\|high\|max` (`dsh-effort`); затем `--probe` |
 | `oc-deepseek` | `npm i -g opencode-ai@1.19.3` (или `brew install anomalyco/tap/opencode`; не `brew install opencode` — так ставится v2); ключ `deepseek` уже сохранён | `… doctor --profile oc-deepseek --probe` |
 | `oc-copilot`, `oc-go`, `oc-chatgpt` | установка OpenCode, как выше; `opencode auth login` → GitHub Copilot, OpenCode Go или ChatGPT Plus/Pro | `doctor` (`opencode auth list` печатает только имена), затем `--probe` |
 | `pi-glm` | `npm i -g --ignore-scripts @earendil-works/pi-coding-agent@1.3.0` (Node `>=22.19`); ключ `zai` уже сохранён | `… doctor --profile pi-glm --probe` |
@@ -552,7 +558,7 @@ state/<ws>/jobs/    задачи ct-, oc-, pi-, dt-
 
 Версии в командах — те, по которым написаны адаптеры. Новее ставить можно: `doctor` одной строкой сообщит, что версия не проверялась.
 
-Если профилю со входом нужен отдельный каталог (`"home": "isolated"`, например для второго аккаунта), вход выполняется так: `eval "$(agent-dispatch profile env oc-copilot)"; opencode auth login`.
+Если профилю со входом нужен отдельный каталог (`"home": "isolated"`, например для второго аккаунта), вход выполняется так: `agent-dispatch profile env oc-copilot -- opencode auth login` (для claude — `-- claude`, затем `/login`; для pi — `-- pi`, затем `/login <провайдер>`). Форма с `eval "$(…)"; <вход>` не годится: если `profile env` отказал (например, опечатка в имени), eval пустого вывода ничего не меняет, вход уходит в каталог по умолчанию и заменяет учётные данные основного аккаунта.
 
 `--probe` — один короткий платный запрос на ключе или подписке самого пользователя. Это проверка для самого пользователя, а не условие выпуска.
 
@@ -638,10 +644,13 @@ Kill switch «без GLM» убирает `glm` из всех цепочек д�
 **Проверяется** (`doctor` и `route`, без вызова модели):
 
 - профиль существует, его имя корректно, харнесс известен, неизвестных полей нет;
+- адаптер загружается: сбой импорта, синтаксическая ошибка или неверный `id` — строка FAIL этого профиля (`adapter <h> failed to load: <файл>: …`); ключ или вход профиля всё равно проверяются, а остальные профили и итог `doctor:` печатаются;
 - роли ссылаются на существующие профили;
 - бинарник найден и это нужная программа, версия читается, обязательные флаги есть в справке; непроверенная версия — строка в `doctor`, а не отказ;
 - ключ доступен: файл есть, переменная задана или `keyCmd` завершился с кодом 0;
 - вход в харнесс подтверждён там, где есть неинтерактивная проверка: `claude auth status --json`, `opencode auth list`, `pi auth check --provider X --json`;
+- у профиля с ключом нет сохранённого входа, который перекрыл бы ключ: у OpenCode `opencode auth list` запускается в изолированном каталоге профиля, и вход того же провайдера — FAIL; у pi учётные данные, которые pi находит сам (`ready` или `invalid`), — FAIL;
+- профиль, который `task` отклонит (§3.4, §3.6 А2), — FAIL; `--probe` его тоже отклоняет, модель не вызывается;
 - `env` профиля не трогает обязательные настройки (§3.6 А);
 - `wrap` запускается;
 - для `native` песочница доступна на платформе (§3.10).
@@ -729,7 +738,7 @@ Kill switch «без GLM» убирает `glm` из всех цепочек д�
    - подписка (общие лимиты с основной сессией [07 AN4]);
    - API — таблица эндпоинтов и рецептов из [06 §1]: Z.ai, DeepSeek, Kimi Platform, MiniMax, Alibaba PAYG (по регионам), OpenRouter (`ANTHROPIC_API_KEY=""`);
    - локальная модель: llama-server, LM Studio, Ollama, контекст по умолчанию у Ollama, «16 ГБ памяти — не для имплементера, 32–48 ГБ — для небольших фаз» [08].
-3. **OpenCode:** установка `npm i -g opencode-ai@1.19.3` (не `brew install opencode`); вход в Copilot, ChatGPT, OpenCode Go или GLM Coding Plan либо API-ключ и `keyVar`; изолированный каталог через `profile env`; `options.permission` и `options.plugins`; поддерживаемая версия — 1.19.x.
+3. **OpenCode:** установка `npm i -g opencode-ai@1.19.3` (не `brew install opencode`); вход в Copilot, ChatGPT, OpenCode Go или GLM Coding Plan либо API-ключ и `keyVar`; вход в изолированный каталог: `agent-dispatch profile env P -- opencode auth login`; `options.permission` и `options.plugins`; поддерживаемая версия — 1.19.x.
 4. **pi:** установка `npm i -g --ignore-scripts @earendil-works/pi-coding-agent@1.3.0`, Node `>=22.19`; ключ через `keyVar` или `models.json` для своего эндпоинта; «Sign in with ChatGPT»; `options.extensions`; у ревьюера нет git.
 5. **DeepSeek Harness:** `npm i -g @deepseek-ai/dsh@0.2.1-rc.2` (не путать с `dsh` из Homebrew), Node `^22.19` или `>=24`; ключ DeepSeek из хранилища или `~/.dsh/.env`; модели `deepseek-v4-pro`, `deepseek-flash` и словарь effort `off|low|high|max`; `endpoint` для своего шлюза; `options.sessionLog` включает выгрузку журнала сессии.
 6. **ZCode и Codex:** ссылки на существующие разделы, без изменений. В Codex документируются только модели OpenAI.
@@ -773,14 +782,14 @@ Kill switch «без GLM» убирает `glm` из всех цепочек д�
 | 2 | Адаптер `claude`: вход, API, `none` (локальная модель); README по нему | `agent-stub.cjs`, диалект `claude-json`: env (ровно одна переменная с ключом, свой `CLAUDE_CONFIG_DIR`, никаких `ANTHROPIC_*` у профиля со входом, scrub, `CLAUDE_CODE_EFFORT_LEVEL` в наложении, алиас `FABLE`); argv (флаги, набор ревьюера с git, один `--append-system-prompt-file`); пустой ключ → отказ без запуска; классы ошибок по `api_error_status` (`is_error` при exit 0, `error_max_turns`, 401/402/404/429/529, `prompt_too_long`, SIGINT → пустой stdout с exit 0, SIGTERM → 143); привязка resume и `No conversation found` → `resume-lost`; `permission_denials`; проверка справки | ~300 + ~300 |
 | 3 | Адаптер `dsh` | диалект `dsh-ndjson`: сборка patch-файла (строки целиком, `baseURL` из `endpoint`, слияние `options.patch` без перекрытия закреплённых полей, effort в обеих строках); `danger-full-access` без `native`, `workspace-write` с `native`, `read-only` у ревьюера; `auth: native` не задаёт `DEEPSEEK_API_KEY`; после SIGTERM dsh выходит с кодом 0, но задача всё равно получает статус `cancelled` по записи диспетчера; отмена SIGINT → не меньше 7 с → SIGKILL; коды `dsh: <CODE>:`; позднее событие `session`; проверка, что это нужный `dsh` | ~250 + ~200 |
 | 4 | Адаптер `opencode` (v1.19.x) | диалект `opencode-jsonl`: агенты `sp-` в `OPENCODE_CONFIG_CONTENT` и `--agent`; оставшийся `ask` → `blocked`; режим `stdin-wait` (stdin закрыт); exit 1 с валидным текстом; отсоединённые потомки убиты; `agent … not found` → `launch`; `instructions` проекта; `home: isolated` при ключе; `quota` только по признакам в теле | ~300 + ~250 |
-| 5 | Адаптер `pi` | диалект `pi-jsonl`: exit 0 при ошибке провайдера; resume — тот же `cwd` и файл сессии, `No project session found` → `resume-lost`; всегда `--mode json`; `stopReason`; `options.extensions` → `-e`; отмена только SIGTERM; `home: isolated` при ключе | ~250 + ~200 |
+| 5 | Адаптер `pi` | диалект `pi-jsonl`: exit 0 при ошибке провайдера; resume — тот же `cwd` и файл сессии, `No project session found` → `resume-lost`; всегда `--mode json`; `stopReason`; `options.extensions` → `-e`; отмена только SIGTERM; `home: isolated` при ключе; отказ ключевому профилю при `home: "user"` и при `auth.json` в изолированном каталоге; вычистка ключа из файлов сессии (`scrub`) на всех исходах; WARN на неизвестное `builtin:`-расширение; `resume-lost` по новому файлу сессии при длинном stderr | ~250 + ~200 |
 | 6 | Роли субагентов Claude на внешних профилях через `$AD` — последний инкремент; пакеты ревью — как у Astra | эталонные argv; сценарий от начала до конца (end-to-end) на заглушке | ~150 + правки скиллов |
 
 **Заглушка.** `tests/fixtures/agent-stub.cjs` обобщает `zcode-stub.cjs` и подставляется через поле профиля `bin`:
 
 - `AGENT_STUB_DIALECT`: `zcode-json`, `claude-json`, `opencode-jsonl`, `pi-jsonl`, `dsh-ndjson`;
 - `AGENT_STUB_MODE`: 15 существующих режимов плюс `exit0-error`, `sigterm-exit0`, `error-then-recover`, `auto-reject`, `stdin-wait`, `detached-child`, `late-session`, `max-turns`, `rate-limit`, `quota`, `context`;
-- заглушка отвечает на справку (`helpArgv`), `--version`, `auth status --json`, `opencode auth list`, `pi auth check` и `dsh --dump-config`;
+- заглушка отвечает на справку (`helpArgv`), `--version`, `auth status --json`, `opencode auth list`, `pi auth check` и `dsh --dump-config`; диалект `dsh-ndjson` применяет слои `$DSH_HOME` перед `--patch` и отдаёт строки `sandbox-policy`/`approval-policy`;
 - заглушка записывает argv, env и stdin для проверок.
 
 **Изоляция тестов.** Ядро читает фиксированные переменные: `AGENT_DISPATCH_STATE_DIR` (аналог `ZCODE_STATE_DIR`), `AGENT_DISPATCH_ZCODE` и `AGENT_DISPATCH_CODEX` (пути к заглушкам обёрток), `AGENT_TEST_BOOT_ID` (имитация перезагрузки), `AGENT_ENV_PASSTHROUGH` (проброс управляющих переменных заглушки через белый список). Имена можно поменять в плане, но они фиксируются один раз.
@@ -815,7 +824,7 @@ Kill switch «без GLM» убирает `glm` из всех цепочек д�
 
 ## 10. Принятые решения и непроверенное
 
-Вопросов к владельцу нет. То, что раньше было открытым, решено так:
+Вопрос к владельцу один — в конце раздела. То, что раньше было открытым, решено так:
 
 - **Порядок инкрементов 3–5:** `dsh` → OpenCode → pi; меняется, если друг попросит другой харнесс первым.
 - **Роли субагентов Claude:** переназначение на другую модель и effort — с инкремента 1, внешнее исполнение — инкремент 6 (решение владельца: роли перенастраиваются как угодно).
@@ -824,8 +833,12 @@ Kill switch «без GLM» убирает `glm` из всех цепочек д�
 Не проверено запуском; на план не влияет, подтвердят первые пользователи:
 
 - работает ли `git commit` под `workspace-write` у `dsh` в связанных рабочих деревьях (git worktree), где `.git` лежит вне `cwd` [04b] — оговорка в README (§3.7);
-- какой `reasoningEffort` у dsh побеждает в headless-режиме и принимаются ли все поля patch-файла [04b, вопрос 3] — `doctor` проверяет через `--dump-config`;
+- какой `reasoningEffort` у dsh побеждает в headless-режиме и принимаются ли все поля patch-файла [04b, вопрос 3] — открыт: `doctor` проверяет оба значения по словарю dsh (`dsh-effort`), а `--dump-config` подтверждает лишь, что dsh принимает файл; какое значение побеждает, покажет `--probe` на живом dsh;
 - нет ли гонок при параллельной первой инициализации профиля headless у dsh [04b, вопрос 4] — `doctor` инициализирует профиль заранее;
 - видит ли зачистка потомков инструменты dsh в user-systemd scopes на Linux [04b §10];
 - код выхода OpenCode v1 при автоотклонении запроса разрешения (по исходникам — 0) [02];
 - можно ли повторять `--append-system-prompt-file` у `claude` — адаптер передаёт один файл [01].
+
+Открыто, решает владелец:
+
+- **Перенаправление оболочки у ревьюера** (`git status > f`, `git diff > f`) — путь записи, который правила claude и OpenCode не закрывают: OpenCode сравнивает текст команды вместе с перенаправлением, и `git status *` его пропускает (проверено по исходникам OpenCode); как `claude` обрабатывает цель перенаправления, в [01] не проверено. Правило `Bash(git *>*)` у claude или `"*>*": "deny"` у OpenCode его закрыло бы, но запретило бы и `2>&1` / `2>/dev/null`, которые модели часто дописывают; каждый такой отказ попадал бы в отчёт ревью замечанием. Пока такого правила нет.
