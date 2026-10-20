@@ -217,6 +217,15 @@ spawn(process.execPath, ["-e", script, process.argv[1]], { detached: true, stdio
     wait_file "$1"
 }
 
+# spawn_leaderless <marker> — a stranger's process group without a leader: sh leads a new group, leaves a member in it
+# (a node carrying the marker in its argv) and exits, as a shell pipeline whose first command ended does. Prints
+# "<group id> <member pid>".
+spawn_leaderless() {
+    node -e '
+const r = require("node:child_process").spawnSync("/bin/sh", ["-c", `"${process.execPath}" -e "setInterval(() => {}, 1 << 30)" "$1" </dev/null >/dev/null 2>&1 & echo $!`, "sh", process.argv[1]], { detached: true, encoding: "utf8" });
+console.log(r.pid, r.stdout.trim());' "$1"
+}
+
 main() {
     echo "=== Test: agent-core ==="
 
@@ -239,12 +248,12 @@ main() {
 
     local git_id=(-c user.email=t@example.com -c user.name=t -c commit.gpgsign=false)
     local r
-    for r in repo repo2 repo3 repo4 repo5 repo6 repo7 repo8 repo9 repo10; do
+    for r in repo repo2 repo3 repo4 repo5 repo6 repo7 repo8 repo9 repo10 repo11 repo12 repo13 repo14; do
         git init -q -b main "$TEST_ROOT/$r"
         printf 'x\n' >"$TEST_ROOT/$r/a.txt"
         (cd "$TEST_ROOT/$r" && git add a.txt && git "${git_id[@]}" commit -qm c0)
     done
-    local repo repo2 repo3 repo4 repo5 repo6 repo7 repo8 repo9 repo10
+    local repo repo2 repo3 repo4 repo5 repo6 repo7 repo8 repo9 repo10 repo11 repo12 repo13 repo14
     repo="$(cd "$TEST_ROOT/repo" && git rev-parse --show-toplevel)"
     repo2="$(cd "$TEST_ROOT/repo2" && git rev-parse --show-toplevel)"
     repo3="$(cd "$TEST_ROOT/repo3" && git rev-parse --show-toplevel)"
@@ -255,7 +264,22 @@ main() {
     repo8="$(cd "$TEST_ROOT/repo8" && git rev-parse --show-toplevel)"
     repo9="$(cd "$TEST_ROOT/repo9" && git rev-parse --show-toplevel)"
     repo10="$(cd "$TEST_ROOT/repo10" && git rev-parse --show-toplevel)"
+    repo11="$(cd "$TEST_ROOT/repo11" && git rev-parse --show-toplevel)"
+    repo12="$(cd "$TEST_ROOT/repo12" && git rev-parse --show-toplevel)"
+    repo13="$(cd "$TEST_ROOT/repo13" && git rev-parse --show-toplevel)"
+    repo14="$(cd "$TEST_ROOT/repo14" && git rev-parse --show-toplevel)"
     mkdir -p "$TEST_ROOT/notgit"
+    # An auxiliary command for the boundedExec tests: `lead <file>` ignores SIGTERM, starts a member of its own process
+    # group that ignores it too, and writes "<its parent> <its pid> <the member's pid>" to the file; both wait forever.
+    # Both carry the file's path (under the run's temp root) in their argv.
+    cat >"$TEST_ROOT/group-child.cjs" <<'EOF'
+process.on("SIGTERM", () => {});
+if (process.argv[2] === "lead") {
+  const mate = require("node:child_process").spawn(process.execPath, [__filename, "member", process.argv[3]], { stdio: "ignore" });
+  require("node:fs").writeFileSync(process.argv[3], `${process.ppid} ${process.pid} ${mate.pid}`);
+}
+setInterval(() => {}, 1 << 30);
+EOF
     local prompt="$TEST_ROOT/prompt.md"
     printf '## Headless run\n\nImplement the thing. Ünïcødé ok.\n' >"$prompt"
     cd "$repo"
@@ -669,6 +693,18 @@ process.exit(r.env.PLAIN_API_KEY === process.env.S && !("TEST_SECRET" in r.env) 
     else
         fail "7 a probe whose adapter error carries the key (discover): the error is redacted (the probe knows the key before discover runs)"
         echo "    exit=$rc out=${out//$SECRET/<SECRET>}"
+    fi
+    # A plan the adapter rejects ends the probe there: the key is never resolved and discovery — whose diagnostics may
+    # carry a secret the redactor does not know yet — never runs.
+    keylog="$TEST_ROOT/keylog-plan.txt"
+    rc=0
+    out="$(CORE_HARNESS_KEY_LOG="$keylog" TEST_SECRET="$SECRET" ad probe --profile leaky \
+        --profile-json '{"harness":"plain-leak","auth":{"keyEnv":"TEST_SECRET"},"leak":"discover","rejectPlan":"--turbo"}' 2>&1)" || rc=$?
+    if [[ "$rc" -eq 2 && "$out" == *"profile leaky: unsupported option --turbo"* && "$out" != *"cannot start with key"* && "$out" != *"$SECRET"* && ! -e "$keylog" ]]; then
+        pass "7 a probe whose preliminary plan is rejected fails at once (exit 2, the adapter's reason): no key resolved, discovery never called"
+    else
+        fail "7 a probe whose preliminary plan is rejected fails at once (exit 2, the adapter's reason): no key resolved, discovery never called"
+        echo "    exit=$rc out=${out//$SECRET/<SECRET>} keylog=$(cat "$keylog" 2>/dev/null)"
     fi
     rc=0
     err="$(TEST_SECRET= ad task --background --write --profile keyed --profile-json "$keyed" --prompt-file "$prompt" 2>&1)" || rc=$?
@@ -1605,7 +1641,11 @@ fs.writeFileSync(`${file}.terminal`, JSON.stringify({ ...r, status: "cancelled",
         echo "    status=$st cancel=$(cat "$TEST_ROOT/cancel-29.rc" 2>/dev/null):$(cat "$TEST_ROOT/cancel-29.out" 2>/dev/null) launches=$(wc -l <"$launches" 2>/dev/null) next=$rc:$err/$out"
     fi
 
-    # --- 30. one runner per job, also for two __run released into the claim at the same moment ---
+    # --- 30. one runner per job, also for two __run that both read the job unclaimed ---
+    # The seam (AGENT_TEST_RUN_BARRIER) parks each runner after the reads its claim decision rests on and before it
+    # commits the claim, and writes what it read to <barrier>.ready-<pid>. Once both are parked — both holding "the job
+    # is unclaimed" — the barrier file names one instant at which both commit, so a claim that is not atomic lets both
+    # through, whatever the scheduling.
     barrier="$TEST_ROOT/claim-barrier-30"
     launches="$TEST_ROOT/launches-30.txt"
     rm -f "$barrier"* "$launches" "$TEST_ROOT"/run30-*.rc
@@ -1619,22 +1659,24 @@ fs.writeFileSync(`${file}.terminal`, JSON.stringify({ ...r, status: "cancelled",
             echo "$krc" >"$TEST_ROOT/run30-$k.rc"
         ) &
     done
-    local ready=0
+    local ready=0 observed=""
     for ((k = 0; k < 100; k++)); do
         ready="$(compgen -G "$barrier.ready-*" | wc -l | tr -d ' ')"
         if ((ready >= 2)); then break; fi
         sleep 0.1
     done
-    touch "$barrier" # both runners passed the pre-claim check; now both claim at once
+    for f in "$barrier".ready-*; do observed="$observed$(cat "$f" 2>/dev/null) "; done
+    echo "$(($(now_ms) + 300))" >"$barrier.tmp" && mv "$barrier.tmp" "$barrier" # both commit at this instant
     wait
     out="$(cat "$TEST_ROOT"/run30-*.rc 2>/dev/null | sort | tr '\n' ' ')"
     st="$(wait_status pt-9000 'completed|failed|cancelled' 20)"
-    if [[ "$ready" -eq 2 && "$out" == "0 1 " && "$(wc -l <"$launches" | tr -d ' ')" == 1 && "$st" == completed ]] \
+    if [[ "$ready" -eq 2 && "$observed" == '{"runnerPid":null,"claimed":false} {"runnerPid":null,"claimed":false} ' && "$out" == "0 1 " \
+        && "$(wc -l <"$launches" | tr -d ' ')" == 1 && "$st" == completed ]] \
         && grep -q "__run refused for pt-9000 in pid [0-9]*: runner pid [0-9]* owns the job" "$JOBS/pt-9000.log"; then
-        pass "30 two __run that both passed the pre-claim check claim at once: exactly one wins (exit 0, one harness launch), the other is refused (exit 1)"
+        pass "30 two __run that both read the job unclaimed commit their claims at one instant: exactly one wins (exit 0, one harness launch), the other is refused (exit 1)"
     else
-        fail "30 two __run that both passed the pre-claim check claim at once: exactly one wins (exit 0, one harness launch), the other is refused (exit 1)"
-        echo "    ready=$ready exit codes: $out launches=$(wc -l <"$launches" 2>/dev/null) status=$st"
+        fail "30 two __run that both read the job unclaimed commit their claims at one instant: exactly one wins (exit 0, one harness launch), the other is refused (exit 1)"
+        echo "    ready=$ready observed=$observed exit codes: $out launches=$(wc -l <"$launches" 2>/dev/null) status=$st"
     fi
 
     # --- 31. a process's identity does not move with the wall clock (Linux: /proc ticks, not procps' lstart) ---
@@ -1795,6 +1837,363 @@ console.log([same, echo.stdout, typed.stdout, slow.status, slow.error === null, 
     else
         fail "36 SIGKILL to the runner's process group during a discovery that hangs (and ignores SIGTERM): its supervisor, in a group of its own, ends the --version; the job is reaped, release-stale frees the worktree"
         echo "    stub=$d1 gone=$aux_gone $(jfield job.status <<<"$sj") note=$(jfield job.note <<<"$sj") release-stale=$rc:$out next=$st"
+    fi
+
+    # --- 37. the exec supervisor ends its own group itself; the caller never signals that group id afterwards ---
+    # Once boundedExec has the supervisor's result, the supervisor is reaped and its pid — the id of its group — is free:
+    # here it names a replacement group (a probe of it succeeds, a signal to it is recorded, not delivered). The command
+    # ignores SIGTERM and keeps a member in its group; both must still be gone, ended by the supervisor.
+    pids="$TEST_ROOT/pids-37.txt"
+    out="$(core_js '
+const fs = await import("node:fs");
+const [script, pids] = process.argv.slice(1);
+const real = process.kill.bind(process);
+const supervisor = () => { try { return Number(fs.readFileSync(pids, "utf8").split(" ")[0]); } catch { return null; } };
+const sent = [];
+process.kill = (pid, signal = "SIGTERM") => {
+  if (pid < 0 && -pid === supervisor()) { if (signal !== 0) sent.push(signal); return true; }
+  return real(pid, signal);
+};
+const r = core.boundedExec(process.execPath, [script, "lead", pids], { timeoutMs: 300, graceMs: 100 });
+process.kill = real;
+const procs = fs.readFileSync(pids, "utf8").split(" ").map(Number);
+const alive = (pid) => { try { real(pid, 0); return true; } catch { return false; } };
+for (let i = 0; i < 50 && procs.some(alive); i += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+console.log([r.timedOut, r.error?.code, sent.length, procs.filter(alive).length].join(" "));' "$TEST_ROOT/group-child.cjs" "$pids")"
+    if [[ "$out" == "true ETIMEDOUT 0 0" ]]; then
+        pass "37 boundedExec past its deadline: the supervisor SIGKILLs its own group while it still pins it (command and group member gone); the caller sends no signal to the freed group id"
+    else
+        fail "37 boundedExec past its deadline: the supervisor SIGKILLs its own group while it still pins it (command and group member gone); the caller sends no signal to the freed group id"
+        echo "    timedOut code signals-to-freed-id alive: $out"
+    fi
+
+    # --- 38. a supervisor whose caller died before it started never starts the command (no deadline, or a long one) ---
+    # AGENT_TEST_EXEC_DELAY_MS parks the supervisor before its first step; its caller is SIGKILLed meanwhile. Its
+    # parent is init (or a subreaper) by the time it runs, which it must not take for its caller.
+    local caller_js m38a="$TEST_ROOT/started-38a" m38b="$TEST_ROOT/started-38b" c38a c38b sup38=0
+    caller_js='const { pathToFileURL } = await import("node:url");
+const core = await import(pathToFileURL(process.env.CORE).href);
+core.boundedExec(process.execPath, [process.argv[1], "lead", process.argv[2]], { timeoutMs: Number(process.argv[3]) });'
+    rm -f "$m38a" "$m38b"
+    CORE="$CORE" AGENT_TEST_EXEC_DELAY_MS=1500 node --input-type=module -e "$caller_js" "$TEST_ROOT/group-child.cjs" "$m38a" 0 &
+    c38a=$!
+    CORE="$CORE" AGENT_TEST_EXEC_DELAY_MS=1500 node --input-type=module -e "$caller_js" "$TEST_ROOT/group-child.cjs" "$m38b" 60000 &
+    c38b=$!
+    for ((k = 0; k < 50; k++)); do
+        sup38="$( (pgrep -f "agent-dispatch-exec .*$m38a" || true; pgrep -f "agent-dispatch-exec .*$m38b" || true) | wc -l | tr -d ' ')"
+        if ((sup38 >= 2)); then break; fi
+        sleep 0.1
+    done
+    kill -KILL "$c38a" "$c38b" 2>/dev/null
+    wait "$c38a" "$c38b" 2>/dev/null
+    local left38=""
+    for ((k = 0; k < 50; k++)); do
+        left38="$(pgrep -f "agent-dispatch-exec .*$TEST_ROOT/started-38" | tr '\n' ' ')"
+        [[ -z "$left38" ]] && break
+        sleep 0.2
+    done
+    if [[ "$sup38" -eq 2 && -z "$left38" && ! -e "$m38a" && ! -e "$m38b" ]] && ! pgrep -f "group-child.cjs lead $TEST_ROOT/started-38" >/dev/null; then
+        pass "38 the caller dies before its supervisor initialized: the supervisor sees another parent than the caller it was given and exits without starting the command (timeoutMs 0 and 60000)"
+    else
+        fail "38 the caller dies before its supervisor initialized: the supervisor sees another parent than the caller it was given and exits without starting the command (timeoutMs 0 and 60000)"
+        echo "    supervisors seen: $sup38 left: $left38 started: $(/bin/ls "$TEST_ROOT" | grep started-38 | tr '\n' ' ')"
+    fi
+
+    # --- 39. a runner killed during discovery: its auxiliary command stays the job's until it is gone ---
+    # The --version ignores SIGTERM and its grace is long, so it outlives the runner for seconds. The supervisor recorded
+    # its group in the job's ownership log before it started the command: release-stale refuses, the reaper does not
+    # mark the cleanup done in the pass that found it alive.
+    local JOBS11 aux_pg cleaned_early
+    JOBS11="$(jobs_dir_of "$repo11")"
+    pids="$TEST_ROOT/pids-39.txt"
+    id="$(AGENT_STUB_VERSION_HANG=ignore-term AGENT_STUB_PIDS="$pids" start_task --write --cwd "$repo11" --profile dh \
+        --profile-json '{"harness":"plain","discoverTimeoutMs":60000,"discoverGraceMs":8000}' --prompt-file "$prompt")"
+    wait_lines "$pids" 1 || true
+    d1="$(sed -n 1p "$pids" 2>/dev/null)"
+    aux_pg="$(ps -o pgid= -p "$d1" 2>/dev/null | tr -d ' ')"
+    runner="$(ad status "$id" --cwd "$repo11" --json | jfield job.runnerPid)"
+    kill -KILL "$runner" 2>/dev/null
+    gone "$runner" || true
+    rc=0
+    err="$(ad release-stale --cwd "$repo11" 2>&1)" || rc=$?
+    sj="$(ad status "$id" --cwd "$repo11" --json)"
+    cleaned_early=no
+    if [[ -e "$JOBS11/$id.json.cleaned" ]]; then cleaned_early=yes; fi
+    aux_gone=no
+    if gone "$d1"; then aux_gone=yes; fi
+    ad status "$id" --cwd "$repo11" >/dev/null
+    rc2=0
+    out2="$(ad release-stale --cwd "$repo11" 2>&1)" || rc2=$?
+    id2="$(AGENT_STUB_MODE=ok start_task --write --cwd "$repo11" --profile p1 --prompt-file "$prompt")"
+    st="$(wait_status "$id2" 'completed|failed|cancelled' 20 --cwd "$repo11")"
+    if [[ -n "$d1" && -n "$aux_pg" && "$rc" -eq 2 && "$err" == *"still has live process group $aux_pg of job $id"* \
+        && "$(jfield job.status <<<"$sj")" == failed && "$(jfield job.note <<<"$sj")" == "runner died" && "$cleaned_early" == no && "$aux_gone" == yes \
+        && -e "$JOBS11/$id.json.cleaned" && "$rc2" -eq 0 && "$st" == completed ]]; then
+        pass "39 runner killed while its --version (SIGTERM ignored) runs: release-stale refuses naming the command's group and the cleanup stays pending until the group is gone; then both complete and the next write task runs"
+    else
+        fail "39 runner killed while its --version (SIGTERM ignored) runs: release-stale refuses naming the command's group and the cleanup stays pending until the group is gone; then both complete and the next write task runs"
+        echo "    stub=$d1 group=$aux_pg release-stale=$rc:$err $(jfield job.status <<<"$sj") note=$(jfield job.note <<<"$sj") cleaned early: $cleaned_early aux gone: $aux_gone release-stale=$rc2:$out2 next=$st"
+    fi
+
+    # --- 40. a detached descendant that survives an interrupted cancel is found again and stopped by a retry ---
+    # The harness keeps SIGTERM's default and dies at the ladder's first step; its descendants (each in a group of its
+    # own) ignore it. Runner and cancel are killed during that step's wait: the descendants have lost their link to the
+    # job's tree, and only the ownership log, written before the signal, still names them.
+    pids="$TEST_ROOT/pids-40.txt"
+    rm -f "$pids"
+    id="$(AGENT_STUB_MODE=detached-child AGENT_STUB_PIDS="$pids" start_task --profile ll --profile-json '{"harness":"plain-long-ladder"}' --prompt-file "$prompt")"
+    child="$(wait_child "$id")"
+    wait_lines "$pids" 2 || true
+    d1="$(sed -n 1p "$pids" 2>/dev/null)"
+    d2="$(sed -n 2p "$pids" 2>/dev/null)"
+    runner="$(ad status "$id" --json | jfield job.runnerPid)"
+    node "$HARNESS" cancel "$id" >/dev/null 2>&1 &
+    local cancel40=$! harness_died=no
+    if gone "$child"; then harness_died=yes; fi
+    kill -KILL "$runner" "$cancel40" 2>/dev/null
+    wait "$cancel40" 2>/dev/null
+    local survived=no
+    if [[ -n "$d1" && -n "$d2" ]] && kill -0 "$d1" 2>/dev/null && kill -0 "$d2" 2>/dev/null && ! kill -0 "$runner" 2>/dev/null; then survived=yes; fi
+    out="$(with_deadline 30 ad cancel "$id")"
+    if [[ "$harness_died" == yes && "$survived" == yes && "$out" == "$id is cancelled (cleanup resumed)" ]] && gone "$d1" "$d2" \
+        && [[ -e "$JOBS/$id.json.cleaned" && "$(ad status "$id" --json | jfield job.status)" == cancelled ]]; then
+        pass "40 cancel interrupted between SIGTERM and SIGKILL (runner and cancel killed): a repeated cancel finds the two orphaned descendants through the ownership log and stops them; then the cleanup is done"
+    else
+        fail "40 cancel interrupted between SIGTERM and SIGKILL (runner and cancel killed): a repeated cancel finds the two orphaned descendants through the ownership log and stops them; then the cleanup is done"
+        echo "    harness died: $harness_died descendants survived the interruption: $survived d1=$d1 d2=$d2 retry=$out"; tail -5 "$JOBS/$id.log"
+    fi
+
+    # --- 41. a sweep that reports survivors leaves the cleanup pending and the reservation held, whatever the verdict ---
+    # A runner run in-process, whose every signal to a process group fails as one to another user's processes would
+    # (EPERM): the harness completes but leaves a member of its group and that member's own-group child behind.
+    local JOBS12
+    JOBS12="$(jobs_dir_of "$repo12")"
+    pids="$TEST_ROOT/pids-41.txt"
+    rm -f "$pids"
+    out="$(core_js '
+const fs = await import("node:fs");
+const path = await import("node:path");
+const [jobs, repo, prompt, pids, adapterPath] = process.argv.slice(1);
+const { default: plain } = await import((await import("node:url")).pathToFileURL(adapterPath).href);
+const id = "pt-0001";
+fs.mkdirSync(`${jobs}/${id}`, { recursive: true });
+fs.copyFileSync(prompt, `${jobs}/${id}/prompt.md`);
+fs.writeFileSync(`${jobs}/${id}.json`, JSON.stringify({ id, status: "running", errorClass: null, profile: "p1", harness: "plain", write: true,
+  sessionId: "s-41", resumeOf: null, workspaceRoot: repo, cwd: repo, promptPath: `${jobs}/${id}/prompt.md`, promptBytes: 10, runnerPid: null,
+  childPid: null, startedAt: new Date().toISOString(), bootId: core.bootId(), timeoutMin: 1, cancelLadder: [["SIGTERM", 200], ["SIGKILL", 0]],
+  hasSecret: false, profileConfig: { harness: "plain" } }));
+const lock = `${path.dirname(jobs)}/active.lock.0`;
+fs.writeFileSync(lock, JSON.stringify({ holderPid: process.pid, holderStartedAt: core.ownStart(), jobId: id, token: "tok-41", generation: 0,
+  createdAt: new Date().toISOString(), bootId: core.bootId() }));
+const real = process.kill.bind(process);
+process.kill = (pid, signal = "SIGTERM") => {
+  if (pid < 0 && signal !== 0) throw Object.assign(new Error("kill EPERM"), { code: "EPERM", syscall: "kill" });
+  return real(pid, signal);
+};
+const rc = await core.runJob({ id, jobsDir: jobs, token: "tok-41", adapters: { plain }, env: { ...process.env, AGENT_STUB_MODE: "leave-behind", AGENT_STUB_PIDS: pids } });
+process.kill = real;
+const record = core.readRecord(`${jobs}/${id}.json`);
+console.log([rc, record.status, fs.existsSync(`${jobs}/${id}.json.cleaned`), fs.existsSync(`${lock}.released`), core.cleanupPending(jobs, record)].join(" "));' \
+        "$JOBS12" "$repo12" "$prompt" "$pids" "$FIX/adapters/plain.mjs")"
+    d1="$(sed -n 1p "$pids" 2>/dev/null)"
+    d2="$(sed -n 2p "$pids" 2>/dev/null)"
+    local alive41=no
+    if [[ -n "$d1" && -n "$d2" ]] && kill -0 "$d1" 2>/dev/null && kill -0 "$d2" 2>/dev/null; then alive41=yes; fi
+    rc=0
+    err="$(ad release-stale --cwd "$repo12" 2>&1)" || rc=$?
+    if [[ -n "$d1" ]]; then kill -KILL "$d1" "$d2" 2>/dev/null; fi
+    gone "$d1" "$d2" || true
+    ad status pt-0001 --cwd "$repo12" >/dev/null
+    rc2=0
+    out2="$(ad release-stale --cwd "$repo12" 2>&1)" || rc2=$?
+    if [[ "$out" == "0 completed false false true" && "$alive41" == yes && "$rc" -eq 2 && "$err" == *"still has live harness process group"* \
+        && -e "$JOBS12/pt-0001.json.cleaned" && "$rc2" -eq 0 && "$out2" == "released $repo12 generation 0" ]] \
+        && grep -q "cleanup pending: process groups .* survived the teardown; the workspace reservation stays held" "$JOBS12/pt-0001.log"; then
+        pass "41 the harness completes but its sweep reports survivors: the job is completed, yet no cleanup marker and the reservation stays held (release-stale refuses); once they are gone the reaper marks the cleanup done and release-stale frees the worktree"
+    else
+        fail "41 the harness completes but its sweep reports survivors: the job is completed, yet no cleanup marker and the reservation stays held (release-stale refuses); once they are gone the reaper marks the cleanup done and release-stale frees the worktree"
+        echo "    rc status cleaned released pending: $out survivors alive: $alive41 release-stale=$rc:$err then $rc2:$out2"; grep cleanup "$JOBS12/pt-0001.log" || true
+    fi
+
+    # --- 42. a group of the ownership log is the job's only while its leader lives: a stranger under its old id is left alone ---
+    # Once a recorded group has ended, its id can name a stranger's group whose leader exited while its members live (a
+    # shell pipeline whose first command ended). The runner's own end (a write job run in-process, whose log names that
+    # id as a group it owned), the reaper (pt-0002) and cancel (pt-0003) must neither signal that group nor wait for it.
+    local JOBS13 stranger member42 marker42="$TEST_ROOT/stranger-42"
+    JOBS13="$(jobs_dir_of "$repo13")"
+    read -r stranger member42 <<<"$(spawn_leaderless "$marker42")"
+    out="$(core_js '
+const fs = await import("node:fs");
+const path = await import("node:path");
+const { spawnSync } = await import("node:child_process");
+const [jobs, repo, prompt, adapterPath, stranger] = process.argv.slice(1);
+const { default: plain } = await import((await import("node:url")).pathToFileURL(adapterPath).href);
+const owned = (now) => `${JSON.stringify({ groups: [{ pgid: Number(stranger), startedAt: "Mon Oct 19 10:00:01 2026" }], by: "exec", at: now })}\n`;
+const id = "pt-0001";
+fs.mkdirSync(`${jobs}/${id}`, { recursive: true });
+fs.copyFileSync(prompt, `${jobs}/${id}/prompt.md`);
+fs.writeFileSync(`${jobs}/${id}.json`, JSON.stringify({ id, status: "running", errorClass: null, profile: "p1", harness: "plain", write: true,
+  sessionId: "s-42", resumeOf: null, workspaceRoot: repo, cwd: repo, promptPath: `${jobs}/${id}/prompt.md`, promptBytes: 10, runnerPid: null,
+  childPid: null, startedAt: new Date().toISOString(), bootId: core.bootId(), timeoutMin: 1, cancelLadder: [["SIGTERM", 200], ["SIGKILL", 0]],
+  hasSecret: false, profileConfig: { harness: "plain" } }));
+const lock = `${path.dirname(jobs)}/active.lock.0`;
+fs.writeFileSync(lock, JSON.stringify({ holderPid: process.pid, holderStartedAt: core.ownStart(), jobId: id, token: "tok-42", generation: 0,
+  createdAt: new Date().toISOString(), bootId: core.bootId() }));
+const adapter = { ...plain, discover(ctx) { fs.appendFileSync(`${jobs}/${id}.json.runner`, owned(new Date().toISOString())); return plain.discover(ctx); } };
+const rc = await core.runJob({ id, jobsDir: jobs, token: "tok-42", adapters: { plain: adapter }, env: { ...process.env, AGENT_STUB_MODE: "ok" } });
+const ran = [rc, core.readRecord(`${jobs}/${id}.json`).status, fs.existsSync(`${jobs}/${id}.json.cleaned`), fs.existsSync(`${lock}.released`)];
+const dead = spawnSync("/usr/bin/true").pid;
+for (const pending of ["pt-0002", "pt-0003"]) {
+  const now = new Date().toISOString();
+  fs.writeFileSync(`${jobs}/${pending}.json`, JSON.stringify({ id: pending, status: "completed", errorClass: null, profile: "p1", harness: "plain",
+    write: false, workspaceRoot: repo, cwd: repo, runnerPid: dead, runnerStartedAt: "Mon Oct 19 10:00:00 2026", childPid: null, childStartedAt: null,
+    startedAt: now, finishedAt: now, bootId: core.bootId(), timeoutMin: 1, cancelLadder: [["SIGTERM", 200], ["SIGKILL", 0]] }));
+  fs.writeFileSync(`${jobs}/${pending}.json.runner`, `${JSON.stringify({ pid: dead, startedAt: "Mon Oct 19 10:00:00 2026", bootId: core.bootId(), claimedAt: now })}\n${owned(now)}`);
+}
+console.log(ran.join(" "));' "$JOBS13" "$repo13" "$prompt" "$FIX/adapters/plain.mjs" "$stranger")"
+    out2="$(with_deadline 30 ad cancel pt-0003 --cwd "$repo13")"
+    local member_alive=no
+    if [[ -n "$member42" ]] && kill -0 "$member42" 2>/dev/null; then member_alive=yes; fi
+    if [[ -n "$stranger" && "$out" == "0 completed true true" && "$out2" == "pt-0003 is completed" && "$member_alive" == yes \
+        && -e "$JOBS13/pt-0002.json.cleaned" && -e "$JOBS13/pt-0003.json.cleaned" ]] && ! grep -qs SIG "$JOBS13/pt-0002.log" "$JOBS13/pt-0003.log"; then
+        pass "42 a recorded group whose id now names a stranger's leaderless group: the runner ends cleaned and releases the worktree, the reaper and cancel send it nothing and mark the cleanup done"
+    else
+        fail "42 a recorded group whose id now names a stranger's leaderless group: the runner ends cleaned and releases the worktree, the reaper and cancel send it nothing and mark the cleanup done"
+        echo "    rc status cleaned released: $out cancel=$out2 stranger=$stranger member alive: $member_alive"; cat "$JOBS13"/pt-000[123].log 2>/dev/null | grep -i "cleanup\|SIG" || true
+    fi
+    if [[ -n "$member42" ]]; then kill -KILL "$member42" 2>/dev/null || true; fi
+
+    # --- 43. a process that ended but was never reaped (a zombie) is gone: it neither blocks the cleanup nor gets signalled ---
+    # kill(…, 0) finds a zombie, also in its group; under a Linux container's pid 1 that never reaps, what a cleanup
+    # SIGKILLed stays one for good. perl forks a child into a group of its own and never reaps it; a pending job names
+    # that child as its harness. (macOS's launchd reaps every orphan at once: no zombie lasts there beyond its parent.)
+    if [[ "$(uname -s)" != Linux ]]; then
+        echo "  [SKIP] 43 Linux only: a zombie that outlives its parent (macOS's launchd reaps every orphan at once)"
+    elif command -v perl >/dev/null; then
+        out="$(core_js '
+const fs = await import("node:fs");
+const { spawn, spawnSync } = await import("node:child_process");
+const [jobs, marker] = process.argv.slice(1);
+const holder = spawn("perl", ["-e", `$| = 1; my $c = fork; if (!$c) { setpgrp(0, 0); exec "sleep", "1"; } print "$c\n"; sleep 60;`, marker], { stdio: ["ignore", "pipe", "ignore"] });
+const child = await new Promise((resolve) => holder.stdout.once("data", (data) => resolve(Number(String(data).trim()))));
+const startedAt = core.processStart(child);
+await new Promise((resolve) => setTimeout(resolve, 1800)); // the child has ended; perl never reaps it
+let found = false; // the zombie is there for kill(…, 0)
+try { process.kill(child, 0); found = true; } catch {}
+const t0 = Date.now();
+const stopped = await core.terminateTree(child, [["SIGTERM", 1000], ["SIGKILL", 0]]);
+const quick = Date.now() - t0 < 900;
+const dead = spawnSync("/usr/bin/true").pid;
+const id = "pt-0001", file = `${jobs}/${id}.json`, now = new Date().toISOString();
+fs.mkdirSync(jobs, { recursive: true });
+fs.writeFileSync(file, JSON.stringify({ id, status: "completed", errorClass: null, profile: "p1", harness: "plain", write: false, runnerPid: dead,
+  runnerStartedAt: "Mon Oct 19 10:00:00 2026", childPid: child, childStartedAt: startedAt, startedAt: now, finishedAt: now, bootId: core.bootId() }));
+fs.writeFileSync(`${file}.runner`, `${JSON.stringify({ pid: dead, startedAt: "Mon Oct 19 10:00:00 2026", bootId: core.bootId(), claimedAt: now, childPid: child, childStartedAt: startedAt })}\n`);
+const reaped = core.reapDeadRunners(jobs);
+console.log([found, typeof startedAt, core.isAlive(child), core.groupAlive(child), core.processIdentity(child, startedAt),
+  core.harnessGroupState(child, startedAt), stopped.sent.length, stopped.survivors.length, quick, reaped.length, fs.existsSync(`${file}.cleaned`)].join(" "));
+holder.stdout.destroy();
+holder.kill("SIGKILL");' "$TEST_ROOT/jobs-43" "$TEST_ROOT/zombie-holder-43")"
+        if [[ "$out" == "true string false false gone gone 0 0 true 0 true" ]]; then
+            pass "43 a zombie (ended, never reaped) is gone: isAlive / groupAlive / identity say so, terminateTree sends nothing and reports no survivor, the reaper marks the cleanup done"
+        else
+            fail "43 a zombie (ended, never reaped) is gone: isAlive / groupAlive / identity say so, terminateTree sends nothing and reports no survivor, the reaper marks the cleanup done"
+            echo "    kill-finds-it start alive group identity harness sent survivors quick reaped cleaned: $out"
+        fi
+    else
+        echo "  [SKIP] 43 needs perl (a parent that never reaps its child)"
+    fi
+
+    # --- 44. the ownership log keys a group by id and leader start; a leaderless group is not recorded ---
+    # P is a live group of the job (a detached descendant) whose id the log already names for an earlier group with
+    # another start time (an auxiliary command long gone): a snapshot that finds P records it anew, and the reaper stops
+    # it before the cleanup counts as done. X is a leaderless group a snapshot met: nothing could confirm it later, so it
+    # is not recorded. Then release-stale: a cleaned job's log is not consulted again — here it names, without a start
+    # time, a pid an unrelated process holds now.
+    local marker44="$TEST_ROOT/proc-44" leaderless44 member44 unrelated44
+    read -r leaderless44 member44 <<<"$(spawn_leaderless "$marker44")"
+    out="$(core_js '
+const fs = await import("node:fs");
+const { spawn, spawnSync } = await import("node:child_process");
+const [jobs, marker, X] = process.argv.slice(1);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30)", marker], { detached: true, stdio: "ignore" });
+descendant.unref(); // a core that never stops it must fail this check, not hang it
+const P = descendant.pid;
+await sleep(200);
+const dead = spawnSync("/usr/bin/true").pid;
+const id = "pt-0001", file = `${jobs}/${id}.json`, now = new Date().toISOString();
+fs.mkdirSync(jobs, { recursive: true });
+fs.writeFileSync(file, JSON.stringify({ id, status: "cancelled", errorClass: null, profile: "p1", harness: "plain", write: false, runnerPid: dead,
+  runnerStartedAt: "Mon Oct 19 10:00:00 2026", childPid: null, childStartedAt: null, startedAt: now, finishedAt: now, bootId: core.bootId() }));
+fs.writeFileSync(`${file}.runner`, `${JSON.stringify({ pid: dead, startedAt: "Mon Oct 19 10:00:00 2026", bootId: core.bootId(), claimedAt: now })}\n`
+  + `${JSON.stringify({ groups: [{ pgid: P, startedAt: "Mon Oct 19 10:00:01 2026" }], by: "exec", at: now })}\n`);
+const recorded = core.recordGroups(file, [P, Number(X)], "cancel");
+const added = fs.readFileSync(`${file}.runner`, "utf8").trim().split("\n").slice(2).flatMap((line) => JSON.parse(line).groups)
+  .map((group) => `${group.pgid === P ? "P" : group.pgid === Number(X) ? "X" : "?"}:${group.startedAt ? "start" : "null"}`).join(",");
+const first = core.reapDeadRunners(jobs);
+const cleanedEarly = fs.existsSync(`${file}.cleaned`);
+for (let i = 0; i < 50 && core.isAlive(P); i += 1) await sleep(100);
+core.reapDeadRunners(jobs);
+console.log([recorded, added, first[0]?.action, first[0]?.groups?.includes(P), cleanedEarly, core.isAlive(P), fs.existsSync(`${file}.cleaned`)].join(" "));
+try { process.kill(P, "SIGKILL"); } catch {}' \
+        "$TEST_ROOT/jobs-44" "$marker44" "$leaderless44")"
+    local member44_alive=no
+    if [[ -n "$member44" ]] && kill -0 "$member44" 2>/dev/null; then member44_alive=yes; fi
+    unrelated44="$(core_js '
+const fs = await import("node:fs");
+const path = await import("node:path");
+const { spawn, spawnSync } = await import("node:child_process");
+const [jobs, repo, marker] = process.argv.slice(1);
+const unrelated = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30)", marker], { detached: true, stdio: "ignore" });
+unrelated.unref();
+const dead = spawnSync("/usr/bin/true").pid;
+const id = "pt-0001", file = `${jobs}/${id}.json`, now = new Date().toISOString();
+fs.mkdirSync(jobs, { recursive: true });
+fs.writeFileSync(file, JSON.stringify({ id, status: "completed", errorClass: null, profile: "p1", harness: "plain", write: true, workspaceRoot: repo,
+  cwd: repo, runnerPid: dead, runnerStartedAt: "Mon Oct 19 10:00:00 2026", childPid: null, startedAt: now, finishedAt: now, bootId: core.bootId() }));
+fs.writeFileSync(`${file}.runner`, `${JSON.stringify({ pid: dead, startedAt: "Mon Oct 19 10:00:00 2026", bootId: core.bootId(), claimedAt: now })}\n`
+  + `${JSON.stringify({ groups: [{ pgid: unrelated.pid, startedAt: null }], by: "runner", at: now })}\n`);
+fs.writeFileSync(`${file}.cleaned`, `${now}\n`);
+fs.writeFileSync(`${path.dirname(jobs)}/active.lock.0`, JSON.stringify({ holderPid: dead, holderStartedAt: "Mon Oct 19 10:00:00 2026", jobId: id,
+  token: "tok-44", generation: 0, createdAt: now, bootId: core.bootId() }));
+console.log(unrelated.pid);' "$(jobs_dir_of "$repo14")" "$repo14" "$marker44")"
+    rc=0
+    out2="$(ad release-stale --cwd "$repo14" 2>&1)" || rc=$?
+    if [[ "$out" == "true P:start cleanup-resumed true false false true" && "$member44_alive" == yes && "$rc" -eq 0 && "$out2" == "released $repo14 generation 0" ]]; then
+        pass "44 a reused group id with a new leader start is recorded anew and stopped before the cleanup is done; a leaderless group is not recorded; release-stale does not consult a cleaned job's log"
+    else
+        fail "44 a reused group id with a new leader start is recorded anew and stopped before the cleanup is done; a leaderless group is not recorded; release-stale does not consult a cleaned job's log"
+        echo "    recorded added action P-killed cleaned-early P-alive cleaned: $out leaderless member alive: $member44_alive release-stale=$rc:$out2"
+    fi
+    for pid in $member44 $unrelated44; do kill -KILL "$pid" 2>/dev/null || true; done
+
+    # --- 45. the exec supervisor loads nothing from disk, and its deadline counts from its own start ---
+    # A plugin update may replace the core's directory during a long job: a runner's later ctx.exec (finalize's export)
+    # must still run and record its group, from a core whose file is gone. A supervisor slow to get going (here held back
+    # 800 ms) does not start the command once its 300 ms are up, so it is done well inside its caller's backstop.
+    local marker45="$TEST_ROOT/started-45"
+    out="$(core_js '
+const fs = await import("node:fs");
+const [source, dir, marker] = process.argv.slice(1);
+fs.mkdirSync(dir, { recursive: true });
+fs.copyFileSync(source, `${dir}/agent-core.mjs`);
+const copy = await import(pathToFileURL(`${dir}/agent-core.mjs`).href);
+fs.rmSync(`${dir}/agent-core.mjs`);
+const file = `${dir}/pt-0001.json`;
+fs.writeFileSync(file, "{}");
+fs.writeFileSync(`${file}.runner`, `${JSON.stringify({ pid: process.pid, startedAt: copy.ownStart() })}\n`);
+const ran = copy.boundedExec(process.execPath, ["-e", "console.log(process.ppid)"], { owner: file });
+const groups = fs.readFileSync(`${file}.runner`, "utf8").trim().split("\n").slice(1).map((line) => JSON.parse(line).groups[0]);
+const recorded = groups.length === 1 && groups[0].pgid === Number(ran.stdout.trim()) && typeof groups[0].startedAt === "string";
+process.env[copy.TEST_EXEC_DELAY_VAR] = "800";
+const late = copy.boundedExec(process.execPath, ["-e", "require(\"node:fs\").writeFileSync(process.argv[1], \"\")", marker], { timeoutMs: 300 });
+console.log([ran.status, ran.error === null, recorded, late.error?.code, late.timedOut].join(" "));' "$CORE" "$TEST_ROOT/core-copy-45" "$marker45")"
+    if [[ "$out" == "0 true true ETIMEDOUT true" && ! -e "$marker45" ]]; then
+        pass "45 the exec supervisor runs and records its group with the core's file gone (it imports nothing); past its deadline before the start, the command never starts (ETIMEDOUT)"
+    else
+        fail "45 the exec supervisor runs and records its group with the core's file gone (it imports nothing); past its deadline before the start, the command never starts (ETIMEDOUT)"
+        echo "    status no-error recorded late-code late-timedOut: $out started: $([[ -e "$marker45" ]] && echo yes || echo no)"
     fi
 
     # --- leak check: nothing this run started is still running ---

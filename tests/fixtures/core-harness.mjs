@@ -20,9 +20,9 @@ import { parseArgs } from "node:util";
 
 const SELF = fileURLToPath(import.meta.url);
 const core = await import(pathToFileURL(path.join(path.dirname(SELF), "..", "..", "bin", "lib", "agent-core.mjs")).href);
-const { default: plain, plainSigint, plainLeak, plainProbe } = await import(pathToFileURL(path.join(path.dirname(SELF), "adapters", "plain.mjs")).href);
+const { default: plain, plainSigint, plainLongLadder, plainLeak, plainProbe } = await import(pathToFileURL(path.join(path.dirname(SELF), "adapters", "plain.mjs")).href);
 
-const ADAPTERS = { [plain.id]: plain, [plainSigint.id]: plainSigint, [plainLeak.id]: plainLeak, [plainProbe.id]: plainProbe };
+const ADAPTERS = Object.fromEntries([plain, plainSigint, plainLongLadder, plainLeak, plainProbe].map((adapter) => [adapter.id, adapter]));
 
 // The profile of --profile / --profile-json, its adapter and its key resolver.
 function profileOf(values) {
