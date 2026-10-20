@@ -48,8 +48,19 @@ Steps for your agent (Claude Code on the Linux machine):
    - Debian/Ubuntu: `sudo apt install ./ZCode-<ver>-linux-<arch>.deb`
    - Fedora/RHEL/openSUSE: `sudo dnf install ./ZCode-<ver>-linux-<arch>.rpm` (or `zypper install`)
    - No sudo: download the `.AppImage`, run `chmod +x ZCode-*.AppImage && ./ZCode-*.AppImage --appimage-extract` in a directory of your choice, and set `"env": { "ZCODE_APP": "<that dir>/squashfs-root" }` in `~/.claude/settings.json` so every `zcode-dispatch` call sees it. (Extraction needs neither FUSE nor sudo. Afterwards `squashfs-root/resources/glm/zcode.cjs` must exist.)
-3. Verify: `node /opt/ZCode/resources/glm/zcode.cjs --version` prints the CLI version, and `zcode-dispatch doctor` shows `ok platform: linux (config lock: flock(1))` and `ok app: /opt/ZCode <version>`. At this point only `personal-config` and `auth` may fail, because no key is stored yet. `WARN app-version` only means the app is newer than the version the wrapper was verified on; the probe in step 4 decides.
-4. Hand the API key step to the user. Never ask for the key in the chat. Give the user one exact command line for their own terminal: the absolute path of `zcode-dispatch` and, for an AppImage install, a `ZCODE_APP=<dir>/squashfs-root` prefix (their shell does not see Claude Code's `settings.json`). The user runs it and pastes the key at the hidden prompt. Then run `zcode-dispatch doctor --probe` (one short request): `probe: ok` means the GLM channel is up.
+3. Verify. `<root>` below is `/opt/ZCode` for `.deb`/`.rpm`, or `<that dir>/squashfs-root` for the AppImage. `doctor` needs a git work tree, so run it from the repository the pipeline will work in, or pass `--cwd <repo>`:
+   - `node <root>/resources/glm/zcode.cjs --version` prints the CLI version;
+   - `zcode-dispatch doctor --cwd <repo>` shows `ok platform: linux (config lock: flock(1))` and `ok app: <root> <version>`.
+
+   At this point only `personal-config` and `auth` may fail, because no key is stored yet. `WARN app-version` means the installed version differs from the version the wrapper was verified on, which is fine if the probe in step 4 passes. If the version cannot be read, `doctor` fails `app` instead.
+4. Hand the API key step to the user. Never ask for the key in the chat. Give the user one exact command line for their own terminal, with the absolute path of `zcode-dispatch`. For an AppImage install, add a `ZCODE_APP=<root>` prefix, because their shell does not see Claude Code's `settings.json`:
+
+   ```
+   /path/to/bin/zcode-dispatch api-key set                                              # .deb / .rpm
+   ZCODE_APP=/home/<user>/apps/squashfs-root /path/to/bin/zcode-dispatch api-key set    # AppImage
+   ```
+
+   The user runs it and pastes the key at the hidden prompt. Then run `zcode-dispatch doctor --probe --cwd <repo>` (one short request): `probe: ok` means the GLM channel is up.
 
 Notes:
 - The package also puts `/usr/bin/zcode` on `PATH`. That is the desktop app's launcher, not the CLI; the wrapper never uses it.

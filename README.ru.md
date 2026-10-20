@@ -48,8 +48,19 @@ codex login
    - Debian/Ubuntu: `sudo apt install ./ZCode-<версия>-linux-<arch>.deb`
    - Fedora/RHEL/openSUSE: `sudo dnf install ./ZCode-<версия>-linux-<arch>.rpm` (или `zypper install`)
    - Без sudo: скачать `.AppImage`, в выбранном каталоге выполнить `chmod +x ZCode-*.AppImage && ./ZCode-*.AppImage --appimage-extract` и прописать в `~/.claude/settings.json` `"env": { "ZCODE_APP": "<каталог>/squashfs-root" }`, чтобы этот путь видел каждый вызов `zcode-dispatch`. (Распаковка не требует ни FUSE, ни sudo. После неё должен существовать файл `squashfs-root/resources/glm/zcode.cjs`.)
-3. Проверить: `node /opt/ZCode/resources/glm/zcode.cjs --version` печатает версию CLI, а `zcode-dispatch doctor` показывает `ok platform: linux (config lock: flock(1))` и `ok app: /opt/ZCode <версия>`. На этом этапе падать могут только `personal-config` и `auth`: ключ ещё не сохранён. `WARN app-version` значит лишь, что приложение новее версии, на которой проверялась обёртка; решает проба на шаге 4.
-4. Шаг с API-ключом передать пользователю. Никогда не просить ключ в чате. Дать пользователю одну готовую команду для его терминала: абсолютный путь к `zcode-dispatch` и, при установке из AppImage, префикс `ZCODE_APP=<каталог>/squashfs-root` (его shell не видит `settings.json` Claude Code). Пользователь запускает её и вставляет ключ в скрытое приглашение. После этого выполнить `zcode-dispatch doctor --probe` (один короткий запрос): `probe: ok` значит, что канал GLM работает.
+3. Проверить. Ниже `<корень>` — это `/opt/ZCode` для `.deb`/`.rpm` или `<каталог>/squashfs-root` для AppImage. `doctor` нужен git-репозиторий, поэтому запускать его из репозитория, в котором будет работать пайплайн, или передавать `--cwd <репо>`:
+   - `node <корень>/resources/glm/zcode.cjs --version` печатает версию CLI;
+   - `zcode-dispatch doctor --cwd <репо>` показывает `ok platform: linux (config lock: flock(1))` и `ok app: <корень> <версия>`.
+
+   На этом этапе падать могут только `personal-config` и `auth`: ключ ещё не сохранён. `WARN app-version` значит, что установленная версия отличается от той, на которой проверялась обёртка; это нормально, если проба на шаге 4 проходит. Если версию прочитать не удалось, `doctor` падает на `app`.
+4. Шаг с API-ключом передать пользователю. Никогда не просить ключ в чате. Дать пользователю одну готовую команду для его терминала с абсолютным путём к `zcode-dispatch`. При установке из AppImage добавить префикс `ZCODE_APP=<корень>`, потому что его shell не видит `settings.json` Claude Code:
+
+   ```
+   /path/to/bin/zcode-dispatch api-key set                                              # .deb / .rpm
+   ZCODE_APP=/home/<user>/apps/squashfs-root /path/to/bin/zcode-dispatch api-key set    # AppImage
+   ```
+
+   Пользователь запускает её и вставляет ключ в скрытое приглашение. После этого выполнить `zcode-dispatch doctor --probe --cwd <репо>` (один короткий запрос): `probe: ok` значит, что канал GLM работает.
 
 Примечания:
 - Пакет также кладёт в `PATH` команду `/usr/bin/zcode`. Это запуск десктопного приложения, а не CLI; обёртка её не использует.
