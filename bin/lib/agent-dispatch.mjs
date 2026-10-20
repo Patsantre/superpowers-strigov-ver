@@ -21,10 +21,13 @@
 // Adapters. The pass-through adapters (adapters/zcode.mjs, adapters/codex.mjs) are imported here; they return the
 // wrapper argv and parse the wrappers' `status --json`, and this CLI runs the wrapper with stdio inherited, so its
 // stdout, stderr and exit code pass through unchanged. A core adapter (spec §3.2) is the file
-// adapters/<harness>.mjs for harness ∈ {claude, opencode, pi, dsh}, whose default export has id === <harness>: adding
-// a harness is dropping that file in. A harness without its file is refused (`harness <h> is not available in this
-// version`). $AGENT_DISPATCH_ADAPTER_DIR names a directory searched first (tests put a stub adapter there), like
-// $AGENT_DISPATCH_ZCODE / $AGENT_DISPATCH_CODEX name the wrappers.
+// adapters/<harness>.mjs for harness ∈ {claude, opencode, pi, dsh}, whose default export has id === <harness>; all
+// four ship (increments 2–5), each loaded on demand — a runner loads only its job's. A harness without its file is
+// refused (`harness <h> is not available in this version`). $AGENT_DISPATCH_ADAPTER_DIR names a directory searched
+// first (tests put a stand-in adapter there), like $AGENT_DISPATCH_ZCODE / $AGENT_DISPATCH_CODEX name the wrappers.
+// Besides the hooks of the core contract the CLI reads two of its own: loginEnv(profile, ctx) → the variables
+// `profile env` exports for an isolated home, and doctorChecks(profile, ctx) → doctor rows; doctor's ctx also carries
+// cwd and writeFiles(spec), the core's writer of adapter files under the data root (dsh's --dump-config template).
 //
 // Pure Node ESM, no dependencies, no shell: every child process gets an argv array.
 
@@ -96,19 +99,8 @@ const OPTIONS = {
   pi: { extensions: "strings" },
   dsh: { sessionLog: "boolean", agentsHome: ["user", "empty"], patch: "object" },
 };
-// Where `profile env` points a harness with "home": "isolated" (spec §3.4 homes/<profile>/). An adapter may export
-// loginEnv(profile, ctx) instead; the adapters of increments 2–5 keep their homes in these directories.
-const HOME_ENV = {
-  claude: (dir) => ({ CLAUDE_CONFIG_DIR: path.join(dir, "claude") }),
-  opencode: (dir) => ({
-    XDG_CONFIG_HOME: path.join(dir, "config"),
-    XDG_DATA_HOME: path.join(dir, "data"),
-    XDG_STATE_HOME: path.join(dir, "state"),
-    XDG_CACHE_HOME: path.join(dir, "cache"),
-  }),
-  pi: (dir) => ({ PI_CODING_AGENT_DIR: path.join(dir, "pi") }),
-  dsh: (dir) => ({ DSH_HOME: path.join(dir, "dsh") }),
-};
+// How the user logs in to a harness (spec §4.3), for the `next:` line of profile add and doctor hints.
+const LOGIN_STEP = { claude: "claude, then /login", opencode: "opencode auth login", pi: "pi, then /login", codex: "codex login" };
 // --skip classes: the error classes of §3.8 plus the channel states of the `channels` marker.
 const SKIP_CLASSES = new Set([...core.ERROR_CLASSES, "down", "off", "kill-switch"]);
 // Classes that take every linked profile out with the failing one (spec §3.5 "Общий ключ или вход").
@@ -375,6 +367,16 @@ function requireRole(role) {
 // OpenCode Go, … side by side); the provider is the model's prefix before "/". A claude or codex login is one account
 // for every model.
 const PER_PROVIDER_LOGIN = new Set(["opencode", "pi"]);
+const loginProvider = (profile) => (typeof profile.model === "string" && profile.model.indexOf("/") > 0 ? profile.model.split("/")[0] : "-");
+
+// The scope of a login or native setup: "isolated" (the profile's own home), "provider" (an opencode or pi login in
+// the user's home: one login per provider), "harness" (one for the whole harness), or null for a key or "none".
+function loginScope(profile) {
+  if (profile.harness === "inproc" || !(profile.auth === "login" || profile.auth === "native")) return null;
+  if (profile.home === "isolated") return "isolated";
+  if (profile.auth === "login" && PER_PROVIDER_LOGIN.has(profile.harness)) return "provider";
+  return "harness";
+}
 
 // What a profile pays with: the same stored key / variable / command, the same login of the same harness (a login
 // in an isolated home is the profile's own; an opencode or pi login is one per provider), the same `native` setup of
@@ -383,19 +385,28 @@ function linkTokens(name, profile) {
   if (profile.harness === "inproc") return [];
   const tokens = [];
   const auth = profile.auth;
+  const scope = loginScope(profile);
   if (isObject(auth)) {
     const [kind, value] = Object.entries(auth)[0];
     tokens.push(`${kind}:${JSON.stringify(value)}`);
-  } else if (profile.home === "isolated" && (auth === "login" || auth === "native")) {
+  } else if (scope === "isolated") {
     tokens.push(`${auth}:${profile.harness}:${name}`);
-  } else if (auth === "login" && PER_PROVIDER_LOGIN.has(profile.harness)) {
-    const provider = typeof profile.model === "string" && profile.model.includes("/") ? profile.model.split("/")[0] : "-";
-    tokens.push(`login:${profile.harness}:provider:${provider}`);
-  } else if (auth === "login" || auth === "native") {
+  } else if (scope === "provider") {
+    tokens.push(`login:${profile.harness}:provider:${loginProvider(profile)}`);
+  } else if (scope === "harness") {
     tokens.push(`${auth}:${profile.harness}`);
   }
   if (profile.shares) tokens.push(`shares:${profile.shares}`);
   return tokens;
+}
+
+// channels' `auth`: the key source as authText prints it; a login or native setup with the scope it is linked by —
+// `login:isolated` for the profile's own home, `login:<provider>` for an opencode or pi login.
+function paysWith(profile) {
+  const scope = loginScope(profile);
+  if (scope === "isolated") return `${profile.auth}:isolated`;
+  if (scope === "provider") return `login:${loginProvider(profile)}`;
+  return authText(profile);
 }
 
 // name → the other profiles linked to it, transitively (union-find over the shared tokens).
@@ -559,7 +570,7 @@ function cmdChannels(args) {
     name,
     harness: p.harness,
     ...shownModel(p),
-    auth: authText(p),
+    auth: paysWith(p),
     shares: p.shares ?? null,
     linked: links.get(name) ?? [],
     source,
@@ -592,6 +603,24 @@ export async function loadCoreAdapter(harness, env = process.env) {
   }
   coreAdapters.set(harness, adapter);
   return adapter;
+}
+
+// The adapter a runner needs: only its job's harness, read from the record, so a broken adapter file of another
+// harness never stops this job. An adapter that fails to load is left out: runJob then fails the job (launch, "no
+// adapter for harness …") instead of leaving it running. An unreadable record gets every adapter; runJob decides.
+async function runnerAdapters(id, jobsDir) {
+  const record = core.isCoreJobId(id ?? "") && jobsDir ? core.readRecord(core.jobPaths(jobsDir, id).record) : null;
+  const harnesses = CORE_HARNESSES.includes(record?.harness) ? [record.harness] : CORE_HARNESSES;
+  const adapters = {};
+  for (const harness of harnesses) {
+    try {
+      const adapter = await loadCoreAdapter(harness);
+      if (adapter) adapters[harness] = adapter;
+    } catch (error) {
+      process.stderr.write(`${CLI_NAME}: adapter ${harness} failed to load: ${error?.message ?? error}\n`);
+    }
+  }
+  return adapters;
 }
 
 async function requireCoreAdapter(name, harness) {
@@ -996,14 +1025,27 @@ function profileAdd(rest) {
   writeConfigFile(state.file, data);
   const p = resolveProfile(raw);
   out(`profile ${name}: added to ${state.file} (preset ${values.from}, harness ${p.harness})\n`);
-  const keyName = isObject(p.auth) && "key" in p.auth ? p.auth.key : null;
-  const first = keyName ? `${CLI_NAME} key set ${keyName}` : p.auth === "login" ? `log in to ${p.harness}${p.home === "isolated" ? ` after eval "$(${CLI_NAME} profile env ${name})"` : ""}` : null;
+  const first = firstStep(name, p);
   out(`next: ${first ? `${first}, then ` : ""}${CLI_NAME} doctor --profile ${name} --probe\n`);
   return 0;
 }
 
+// The one-time action of spec §4.3 before a profile works: store its key, or log in (in its isolated home through
+// profile env), or give dsh its key file. Null when there is none (keyEnv, keyCmd, none).
+function firstStep(name, p) {
+  if (isObject(p.auth)) return "key" in p.auth ? `${CLI_NAME} key set ${p.auth.key}` : null;
+  const isolated = p.home === "isolated" ? `eval "$(${CLI_NAME} profile env ${name})"; ` : "";
+  if (p.auth === "login") return `log in: ${isolated}${LOGIN_STEP[p.harness] ?? p.harness}`;
+  if (p.auth === "native" && p.harness === "dsh") return `${isolated}put DEEPSEEK_API_KEY=… into $DSH_HOME/.env (default ~/.dsh/.env, mode 0600)`;
+  return null;
+}
+
 const shellQuote = (text) => `'${String(text).replace(/'/g, "'\\''")}'`;
 
+// spec §3.3, §4.3: the `export` lines that point the harness at a profile's isolated home, so the user logs in
+// there (`eval "$(agent-dispatch profile env P)"; opencode auth login`). The adapter names its variables (loginEnv);
+// the directories are created 0700. A claude API profile has nothing to log into: its home must hold no login
+// (spec §3.6 A1), so nothing is exported for it.
 async function profileEnv(rest) {
   const { positionals } = parse(rest, {}, 1, 1);
   const state = lenientState();
@@ -1013,15 +1055,28 @@ async function profileEnv(rest) {
     out(`# profile ${name} uses the harness's own home ("home": "user"); nothing to export\n`);
     return 0;
   }
+  if (p.harness === "claude" && p.auth !== "login") {
+    out(`# profile ${name} is a claude API profile: its isolated home must hold no claude.ai login (spec §3.6 A1); nothing to export\n`);
+    return 0;
+  }
+  const adapter = await requireCoreAdapter(name, p.harness);
+  if (typeof adapter.loginEnv !== "function") throw new UsageError(`profile ${name}: the ${p.harness} adapter names no home variables (loginEnv); nothing to export`);
+  const ctx = core.makeCtx({ profile: p, profileName: name });
+  const env = await adapter.loginEnv(p, ctx);
+  const entries = isObject(env) ? Object.entries(env) : [];
+  const bad = entries.find(([variable, value]) => !ENV_NAME_RE.test(variable) || typeof value !== "string" || value === "");
+  if (entries.length === 0 || bad) throw new Error(`the ${p.harness} adapter's loginEnv() returned ${bad ? `an invalid entry ${JSON.stringify(bad[0])}` : "no variables"}`);
+  // The home as a task prepares it (its dirs and files, e.g. opencode's git config that points git back at the
+  // user's), so the shell that evals these lines finds the same home as the jobs.
+  const home = typeof adapter.prepareHome === "function" ? ((await adapter.prepareHome(p, ctx)) ?? {}) : {};
   const paths = core.dataPaths();
   const dir = path.join(paths.homes, name);
-  const adapter = await loadCoreAdapter(p.harness);
-  const env = typeof adapter?.loginEnv === "function" ? await adapter.loginEnv(p, core.makeCtx({ profile: p, profileName: name })) : HOME_ENV[p.harness](dir);
   core.ensurePrivateDir(paths.root);
   core.ensurePrivateDir(paths.homes);
   core.ensurePrivateDir(dir);
-  for (const value of Object.values(env)) if (typeof value === "string" && value.startsWith(`${dir}${path.sep}`)) core.ensurePrivateDir(value);
-  for (const [variable, value] of Object.entries(env)) out(`export ${variable}=${shellQuote(value)}\n`);
+  core.writeAdapterFiles({ dirs: home.dirs ?? [], files: home.files ?? [] });
+  for (const [, value] of entries) if (value.startsWith(`${dir}${path.sep}`)) core.ensurePrivateDir(value);
+  for (const [variable, value] of entries) out(`export ${variable}=${shellQuote(value)}\n`);
   return 0;
 }
 
@@ -1090,7 +1145,9 @@ function onPath(command) {
 function checkKey(name, p, report) {
   const auth = p.auth;
   if (!isObject(auth)) {
-    const what = { login: `the ${p.harness} login${p.home === "isolated" ? ` in its isolated home (${CLI_NAME} profile env ${name})` : ""}`, native: `${p.harness}'s own configuration`, none: "no key (a local model)" }[auth];
+    const scope = loginScope(p);
+    const where = scope === "isolated" ? ` in its isolated home (${CLI_NAME} profile env ${name})` : scope === "provider" ? ` of provider ${loginProvider(p)}` : "";
+    const what = { login: `the ${p.harness} login${where}`, native: `${p.harness}'s own configuration${scope === "isolated" ? where : ""}`, none: "no key (a local model)" }[auth];
     report("ok", `auth ${name}`, `${auth}: ${what}`);
     return;
   }
@@ -1219,7 +1276,9 @@ async function doctorProfile(state, name, report, checks) {
   else report("ok", `profile ${name}`, `harness ${p.harness}, model ${p.model ?? "-"}, effort ${p.effort ?? "-"}, home ${p.home}, sandbox ${p.sandbox}`);
   checkKey(name, p, report);
   if (!adapter) return;
-  const ctx = core.makeCtx({ profile: p, profileName: name });
+  // cwd: the tree doctor runs in (dsh checks its .env and worktree); writeFiles: the core's writer of adapter files,
+  // only under the data root (dsh writes its patch template for --dump-config there).
+  const ctx = core.makeCtx({ profile: p, profileName: name, cwd: process.cwd(), writeFiles: (spec) => core.writeAdapterFiles(spec) });
   try {
     const found = await core.discoverHarness(adapter, ctx);
     if (found) {
@@ -1241,11 +1300,17 @@ async function doctorProfile(state, name, report, checks) {
     report("FAIL", `env ${name}`, error.message);
   }
   checkSandbox(name, p, report);
-  if (typeof adapter.doctorChecks === "function") {
-    for (const check of (await adapter.doctorChecks(p, ctx)) ?? []) {
-      const level = ["ok", "WARN", "FAIL"].includes(check?.level) ? check.level : "WARN";
-      report(level, `${check?.name ?? "check"} ${name}`, check?.hint ?? "");
-    }
+  if (typeof adapter.doctorChecks !== "function") return;
+  let rows;
+  try {
+    rows = await adapter.doctorChecks(p, ctx);
+  } catch (error) {
+    report("FAIL", `checks ${name}`, `the ${p.harness} adapter's checks failed: ${oneLine(error?.message ?? error, 300)}`);
+    return;
+  }
+  for (const check of Array.isArray(rows) ? rows : []) {
+    const level = ["ok", "WARN", "FAIL"].includes(check?.level) ? check.level : "WARN";
+    report(level, `${check?.name ?? "check"} ${name}`, check?.hint ?? "");
   }
 }
 
@@ -1355,14 +1420,8 @@ export async function main(argv) {
         return await cmdProfile(rest);
       case "preset":
         return cmdPreset(rest);
-      case core.RUN_VERB: {
-        const adapters = {};
-        for (const harness of CORE_HARNESSES) {
-          const adapter = await loadCoreAdapter(harness);
-          if (adapter) adapters[harness] = adapter;
-        }
-        return await core.runJob({ id: rest[0], jobsDir: rest[1], token: rest[2], adapters });
-      }
+      case core.RUN_VERB:
+        return await core.runJob({ id: rest[0], jobsDir: rest[1], token: rest[2], adapters: await runnerAdapters(rest[0], rest[1]) });
       default:
         throw new UsageError(`${USAGE}${verb ? ` (unknown verb: ${verb})` : ""}`);
     }

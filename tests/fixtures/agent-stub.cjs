@@ -4,7 +4,8 @@
 //
 // AGENT_STUB_DIALECT: the output dialect, the module stub-dialects/<name>.cjs (default: plain). A dialect renders the
 //   final and error output and may add modes of its own; its modes win over the generic ones below, so a dialect is
-//   added as one new file, without touching this one.
+//   added as one new file, without touching this one. Its answer(argv, io) handles non-run calls (auth checks and the
+//   like) and returns true for exit 0 or the exit code itself.
 // AGENT_STUB_MODE (generic):
 //   ok             a final answer (AGENT_STUB_RESPONSE or "DONE\nstub finished"), exit 0
 //   slow           ok after AGENT_STUB_DELAY_MS (default 2000 ms)
@@ -70,7 +71,14 @@ const appendLine = (file, text) => {
 };
 
 // Non-run invocations first: the dialect's own (auth checks and the like), then --print-env, --version and --help.
-if (typeof dialect.answer === "function" && dialect.answer(argv, { env, write })) process.exit(0);
+// answer() returns true (handled, exit 0), an integer exit code (handled; 0 included), or false / undefined (not a
+// non-run call). The stub sets the exit code and returns instead of process.exit(), so a pending stdout write to a
+// pipe is not cut off.
+const answered = typeof dialect.answer === "function" ? dialect.answer(argv, { env, write }) : false;
+if (answered === true || Number.isInteger(answered)) {
+  process.exitCode = answered === true ? 0 : answered;
+  return;
+}
 if (flag("--print-env") !== undefined) {
   write(`${env[flag("--print-env")] ?? ""}\n`);
   process.exit(0);

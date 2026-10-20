@@ -2,10 +2,11 @@
 # Tests for bin/agent-dispatch and bin/lib/agent-dispatch.mjs, the CLI of the universal dispatchers (increment 1 of
 # docs/superpowers/specs/2026-10-20-universal-dispatchers-design.md §8). Zero model calls and no real wrapper: the
 # pass-through profiles reach tests/fixtures/wrapper-stub.cjs, linked as zcode-dispatch / codex-dispatch under the temp
-# root ($AGENT_DISPATCH_ZCODE / $AGENT_DISPATCH_CODEX), which records every argv; the core path runs the stand-in
-# claude adapter tests/fixtures/dispatch-adapters/claude.mjs ($AGENT_DISPATCH_ADAPTER_DIR) over
-# tests/fixtures/agent-stub.cjs. All state lives under a temp root (AGENT_DISPATCH_STATE_DIR, HOME). Runs on macOS and
-# Linux.
+# root ($AGENT_DISPATCH_ZCODE / $AGENT_DISPATCH_CODEX), which records every argv; the core path's generic behaviour
+# (keys, redaction, limits, resume) runs the stand-in claude adapter tests/fixtures/dispatch-adapters/claude.mjs
+# ($AGENT_DISPATCH_ADAPTER_DIR) over tests/fixtures/agent-stub.cjs, and the real adapters of bin/lib/adapters/ run over
+# the same stub in its harness dialects (sections 8 and 12–14; section 14 is the end-to-end pass on all four). All
+# state lives under a temp root (AGENT_DISPATCH_STATE_DIR, HOME). Runs on macOS and Linux.
 #
 # The golden reference is the table "Сквозные вызовы" of spec §3.3: for every role of the built-in scheme and every
 # profile of its chain, the argv the wrapper receives must equal it.
@@ -148,6 +149,16 @@ main() {
     local CONFIG="$STATE/config.json"
     ln -s "$STUB" "$TEST_ROOT/bin/agent-stub.cjs"
     export AGENT_TEST_STUB="$TEST_ROOT/bin/agent-stub.cjs"
+    # The four real harnesses, for the real adapters (sections 8, 12–14): one script per harness that picks the stub's
+    # dialect itself, so the core's environment filter cannot drop it. Each profile on a real adapter names its script
+    # as "bin" (a real claude may be on PATH).
+    local h
+    for h in claude:claude-json opencode:opencode-jsonl pi:pi-jsonl dsh:dsh-ndjson; do
+        printf '#!/bin/sh\nAGENT_STUB_DIALECT=%s exec "%s" "%s" "$@"\n' "${h#*:}" "$(command -v node)" "$AGENT_TEST_STUB" >"$TEST_ROOT/bin/${h%%:*}"
+        chmod +x "$TEST_ROOT/bin/${h%%:*}"
+    done
+    unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME OPENCODE_CONFIG OPENCODE_CONFIG_DIR OPENCODE_CONFIG_CONTENT
+    unset DSH_HOME DSH_AGENTS_HOME DSH_PERMISSION_MODE DEEPSEEK_API_KEY PI_CODING_AGENT_DIR ZAI_API_KEY AGENT_STUB_AUTH
     ln -s "$WSTUB" "$TEST_ROOT/bin/zcode-dispatch"
     ln -s "$WSTUB" "$TEST_ROOT/bin/codex-dispatch"
     export AGENT_DISPATCH_ZCODE="$TEST_ROOT/bin/zcode-dispatch"
@@ -485,9 +496,9 @@ EOF
     local oc_route="$OUT"
     run_ad channels
     [[ "$ok" -eq 0 && "$oc_route" == "route control-review: oc-chatgpt harness=opencode model=openai/gpt-6-luna effort=- readOnly=rules maxParallel=2 (chain: oc-chatgpt; skipped: oc-copilot=quota)" \
-        && "$OUT" == *"oc-copilot harness=opencode model=github-copilot/gpt-6-mini effort=- auth=login linked=- source=config"* \
-        && "$OUT" == *"oc-chatgpt harness=opencode model=openai/gpt-6-luna effort=- auth=login linked=oc-chatgpt2 source=config"* ]]
-    verdict "5 opencode logins of different providers are not linked (oc-copilot:quota leaves oc-chatgpt); the same provider is" $? "route rc=$ok: $oc_route" "$OUT"
+        && "$OUT" == *"oc-copilot harness=opencode model=github-copilot/gpt-6-mini effort=- auth=login:github-copilot linked=- source=config"* \
+        && "$OUT" == *"oc-chatgpt harness=opencode model=openai/gpt-6-luna effort=- auth=login:openai linked=oc-chatgpt2 source=config"* ]]
+    verdict "5 opencode logins of different providers are not linked (oc-copilot:quota leaves oc-chatgpt); the same provider is; channels names the provider (auth=login:<provider>)" $? "route rc=$ok: $oc_route" "$OUT"
 
     # A config that spells out the built-in scheme (and adds an unused profile) changes nothing.
     node -e '
@@ -630,20 +641,20 @@ require("node:fs").writeFileSync(process.argv[2], JSON.stringify(cfg, null, 2));
     verdict "7 key rm removes a key; removing it again is refused" $? "rc=$ok/$RC"
 
     # --- 8. core tasks through the stand-in claude adapter: keys, redaction, refusals ---
-    write_config <<'EOF'
+    write_config <<EOF
 {
   "version": 1,
   "profiles": {
     "ct-api": { "harness": "claude", "auth": { "key": "tkey" }, "endpoint": "http://127.0.0.1:9", "model": "stub-model" },
     "ct-env": { "harness": "claude", "auth": { "keyEnv": "TEST_KEY_VAR" }, "endpoint": "http://127.0.0.1:9" },
-    "ct-cmd": { "harness": "claude", "auth": { "keyCmd": ["node", "-e", "process.stdout.write(['cmd', 'key', 'value', '777'].join('-') + '\\n')"] }, "endpoint": "http://127.0.0.1:9" },
+    "ct-cmd": { "harness": "claude", "auth": { "keyCmd": ["node", "-e", "process.stdout.write(['cmd', 'key', 'value', '777'].join('-') + '\\\\n')"] }, "endpoint": "http://127.0.0.1:9" },
     "ct-literal": { "harness": "claude", "auth": { "keyCmd": ["node", "-e", "process.stdout.write('lit-key-value-555')"] }, "endpoint": "http://127.0.0.1:9" },
     "ct-cmdfail": { "harness": "claude", "auth": { "keyCmd": ["node", "-e", "process.exit(3)"] }, "endpoint": "http://127.0.0.1:9" },
     "ct-sub": { "harness": "claude", "auth": "login", "maxParallel": 1 },
     "ct-w": { "harness": "claude", "auth": "login", "maxParallel": 4 },
     "ct-conflict": { "harness": "claude", "auth": "login", "env": { "PLAIN_SAFE": "0" } },
-    "oc-x": { "harness": "opencode", "auth": "login", "model": "a/b" },
-    "dsh-x": { "harness": "dsh", "auth": { "key": "dkey" }, "model": "deepseek-v4-pro" }
+    "oc-x": { "harness": "opencode", "auth": "login", "model": "a/b", "bin": "$TEST_ROOT/bin/opencode" },
+    "dsh-x": { "harness": "dsh", "auth": { "key": "dkey" }, "model": "deepseek-v4-pro", "bin": "$TEST_ROOT/bin/dsh" }
   }
 }
 EOF
@@ -698,12 +709,19 @@ EOF
     [[ "$RC" -eq 2 && "$ERR" == "agent-dispatch: ct-cmdfail: key unavailable (keyCmd node exited 3) errorClass=auth" ]]
     verdict "8 a failing keyCmd: exit 2 key unavailable errorClass=auth, no launch" $? "rc=$RC err: $ERR"
 
-    run_ad task --profile oc-x --background --prompt-file "$prompt"
-    ok=$RC
-    local oc_err="$ERR"
+    # The real adapters ship: an opencode profile runs (its id has the oc- prefix), a dsh profile takes the key check.
+    n="$(count_records "$JOBS")"
     run_ad task --profile dsh-x --background --prompt-file "$prompt"
-    [[ "$ok" -eq 2 && "$oc_err" == *"harness opencode is not available in this version"* && "$RC" -eq 2 && "$ERR" == *"harness dsh is not available in this version"* ]]
-    verdict "8 opencode and dsh profiles: 'harness <h> is not available in this version' (exit 2)" $? "oc: $oc_err" "dsh: $ERR"
+    ok=$RC
+    local dsh_err="$ERR"
+    [[ "$ok" -eq 2 && "$dsh_err" == "agent-dispatch: dsh-x: key unavailable (no key dkey is stored; the user stores it: agent-dispatch key set dkey) errorClass=auth" \
+        && "$(count_records "$JOBS")" -eq "$n" ]]
+    verdict "8 a dsh profile on the real adapter: a missing stored key is exit 2 'key unavailable … errorClass=auth', no job" $? "rc=$ok err: $dsh_err"
+    run_ad task --profile oc-x --background --prompt-file "$prompt"
+    id="${OUT##* }"
+    st="$(wait_status "$id" 'completed|failed|cancelled' 20)"
+    [[ "$RC" -eq 0 && "$id" == oc-* && "$st" == completed && "$(ad status "$id" --json | jfield job.harness)" == opencode ]]
+    verdict "8 an opencode profile on the real adapter: the task starts as oc-…, runs the opencode stub and completes" $? "rc=$RC out: $OUT err: $ERR status: $st"
     run_ad task --profile opus-high --role frontend.new-ui --background --prompt-file "$prompt"
     [[ "$RC" -eq 2 && "$ERR" == *"runs in-session (harness inproc)"*"Agent tool"*"model=opus effort=high"* ]]
     verdict "8 an inproc profile: task refused (exit 2), pointing at the Agent tool with model and effort" $? "err: $ERR"
@@ -962,12 +980,24 @@ console.log(["maxParallel" in p, "timeoutMin" in p, "options" in p, p.env.ANTHRO
     run_ad profile add x2 --from claude-sub --set efort=high
     [[ "$ok" -eq 2 && "$rc_np" -eq 2 && "$RC" -eq 2 && "$ERR" == *'unknown field "efort"'* ]]
     verdict "12 profile add refuses a built-in name, an unknown preset and an unknown field" $? "rc=$ok/$rc_np/$RC err: $ERR"
-    run_ad profile env glm-api
-    [[ "$RC" -eq 0 && "$OUT" == "export CLAUDE_CONFIG_DIR='$STATE/homes/glm-api/claude'" && "$(mode_of "$STATE/homes/glm-api/claude")" == 700 ]]
-    verdict "12 profile env prints the export lines of the profile's isolated home (created 0700)" $? "rc=$RC out: $OUT"
-    run_ad profile env oc1
-    [[ "$RC" -eq 0 && "$(grep -c '^export XDG_' <<<"$OUT")" -eq 4 ]]
-    verdict "12 profile env of an opencode key profile exports XDG_CONFIG/DATA/STATE/CACHE_HOME" $? "$OUT"
+    # profile env asks the real adapter (loginEnv): AGENT_DISPATCH_ADAPTER_DIR is dropped for these calls.
+    real_ad() { OUT="$(env -u AGENT_DISPATCH_ADAPTER_DIR node "$CLI" "$@" 2>"$TEST_ROOT/stderr.txt")"; RC=$?; ERR="$(cat "$TEST_ROOT/stderr.txt")"; }
+    real_ad profile env glm-api
+    [[ "$RC" -eq 0 && "$OUT" == "# profile glm-api is a claude API profile: its isolated home must hold no claude.ai login (spec §3.6 A1); nothing to export" \
+        && ! -e "$STATE/homes/glm-api" ]]
+    verdict "12 profile env of a claude API profile exports nothing (its home must hold no claude.ai login; spec §3.6 A1)" $? "rc=$RC out: $OUT err: $ERR"
+    run_ad profile add cl-iso --from claude-sub --set home=isolated
+    ok=$RC
+    real_ad profile env cl-iso
+    [[ "$ok" -eq 0 && "$RC" -eq 0 && "$OUT" == "export CLAUDE_CONFIG_DIR='$STATE/homes/cl-iso/claude'" && "$(mode_of "$STATE/homes/cl-iso/claude")" == 700 \
+        && "$(mode_of "$STATE/homes/cl-iso")" == 700 ]]
+    verdict "12 profile env of an isolated claude login profile prints the export line of its home (created 0700)" $? "add rc=$ok" "rc=$RC out: $OUT err: $ERR"
+    run_ad profile env cl-iso
+    [[ "$RC" -eq 2 && "$ERR" == *"cl-iso"* ]]
+    verdict "12 profile env through an adapter without loginEnv (the stand-in claude) is refused (exit 2)" $? "rc=$RC out: $OUT err: $ERR"
+    real_ad profile env oc1
+    [[ "$RC" -eq 0 && "$(grep -c '^export XDG_' <<<"$OUT")" -eq 4 && "$OUT" == *"export XDG_CONFIG_HOME='$STATE/homes/oc1/"* ]]
+    verdict "12 profile env of an opencode key profile exports XDG_CONFIG/DATA/STATE/CACHE_HOME of its home" $? "rc=$RC out: $OUT err: $ERR"
     run_ad profile env glm
     ok=$RC
     run_ad profile list
@@ -985,7 +1015,7 @@ console.log(Object.keys(j).join(",") + "|" + Object.keys(g).join(",") + " " + [g
     verdict "12 profiles added without roles leave the routes at 'routes: default'" $? "out: $OUT"
 
     # --- 13. doctor (no model call) and doctor --probe (stub) ---
-    write_config <<'EOF'
+    write_config <<EOF
 {
   "version": 1,
   "profiles": {
@@ -994,16 +1024,16 @@ console.log(Object.keys(j).join(",") + "|" + Object.keys(g).join(",") + " " + [g
     "ct-cmd": { "harness": "claude", "auth": { "keyCmd": ["node", "-e", "process.stdout.write(['cmd', 'key', 'value', '777'].join('-'))"] }, "endpoint": "http://127.0.0.1:9" },
     "ct-sub": { "harness": "claude", "auth": "login" },
     "ct-conflict": { "harness": "claude", "auth": "login", "env": { "PLAIN_SAFE": "0" } },
-    "dsh-x": { "harness": "dsh", "auth": { "key": "dkey" }, "model": "deepseek-v4-pro" }
+    "dsh-x": { "harness": "dsh", "auth": { "key": "dkey" }, "model": "deepseek-v4-pro", "bin": "$TEST_ROOT/bin/dsh" }
   }
 }
 EOF
     reset_wrappers
     run_ad doctor
-    [[ "$RC" -eq 1 && "$OUT" == *"FAIL profile dsh-x: harness dsh is not available in this version"* && "$OUT" == *"FAIL key ct-nokey: no key absent is stored"* \
+    [[ "$RC" -eq 1 && "$OUT" == *"FAIL key dsh-x: no key dkey is stored"* && "$OUT" == *"ok harness dsh-x: $TEST_ROOT/bin/dsh 0.2.1-rc.2"* && "$OUT" == *"FAIL key ct-nokey: no key absent is stored"* \
         && "$OUT" == *"FAIL env ct-conflict: profile env PLAIN_SAFE conflicts with a mandatory setting"* && "$OUT" == *"ok key ct-cmd: keyCmd node exited 0 with a value"* \
         && "$OUT" != *cmd-key-value-777* && "$OUT" == *"ok profile glm: pass-through to $AGENT_DISPATCH_ZCODE"* && "$(tail -1 <<<"$OUT")" == "doctor: FAIL" ]]
-    verdict "13 doctor: harness availability, keys (value never printed), env conflicts, pass-through wrappers; 'doctor: FAIL' exits 1" $? "rc=$RC" "$OUT"
+    verdict "13 doctor: harnesses (dsh on its real adapter), keys (value never printed), env conflicts, pass-through wrappers; 'doctor: FAIL' exits 1" $? "rc=$RC" "$OUT"
     [[ "$OUT" == *"ok profile luna: pass-through to $AGENT_DISPATCH_CODEX (--model gpt-6-luna --effort max; the model is not checked)"* \
         && "$OUT" == *"ok harness luna: codex codex-cli 0.0.0-stub"* && "$OUT" == *"ok auth sol: codex login (chatgpt)"* && "$OUT" != *"stub-user@example.com"* \
         && "$(last_call codex-dispatch setup)" == '["setup","--json"]' && "$(calls_of codex-dispatch setup)" -eq 1 ]]
@@ -1065,6 +1095,115 @@ EOF
     run_ad no-such-verb
     [[ "$RC" -eq 2 && "$ERR" == *"usage: agent-dispatch"* ]]
     verdict "13 an unknown verb is a usage error (exit 2)" $? "rc=$RC err: $ERR"
+
+    # --- 14. end to end on the four real adapters, the orchestrator's steps (spec §5.3) ---
+    # config.json profile → route ROLE → task --profile <routed> --role ROLE → status --json polled until the job ends
+    # (what Monitor does) → result; then doctor --profile and doctor --profile --probe. Each harness is its stub script.
+    unset AGENT_DISPATCH_ADAPTER_DIR
+    export AGENT_ENV_PASSTHROUGH="$AGENT_ENV_PASSTHROUGH,AGENT_STUB_AUTH" AGENT_STUB_AUTH=ready
+    mkdir -p "$HOME/.claude" "$HOME/.local/share/opencode"
+    printf '{}\n' >"$HOME/.claude/stub-login.json"
+    printf '{"github-copilot":{"type":"oauth"}}\n' >"$HOME/.local/share/opencode/stub-auth.json"
+    local zkey="e2e-zai-$RANDOM-value" dkey="e2e-ds-$RANDOM-value"
+    printf '%s\n' "$zkey" | ad key set e2e-zai >/dev/null 2>&1
+    printf '%s\n' "$dkey" | ad key set e2e-ds >/dev/null 2>&1
+    write_config <<EOF
+{
+  "version": 1,
+  "profiles": {
+    "e-csub": { "harness": "claude", "auth": "login", "model": "opus", "effort": "xhigh", "bin": "$TEST_ROOT/bin/claude" },
+    "e-capi": { "harness": "claude", "auth": { "key": "e2e-zai" }, "endpoint": "https://api.z.ai/api/anthropic", "model": "glm-5.3", "bin": "$TEST_ROOT/bin/claude" },
+    "e-oc": { "harness": "opencode", "auth": "login", "model": "github-copilot/gpt-6-mini", "bin": "$TEST_ROOT/bin/opencode" },
+    "e-ockey": { "harness": "opencode", "auth": { "key": "e2e-ds" }, "keyVar": "DEEPSEEK_API_KEY", "model": "deepseek/deepseek-v4-pro", "bin": "$TEST_ROOT/bin/opencode" },
+    "e-pi": { "harness": "pi", "auth": { "key": "e2e-zai" }, "keyVar": "ZAI_API_KEY", "model": "zai/glm-5.3", "effort": "high", "bin": "$TEST_ROOT/bin/pi" },
+    "e-dsh": { "harness": "dsh", "auth": { "key": "e2e-ds" }, "model": "deepseek-v4-pro", "effort": "high", "bin": "$TEST_ROOT/bin/dsh" }
+  },
+  "roles": {
+    "implementer": ["e-csub", "glm"], "spec-reviewer": ["e-capi"], "control-review": ["e-oc"], "adhoc-review": ["e-ockey"],
+    "plan-reviewer": ["e-pi"], "implementer.risk": ["e-dsh", "glm"]
+  }
+}
+EOF
+    reset_wrappers
+    local spec e_role e_prof e_harness e_prefix e_write e_route e_st e_json e_res e_ids=""
+    for spec in implementer:e-csub:claude:ct:--write spec-reviewer:e-capi:claude:ct: control-review:e-oc:opencode:oc: \
+        adhoc-review:e-ockey:opencode:oc: plan-reviewer:e-pi:pi:pi: implementer.risk:e-dsh:dsh:dt:--write; do
+        IFS=: read -r e_role e_prof e_harness e_prefix e_write <<<"$spec"
+        run_ad route "$e_role"
+        e_route="$OUT"
+        export AGENT_STUB_RESPONSE="DONE"$'\n'"e2e $e_prof"
+        # shellcheck disable=SC2086
+        run_ad task --profile "$e_prof" --role "$e_role" --background $e_write --prompt-file "$prompt"
+        unset AGENT_STUB_RESPONSE
+        id="${OUT##* }"
+        e_st="$(wait_status "$id" 'completed|failed|cancelled' 30)"
+        e_json="$(ad status "$id" --json 2>/dev/null)"
+        e_res="$(ad result "$id" 2>&1)"
+        [[ "$e_route" == "route $e_role: $e_prof harness=$e_harness "* && "$RC" -eq 0 && "$OUT" == "agent-dispatch: $e_prof task started in the background as $e_prefix-"* \
+            && "$e_st" == completed && "$(jfield job.profile <<<"$e_json")" == "$e_prof" && "$(jfield job.harness <<<"$e_json")" == "$e_harness" \
+            && "$(jfield job.role <<<"$e_json")" == "$e_role" && "$e_res" == "DONE"$'\n'"e2e $e_prof" ]]
+        verdict "14 $e_harness ($e_prof): route $e_role → task → status polled to completed → result" $? "route: $e_route" "task rc=$RC out: $OUT err: $ERR" \
+            "status: $e_st $(head -c 400 <<<"$e_json")" "result: $(head -c 400 <<<"$e_res")"
+        e_ids="$e_ids $id:$e_prof:${e_write:+yes}"
+    done
+    run_ad status
+    ok=0
+    for spec in $e_ids; do
+        IFS=: read -r id e_prof e_write <<<"$spec"
+        grep -qxF "$id $e_prof completed write=${e_write:-no} cwd=$repo" <<<"$OUT" || { ok=1; echo "    missing: $id $e_prof completed write=${e_write:-no}"; }
+    done
+    [[ "$RC" -eq 0 && "$ok" -eq 0 && "$(wc -w <<<"$e_ids" | tr -d ' ')" -eq 6 ]]
+    verdict "14 status lists every end-to-end job (6) with its profile, write flag and tree" $? "rc=$RC jobs:$e_ids" "$OUT" "err: $ERR"
+    ! grep -rqF -e "$zkey" -e "$dkey" "$STATE" --exclude-dir=keys
+    verdict "14 neither stored key shows in any file under the data root (homes, jobs, logs)" $? "hits: $(grep -rlF -e "$zkey" -e "$dkey" "$STATE" --exclude-dir=keys | tr '\n' ' ')"
+    run_ad channels
+    [[ "$RC" -eq 0 && "$OUT" == *"e-capi harness=claude model=glm-5.3 effort=- auth=key:e2e-zai linked=e-pi source=config"* \
+        && "$OUT" == *"e-oc harness=opencode model=github-copilot/gpt-6-mini effort=- auth=login:github-copilot linked=- source=config"* \
+        && "$OUT" == *"e-dsh harness=dsh model=deepseek-v4-pro effort=high auth=key:e2e-ds linked=e-ockey source=config"* ]]
+    verdict "14 channels links profiles across harnesses by their key (e-capi with e-pi, e-dsh with e-ockey)" $? "$OUT"
+    for e_prof in e-csub e-capi e-oc e-ockey e-pi e-dsh; do
+        run_ad doctor --profile "$e_prof"
+        [[ "$RC" -eq 0 && "$OUT" == *"ok harness $e_prof: $TEST_ROOT/bin/"* && "$OUT" == *"ok env $e_prof: no conflict"* && "$OUT" != *"FAIL"* \
+            && "$OUT" != *"WARN version $e_prof"* && "$(tail -1 <<<"$OUT")" == "doctor: ok" ]]
+        verdict "14 doctor --profile $e_prof: harness at its verified version, no env conflict, the adapter's checks, doctor: ok" $? "rc=$RC" "$OUT" "err: $ERR"
+        OUT="$(AGENT_STUB_RESPONSE=PONG ad doctor --profile "$e_prof" --probe 2>&1)"
+        RC=$?
+        [[ "$RC" -eq 0 && "$(tail -1 <<<"$OUT")" == "ok probe $e_prof: PONG in "* ]]
+        verdict "14 doctor --profile $e_prof --probe: one PONG turn through the real adapter (stub)" $? "rc=$RC" "$(tail -3 <<<"$OUT")"
+    done
+    real_ad profile env e-ockey
+    [[ "$RC" -eq 0 && "$OUT" == *"export XDG_DATA_HOME='$STATE/homes/e-ockey/"* ]]
+    verdict "14 profile env of an isolated opencode profile points at the home its tasks used" $? "rc=$RC out: $OUT err: $ERR"
+    unset AGENT_STUB_AUTH
+
+    # Every preset of spec §4.2, its placeholders filled, is a valid profile whose real adapter plans a run, and whose
+    # env does not conflict with that adapter's mandatory settings (claude-openrouter's ANTHROPIC_API_KEY="" included).
+    OUT="$(CLI="$CLI" CORE="$REPO_ROOT/bin/lib/agent-core.mjs" node --input-type=module -e '
+const { pathToFileURL } = await import("node:url");
+const cli = await import(pathToFileURL(process.env.CLI).href);
+const core = await import(pathToFileURL(process.env.CORE).href);
+const fill = { "<WorkspaceId>": "ws1", "<region>": "cn-beijing", "<model>": "m-x", "<port>": "9931", "<name>": "deepseek",
+  "<VAR>": "DEEPSEEK_API_KEY", "<provider/model>": "deepseek/deepseek-v4-pro", "<provider/id>": "deepseek/deepseek-v4-pro" };
+const bad = [];
+let n = 0;
+for (const [name, preset] of Object.entries(cli.DEFAULTS.presets)) {
+  try {
+    const raw = JSON.parse(JSON.stringify(preset).replace(/<[^<>\s]+>/g, (m) => { if (!(m in fill)) throw new Error(`no fill for ${m}`); return fill[m]; }));
+    cli.checkProfile(`p-${name}`, raw);
+    const p = cli.resolveProfile(raw);
+    const adapter = await cli.loadCoreAdapter(p.harness);
+    if (!adapter) throw new Error(`no adapter for ${p.harness}`);
+    const owned = await core.mandatorySettings(adapter, p, core.makeCtx({ profile: p, profileName: `p-${name}` }));
+    const conflicts = core.envConflicts(p.env, owned);
+    if (conflicts.length > 0) throw new Error(`env conflicts: ${conflicts.join(", ")}`);
+    n += 1;
+  } catch (error) {
+    bad.push(`${name}: ${error.message}`);
+  }
+}
+console.log(bad.length ? bad.join("\n") : `ok ${n}`);' 2>&1)"
+    [[ "$OUT" == "ok 12" ]]
+    verdict "14 every §4.2 preset (12), filled, passes checkProfile and plans on its real adapter with no env conflict" $? "$OUT"
 
     # --- leak check: nothing this run started is still running ---
     local left="" i=0
