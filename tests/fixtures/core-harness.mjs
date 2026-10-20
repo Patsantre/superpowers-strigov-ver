@@ -4,6 +4,8 @@
 // store — the profile comes as JSON on the command line, and `auth: {"keyEnv": VAR}` is the only key source. Its
 // value goes to the core unchecked (the core trims it and refuses an empty one); any other `auth` object resolves to
 // nothing. CORE_HARNESS_KEY_LOG names a file that gets one line per key resolution, so tests see when it ran.
+// CORE_HARNESS_RUN_BARRIER names a file `__run` waits for (up to 30 s) before it enters runJob, so a test can act
+// (cancel) while a runner exists but has not started.
 //
 // Usage: core-harness.mjs task --profile NAME [--profile-json JSON] [--role R] --background [--write] [--cwd W]
 //                                [--resume-task ID | --fresh] --prompt-file F
@@ -18,9 +20,9 @@ import { parseArgs } from "node:util";
 
 const SELF = fileURLToPath(import.meta.url);
 const core = await import(pathToFileURL(path.join(path.dirname(SELF), "..", "..", "bin", "lib", "agent-core.mjs")).href);
-const { default: plain, plainSigint, plainLeak } = await import(pathToFileURL(path.join(path.dirname(SELF), "adapters", "plain.mjs")).href);
+const { default: plain, plainSigint, plainLeak, plainProbe } = await import(pathToFileURL(path.join(path.dirname(SELF), "adapters", "plain.mjs")).href);
 
-const ADAPTERS = { [plain.id]: plain, [plainSigint.id]: plainSigint, [plainLeak.id]: plainLeak };
+const ADAPTERS = { [plain.id]: plain, [plainSigint.id]: plainSigint, [plainLeak.id]: plainLeak, [plainProbe.id]: plainProbe };
 
 // The profile of --profile / --profile-json, its adapter and its key resolver.
 function profileOf(values) {
@@ -141,8 +143,13 @@ async function main(argv) {
         return await cmdProbe(rest);
       case "env-conflicts":
         return await cmdEnvConflicts(rest);
-      case core.RUN_VERB:
+      case core.RUN_VERB: {
+        const barrier = process.env.CORE_HARNESS_RUN_BARRIER;
+        for (const deadline = Date.now() + 30_000; barrier && !fs.existsSync(barrier) && Date.now() < deadline;) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
         return await core.runJob({ id: rest[0], jobsDir: rest[1], token: rest[2], adapters: ADAPTERS });
+      }
       default:
         throw new core.UsageError(`usage: core-harness <task|status|result|cancel|release-stale|count-running|probe|env-conflicts> [args...]${verb ? ` (unknown verb: ${verb})` : ""}`);
     }

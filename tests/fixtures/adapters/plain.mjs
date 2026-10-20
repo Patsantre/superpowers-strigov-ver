@@ -52,9 +52,10 @@ const plain = {
     requiredFlags: ["--plain-json", "--session-id"],
     homeEnv: ["CLAUDE_CONFIG_DIR"],
   },
+  // profile.discoverTimeoutMs (tests): the deadline of the --version call, else ctx.exec's default.
   discover(ctx) {
     const bin = ctx.profile.bin ?? defaultBin(ctx);
-    const r = ctx.exec(bin, ["--version"]);
+    const r = ctx.exec(bin, ["--version"], ctx.profile.discoverTimeoutMs ? { timeoutMs: ctx.profile.discoverTimeoutMs } : {});
     if (r.error || r.status !== 0) throw Object.assign(new Error(`cannot run ${bin} --version`), { errorClass: "launch" });
     return { bin, version: /\d+\.\d+\.\d+\S*/.exec(r.stdout)?.[0] ?? null };
   },
@@ -129,6 +130,17 @@ export const plainLeak = {
     if (req.profile.leak === "argv") inv.argv = [...inv.argv, "--token", leakedKey(ctx)];
     if (req.profile.leak === "file") inv.files = [...inv.files, { path: path.join(req.job.dir, "leak.cfg"), content: `key=${leakedKey(ctx)}\n` }];
     return inv;
+  },
+};
+
+// The plain adapter with a probe() hook of its own that reads req.harness (as an adapter whose probe turn needs the
+// discovered binary may): runProbe must call it only once the harness is known. Its argv says it was used.
+export const plainProbe = {
+  ...plain,
+  id: "plain-probe",
+  probe(req, ctx) {
+    const inv = plain.invocation(req, ctx);
+    return { ...inv, argv: [req.harness.bin, ...inv.argv.slice(1), "--model", `probe-of-${req.harness.version}`] };
   },
 };
 

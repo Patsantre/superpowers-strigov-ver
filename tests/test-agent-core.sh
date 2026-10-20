@@ -167,6 +167,56 @@ count_records() {
 # mode_of <path> — octal permission bits.
 mode_of() { node -e 'console.log((require("node:fs").statSync(process.argv[1]).mode & 0o777).toString(8))' "$1"; }
 
+# with_deadline <seconds> <command...> — run the command, but kill it (exit 124) if it still runs after that many
+# seconds: a regression that hangs fails its check instead of blocking the suite (macOS has no `timeout`).
+with_deadline() {
+    local limit="$1" pid i=0 rc=0
+    shift
+    "$@" &
+    pid=$!
+    while ((i < limit * 10)); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" || rc=$?
+            return "$rc"
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    return 124
+}
+
+# fixture_record <jobs-dir> <id> <json> — a `running` job record of the current boot without a runner, its fields
+# overridden by the JSON object.
+fixture_record() {
+    core_js '
+const fs = await import("node:fs");
+const [dir, id, extra] = process.argv.slice(1);
+fs.mkdirSync(dir, { recursive: true });
+const record = { id, status: "running", errorClass: null, profile: "p1", harness: "plain", write: false, sessionId: "s-fixture",
+  resumeOf: null, workspaceRoot: null, cwd: null, promptPath: null, promptBytes: 10, runnerPid: null, runnerStartedAt: null,
+  childPid: null, childStartedAt: null, startedAt: new Date().toISOString(), bootId: core.bootId(), finishedAt: null,
+  timeoutMin: 1, cancelLadder: [["SIGTERM", 200], ["SIGKILL", 0]], hasSecret: false, profileConfig: { harness: "plain" },
+  note: null, ...JSON.parse(extra) };
+fs.writeFileSync(`${dir}/${id}.json`, JSON.stringify(record));' "$@"
+}
+
+# spawn_family <file> — an unrelated process leading its own group, with a child in a group of its own (what may
+# hold a dead runner's pid after reuse); writes "<parent> <child>" to the file once both run. Both carry the file's
+# path (under the run's temp root) in their argv and keep the default signal dispositions.
+spawn_family() {
+    node -e '
+const { spawn } = require("node:child_process");
+const script = `
+  const { spawn } = require("node:child_process");
+  const c = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30)", "family-child", process.argv[1]], { detached: true, stdio: "ignore" });
+  require("node:fs").writeFileSync(process.argv[1], process.pid + " " + c.pid);
+  setInterval(() => {}, 1 << 30);`;
+spawn(process.execPath, ["-e", script, process.argv[1]], { detached: true, stdio: "ignore" }).unref();' "$1"
+    wait_file "$1"
+}
+
 main() {
     echo "=== Test: agent-core ==="
 
@@ -181,24 +231,30 @@ main() {
     # The harness binary of this run: a link to the stub under the temp root (the plain adapter's default bin).
     ln -s "$STUB" "$TEST_ROOT/bin/agent-stub.cjs"
     export AGENT_TEST_STUB="$TEST_ROOT/bin/agent-stub.cjs"
-    unset AGENT_TEST_BOOT_ID CLAUDE_CONFIG_DIR CORE_HARNESS_KEY_LOG TEST_SECRET
+    unset AGENT_TEST_BOOT_ID AGENT_TEST_PS_START AGENT_TEST_RUN_BARRIER CORE_HARNESS_RUN_BARRIER CLAUDE_CONFIG_DIR CORE_HARNESS_KEY_LOG TEST_SECRET
     unset AGENT_STUB_MODE AGENT_STUB_RECORD AGENT_STUB_DELAY_MS AGENT_STUB_MESSAGE AGENT_STUB_CLASS AGENT_STUB_EXIT
     unset AGENT_STUB_PIDS AGENT_STUB_SIGNALS AGENT_STUB_VERSION AGENT_STUB_HELP_DROP AGENT_STUB_RESPONSE AGENT_STUB_SECRET_VAR
-    unset AGENT_STUB_CALL_LOG AGENT_STUB_HELP_EXIT WRAPPED
-    export AGENT_ENV_PASSTHROUGH="AGENT_STUB_MODE,AGENT_STUB_RECORD,AGENT_STUB_DELAY_MS,AGENT_STUB_MESSAGE,AGENT_STUB_CLASS,AGENT_STUB_EXIT,AGENT_STUB_PIDS,AGENT_STUB_SIGNALS,AGENT_STUB_VERSION,AGENT_STUB_HELP_DROP,AGENT_STUB_RESPONSE,AGENT_STUB_SECRET_VAR,AGENT_STUB_CALL_LOG,AGENT_STUB_HELP_EXIT"
+    unset AGENT_STUB_CALL_LOG AGENT_STUB_HELP_EXIT AGENT_STUB_LAUNCH_LOG AGENT_STUB_VERSION_HANG WRAPPED
+    export AGENT_ENV_PASSTHROUGH="AGENT_STUB_MODE,AGENT_STUB_RECORD,AGENT_STUB_DELAY_MS,AGENT_STUB_MESSAGE,AGENT_STUB_CLASS,AGENT_STUB_EXIT,AGENT_STUB_PIDS,AGENT_STUB_SIGNALS,AGENT_STUB_VERSION,AGENT_STUB_HELP_DROP,AGENT_STUB_RESPONSE,AGENT_STUB_SECRET_VAR,AGENT_STUB_CALL_LOG,AGENT_STUB_HELP_EXIT,AGENT_STUB_LAUNCH_LOG,AGENT_STUB_VERSION_HANG"
 
     local git_id=(-c user.email=t@example.com -c user.name=t -c commit.gpgsign=false)
     local r
-    for r in repo repo2 repo3 repo4; do
+    for r in repo repo2 repo3 repo4 repo5 repo6 repo7 repo8 repo9 repo10; do
         git init -q -b main "$TEST_ROOT/$r"
         printf 'x\n' >"$TEST_ROOT/$r/a.txt"
         (cd "$TEST_ROOT/$r" && git add a.txt && git "${git_id[@]}" commit -qm c0)
     done
-    local repo repo2 repo3 repo4
+    local repo repo2 repo3 repo4 repo5 repo6 repo7 repo8 repo9 repo10
     repo="$(cd "$TEST_ROOT/repo" && git rev-parse --show-toplevel)"
     repo2="$(cd "$TEST_ROOT/repo2" && git rev-parse --show-toplevel)"
     repo3="$(cd "$TEST_ROOT/repo3" && git rev-parse --show-toplevel)"
     repo4="$(cd "$TEST_ROOT/repo4" && git rev-parse --show-toplevel)"
+    repo5="$(cd "$TEST_ROOT/repo5" && git rev-parse --show-toplevel)"
+    repo6="$(cd "$TEST_ROOT/repo6" && git rev-parse --show-toplevel)"
+    repo7="$(cd "$TEST_ROOT/repo7" && git rev-parse --show-toplevel)"
+    repo8="$(cd "$TEST_ROOT/repo8" && git rev-parse --show-toplevel)"
+    repo9="$(cd "$TEST_ROOT/repo9" && git rev-parse --show-toplevel)"
+    repo10="$(cd "$TEST_ROOT/repo10" && git rev-parse --show-toplevel)"
     mkdir -p "$TEST_ROOT/notgit"
     local prompt="$TEST_ROOT/prompt.md"
     printf '## Headless run\n\nImplement the thing. Ünïcødé ok.\n' >"$prompt"
@@ -604,6 +660,16 @@ process.exit(r.env.PLAIN_API_KEY === process.env.S && !("TEST_SECRET" in r.env) 
         file "the adapter put the key into a file it asked for"
     leak_case "7 an adapter error that carries the key (discover): failed/launch, the key redacted in the note and the log" \
         discover "cannot start with key <redacted>"
+    # The same leak through the probe (doctor --probe): its discover() runs in the foreground, so the probe resolves the
+    # key before it, as the runner of a job has it before discover().
+    rc=0
+    out="$(TEST_SECRET="$SECRET" ad probe --profile leaky --profile-json '{"harness":"plain-leak","auth":{"keyEnv":"TEST_SECRET"},"leak":"discover"}' 2>&1)" || rc=$?
+    if [[ "$rc" -eq 1 && "$out" == *"cannot start with key <redacted>"* && "$out" != *"$SECRET"* ]] && ! grep -rFq "$SECRET" "$STATE"; then
+        pass "7 a probe whose adapter error carries the key (discover): the error is redacted (the probe knows the key before discover runs)"
+    else
+        fail "7 a probe whose adapter error carries the key (discover): the error is redacted (the probe knows the key before discover runs)"
+        echo "    exit=$rc out=${out//$SECRET/<SECRET>}"
+    fi
     rc=0
     err="$(TEST_SECRET= ad task --background --write --profile keyed --profile-json "$keyed" --prompt-file "$prompt" 2>&1)" || rc=$?
     id="$(AGENT_STUB_MODE=ok start_task --write --profile p1 --prompt-file "$prompt")"
@@ -1289,6 +1355,446 @@ console.log(JSON.stringify([
     else
         fail "24 a relative state dir resolves against the caller's cwd: the job completes and the runner writes under the same root"
         echo "    status=$(cat "$TEST_ROOT/rel-state.out" 2>/dev/null) repo4: $(/bin/ls -A "$repo4")"
+    fi
+
+    # --- 25. a runner pid reused within one boot: identity (pid + start time) decides, never the pid alone ---
+    # The family stands in for whatever got a dead runner's pid: a group leader with a child in a group of its own,
+    # both with default signal dispositions, so any signal that reaches them shows.
+    local JOBS5 fam fam_p fam_c bogus="Thu Jan 1 00:00:00 1970"
+    JOBS5="$(jobs_dir_of "$repo5")"
+    fam="$TEST_ROOT/family.txt"
+    spawn_family "$fam"
+    fam_p="$(cut -d' ' -f1 "$fam")"
+    fam_c="$(cut -d' ' -f2 "$fam")"
+    fixture_record "$JOBS5" pt-0001 "{\"workspaceRoot\":\"$repo5\",\"cwd\":\"$repo5\",\"runnerPid\":$fam_p,\"runnerStartedAt\":\"$bogus\"}"
+    t0="$(now_ms)"
+    out="$(with_deadline 30 ad cancel pt-0001 --cwd "$repo5")"
+    t1="$(now_ms)"
+    sj="$(ad status pt-0001 --cwd "$repo5" --json)"
+    if [[ -n "$fam_p" && -n "$fam_c" && "$out" == "pt-0001 is failed" && "$(jfield job.errorClass <<<"$sj")" == crash && "$(jfield job.note <<<"$sj")" == "runner died" ]] \
+        && (((t1 - t0) < 4000)) && kill -0 "$fam_p" 2>/dev/null && kill -0 "$fam_c" 2>/dev/null \
+        && grep -q "runner died (pid $fam_p now belongs to another process)" "$JOBS5/pt-0001.log"; then
+        pass "25 cancel of a job whose runner pid now belongs to an unrelated process (same boot, another start time): the runner counts as dead (failed/crash), no wait for it, and neither that process nor its child's group is signalled ($((t1 - t0)) ms)"
+    else
+        fail "25 cancel of a job whose runner pid now belongs to an unrelated process (same boot, another start time): the runner counts as dead (failed/crash), no wait for it, and neither that process nor its child's group is signalled ($((t1 - t0)) ms)"
+        echo "    out=$out $(jfield job.status <<<"$sj")/$(jfield job.errorClass <<<"$sj") parent=$fam_p child=$fam_c"
+        cat "$JOBS5/pt-0001.log" 2>/dev/null
+    fi
+    # The reservation holder's identity: a holder pid reused by another process is not the holder.
+    fixture_record "$JOBS5" pt-0002 "{\"workspaceRoot\":\"$repo5\",\"cwd\":\"$repo5\",\"write\":true,\"runnerPid\":$fam_p,\"runnerStartedAt\":\"$bogus\"}"
+    printf '{"holderPid":%s,"holderStartedAt":"%s","jobId":"pt-0002","token":"tok-25","generation":0,"createdAt":"x","bootId":"%s"}\n' \
+        "$fam_p" "$bogus" "$boot_now" >"$(dirname "$JOBS5")/active.lock.0"
+    rc=0
+    err="$(AGENT_STUB_MODE=ok ad task --background --write --cwd "$repo5" --profile p1 --prompt-file "$prompt" 2>&1)" || rc=$?
+    rc2=0
+    out2="$(ad release-stale --cwd "$repo5" 2>&1)" || rc2=$?
+    id="$(AGENT_STUB_MODE=ok start_task --write --cwd "$repo5" --profile p1 --prompt-file "$prompt")"
+    st="$(wait_status "$id" 'completed|failed|cancelled' 20 --cwd "$repo5")"
+    if [[ "$rc" -eq 2 && "$err" == *"is stale (runner pid $fam_p is not alive (the pid now belongs to another process))"* && "$rc2" -eq 0 \
+        && "$out2" == "released $repo5 generation 0" && "$st" == completed ]] && kill -0 "$fam_p" 2>/dev/null && kill -0 "$fam_c" 2>/dev/null; then
+        pass "25 a reservation whose holder pid now belongs to another process: the write task is refused as stale, release-stale releases it, the next write task runs; nothing signalled"
+    else
+        fail "25 a reservation whose holder pid now belongs to another process: the write task is refused as stale, release-stale releases it, the next write task runs; nothing signalled"
+        echo "    task=$rc:$err release-stale=$rc2:$out2 next=$st"
+    fi
+    # A pending cleanup (terminal record, no marker) whose runner pid was reused: resumed without signalling it.
+    fixture_record "$JOBS5" pt-0050 "{\"workspaceRoot\":\"$repo5\",\"cwd\":\"$repo5\",\"runnerPid\":$fam_p,\"runnerStartedAt\":\"$bogus\"}"
+    core_js 'core.finalizeRecord(process.argv[1], { status: "cancelled", errorClass: null, note: "claimed by the test" });' "$JOBS5/pt-0050.json"
+    local pending_before=no
+    if core_js 'process.exit(core.cleanupPending(process.argv[1], core.readRecord(`${process.argv[1]}/pt-0050.json`)) ? 0 : 1);' "$JOBS5"; then pending_before=yes; fi
+    out="$(with_deadline 30 ad cancel pt-0050 --cwd "$repo5")"
+    if [[ "$pending_before" == yes && "$out" == "pt-0050 is cancelled" && -e "$JOBS5/pt-0050.json.cleaned" ]] && kill -0 "$fam_p" 2>/dev/null && kill -0 "$fam_c" 2>/dev/null \
+        && grep -q "cancel: runner pid $fam_p not signalled: the pid now belongs to another process" "$JOBS5/pt-0050.log"; then
+        pass "25 cancel resuming a pending cleanup whose runner pid was reused: no descendant of that process is searched or signalled; the cleanup is then done"
+    else
+        fail "25 cancel resuming a pending cleanup whose runner pid was reused: no descendant of that process is searched or signalled; the cleanup is then done"
+        echo "    pending before: $pending_before out=$out"
+    fi
+    # A start time that was never recorded (an older record; ps failing at the claim) makes a live pid "unknown" too —
+    # never signalled, never gone — and the notes say why: not "cannot be read", which would send one hunting for ps.
+    fixture_record "$JOBS5" pt-0051 "{\"workspaceRoot\":\"$repo5\",\"cwd\":\"$repo5\",\"runnerPid\":$fam_p}"
+    core_js '
+const fs = await import("node:fs");
+const file = process.argv[1];
+const r = JSON.parse(fs.readFileSync(file, "utf8"));
+fs.writeFileSync(`${file}.terminal`, JSON.stringify({ ...r, status: "cancelled", note: "claimed long ago",
+  finishedAt: new Date(Date.now() - 3600e3).toISOString() }));' "$JOBS5/pt-0051.json"
+    out="$(with_deadline 30 ad cancel pt-0051 --cwd "$repo5")"
+    local lock_gen
+    lock_gen="$(/bin/ls "$(dirname "$JOBS5")" | grep -cE '^active\.lock\.[0-9]+$')"
+    printf '{"holderPid":%s,"jobId":"pt-0052","token":"tok-25b","generation":%s,"createdAt":"x","bootId":"%s"}\n' \
+        "$fam_p" "$lock_gen" "$boot_now" >"$(dirname "$JOBS5")/active.lock.$lock_gen"
+    rc=0
+    err="$(ad release-stale --cwd "$repo5" 2>&1)" || rc=$?
+    if [[ "$out" == "pt-0051 is cancelled (cleanup resumed: runner pid $fam_p not signalled: it is alive, but no start time was recorded for it to confirm it is the job's)" \
+        && ! -e "$JOBS5/pt-0051.json.cleaned" && "$rc" -eq 2 \
+        && "$err" == *"generation $lock_gen is held by live runner pid $fam_p (no start time was recorded for it to confirm whether it is still the job's runner)"* ]] \
+        && kill -0 "$fam_p" 2>/dev/null && kill -0 "$fam_c" 2>/dev/null; then
+        pass "25 a live runner / reservation holder pid without a recorded start time: not signalled, the cleanup stays pending, release-stale refuses — and both say the start time was never recorded"
+    else
+        fail "25 a live runner / reservation holder pid without a recorded start time: not signalled, the cleanup stays pending, release-stale refuses — and both say the start time was never recorded"
+        echo "    cancel=$out release-stale=$rc:$err"
+    fi
+    kill -KILL "$fam_p" "$fam_c" 2>/dev/null
+
+    # --- 26. a terminal claim whose cleanup was interrupted (the claiming cancel and the runner both gone) ---
+    # The runner is stopped, the claim written, the runner killed: the harness lives on under a cancelled record.
+    rec="$TEST_ROOT/ready-26a.json"
+    id="$(AGENT_STUB_MODE=hang AGENT_STUB_RECORD="$rec" start_task --profile p1 --prompt-file "$prompt")"
+    child="$(wait_child "$id")"
+    wait_file "$rec" || true
+    runner="$(ad status "$id" --json | jfield job.runnerPid)"
+    kill -STOP "$runner" 2>/dev/null
+    # As a cancel that claimed before the runner recorded its harness leaves it: the claim does not name the harness.
+    core_js '
+const fs = await import("node:fs");
+const file = process.argv[1];
+const r = JSON.parse(fs.readFileSync(file, "utf8"));
+fs.writeFileSync(`${file}.terminal`, JSON.stringify({ ...r, status: "cancelled", errorClass: null, note: "claimed by an interrupted cancel",
+  childPid: null, childStartedAt: null, finishedAt: new Date().toISOString() }));' "$JOBS/$id.json"
+    kill -KILL "$runner" 2>/dev/null
+    gone "$runner" || true
+    local alive_before=no
+    if [[ -n "$child" ]] && kill -0 "$child" 2>/dev/null; then alive_before=yes; fi
+    out="$(with_deadline 30 ad cancel "$id")"
+    out2="$(ad cancel "$id")"
+    if [[ "$alive_before" == yes && "$out" == "$id is cancelled (cleanup resumed)" && "$out2" == "$id is cancelled" ]] && gone "$child" \
+        && [[ "$(ad status "$id" --json | jfield job.status)" == cancelled ]] && grep -q "cancel: SIGTERM to groups $child" "$JOBS/$id.log"; then
+        pass "26 a repeated cancel resumes the cleanup: the runner's claim file names the harness the record does not; the adapter's ladder stops it, the job stays cancelled; a third cancel has nothing left to do"
+    else
+        fail "26 a repeated cancel resumes the cleanup: the runner's claim file names the harness the record does not; the adapter's ladder stops it, the job stays cancelled; a third cancel has nothing left to do"
+        echo "    harness=$child (alive before: $alive_before) out=$out / $out2"; tail -5 "$JOBS/$id.log"
+    fi
+    rec="$TEST_ROOT/ready-26b.json"
+    id="$(AGENT_STUB_MODE=hang AGENT_STUB_RECORD="$rec" start_task --profile p1 --prompt-file "$prompt")"
+    child="$(wait_child "$id")"
+    wait_file "$rec" || true
+    runner="$(ad status "$id" --json | jfield job.runnerPid)"
+    kill -STOP "$runner" 2>/dev/null
+    core_js 'core.finalizeRecord(process.argv[1], { status: "cancelled", errorClass: null, note: "claimed by an interrupted cancel" });' "$JOBS/$id.json"
+    kill -KILL "$runner" 2>/dev/null
+    gone "$runner" || true
+    alive_before=no
+    if [[ -n "$child" ]] && kill -0 "$child" 2>/dev/null; then alive_before=yes; fi
+    sj="$(ad status "$id" --json)"
+    if [[ "$alive_before" == yes && "$(jfield job.status <<<"$sj")" == cancelled && "$(jfield job.note <<<"$sj")" == "claimed by an interrupted cancel" ]] && gone "$child" \
+        && grep -q "cleanup resumed: the job is cancelled but its runner pid $runner is gone and harness process group $child was alive; SIGKILL to process groups" "$JOBS/$id.log"; then
+        pass "26 the reaper (any status) resumes the cleanup of a cancelled job whose runner died before stopping the harness: SIGKILL to the verified tree, the verdict unchanged"
+    else
+        fail "26 the reaper (any status) resumes the cleanup of a cancelled job whose runner died before stopping the harness: SIGKILL to the verified tree, the verdict unchanged"
+        echo "    harness=$child (alive before: $alive_before) $(jfield job.status <<<"$sj") note=$(jfield job.note <<<"$sj")"; tail -3 "$JOBS/$id.log"
+    fi
+
+    # --- 27. auxiliary commands (discover's --version) run under a hard deadline and stop on cancel ---
+    pids="$TEST_ROOT/pids-27a.txt"
+    rm -f "$pids"
+    t0="$(now_ms)"
+    id="$(AGENT_STUB_VERSION_HANG=ignore-term AGENT_STUB_PIDS="$pids" start_task --profile dh --profile-json '{"harness":"plain","discoverTimeoutMs":300}' --prompt-file "$prompt")"
+    st="$(wait_status "$id" 'completed|failed|cancelled' 15)"
+    t1="$(now_ms)"
+    d1="$(sed -n 1p "$pids" 2>/dev/null)"
+    sj="$(ad status "$id" --json)"
+    if [[ "$st" == failed && "$(jfield job.errorClass <<<"$sj")" == launch && "$(jfield job.note <<<"$sj")" == *"--version"* && -n "$d1" ]] && (((t1 - t0) < 8000)) && gone "$d1"; then
+        pass "27 a --version that ignores SIGTERM past its 300 ms deadline is SIGKILLed after the grace: the job fails launch in bounded time ($((t1 - t0)) ms), nothing left"
+    else
+        fail "27 a --version that ignores SIGTERM past its 300 ms deadline is SIGKILLed after the grace: the job fails launch in bounded time ($((t1 - t0)) ms), nothing left"
+        echo "    status=$st note=$(jfield job.note <<<"$sj") stub=$d1"
+    fi
+    pids="$TEST_ROOT/pids-27b.txt"
+    rm -f "$pids"
+    id="$(AGENT_STUB_VERSION_HANG=ignore-term AGENT_STUB_PIDS="$pids" start_task --write --cwd "$repo6" --profile dh --profile-json '{"harness":"plain","discoverTimeoutMs":60000}' --prompt-file "$prompt")"
+    wait_lines "$pids" 1 || true
+    d1="$(sed -n 1p "$pids" 2>/dev/null)"
+    t0="$(now_ms)"
+    out="$(with_deadline 30 ad cancel "$id" --cwd "$repo6")"
+    t1="$(now_ms)"
+    rc=0
+    err="$(AGENT_STUB_MODE=ok ad task --background --write --cwd "$repo6" --profile p1 --prompt-file "$prompt" 2>&1)" || rc=$?
+    id2="${err##* }"
+    st="$(wait_status "$id2" 'completed|failed|cancelled' 20 --cwd "$repo6")"
+    if [[ -n "$d1" && "$out" == "cancelled $id" && "$rc" -eq 0 && "$st" == completed ]] && (((t1 - t0) < 5000)) && gone "$d1"; then
+        pass "27 cancel during a discovery that hangs (and ignores SIGTERM): the runner's --version is stopped at once, cancel returns in bounded time ($((t1 - t0)) ms) and the write reservation is free"
+    else
+        fail "27 cancel during a discovery that hangs (and ignores SIGTERM): the runner's --version is stopped at once, cancel returns in bounded time ($((t1 - t0)) ms) and the write reservation is free"
+        echo "    stub=$d1 out=$out next=$rc:$err/$st"
+    fi
+
+    # --- 28. a start time that cannot be read is "unknown": never signalled, never released as gone ---
+    local JOBS7 sleeper2 sleeper2_start
+    JOBS7="$(jobs_dir_of "$repo7")"
+    rec="$TEST_ROOT/ready-28.json"
+    id="$(AGENT_STUB_MODE=hang AGENT_STUB_RECORD="$rec" start_task --write --cwd "$repo7" --profile p1 --prompt-file "$prompt")"
+    child="$(wait_child "$id" --cwd "$repo7")"
+    wait_file "$rec" || true
+    runner="$(ad status "$id" --cwd "$repo7" --json | jfield job.runnerPid)"
+    kill -KILL "$runner" 2>/dev/null
+    gone "$runner" || true
+    rc=0
+    err="$(AGENT_TEST_PS_START=unavailable ad release-stale --cwd "$repo7" 2>&1)" || rc=$?
+    if [[ -n "$child" && "$rc" -eq 2 && "$err" == *"still has harness process group $child alive, unconfirmed (its start time cannot be read)"* ]] && kill -0 "$child" 2>/dev/null; then
+        pass "28 runner dead, its harness alive but its start time unreadable (ps): release-stale refuses (exit 2), the reservation stays"
+    else
+        fail "28 runner dead, its harness alive but its start time unreadable (ps): release-stale refuses (exit 2), the reservation stays"
+        echo "    exit=$rc err=$err harness=$child"
+    fi
+    sj="$(AGENT_TEST_PS_START=unavailable ad status "$id" --cwd "$repo7" --json)"
+    rc=0
+    err="$(AGENT_TEST_PS_START=unavailable ad release-stale --cwd "$repo7" 2>&1)" || rc=$?
+    if [[ "$(jfield job.status <<<"$sj")" == failed && "$(jfield job.note <<<"$sj")" == "runner died" && "$rc" -eq 2 ]] && kill -0 "$child" 2>/dev/null \
+        && grep -q "harness process group $child not signalled: it is alive, but its start time cannot be read" "$JOBS7/$id.log"; then
+        pass "28 the reaper with the start time unreadable: failed/crash, the harness group is not signalled (said in the log), and release-stale still refuses"
+    else
+        fail "28 the reaper with the start time unreadable: failed/crash, the harness group is not signalled (said in the log), and release-stale still refuses"
+        echo "    $(jfield job.status <<<"$sj") note=$(jfield job.note <<<"$sj") release-stale=$rc:$err"
+    fi
+    # Readable again: the next status resumes the pending cleanup; then the reservation can go.
+    ad status "$id" --cwd "$repo7" >/dev/null
+    local swept=no
+    if gone "$child"; then swept=yes; fi
+    rc=0
+    out="$(ad release-stale --cwd "$repo7" 2>&1)" || rc=$?
+    id2="$(AGENT_STUB_MODE=ok start_task --write --cwd "$repo7" --profile p1 --prompt-file "$prompt")"
+    st="$(wait_status "$id2" 'completed|failed|cancelled' 20 --cwd "$repo7")"
+    if [[ "$swept" == yes && "$rc" -eq 0 && "$out" =~ ^released\ $repo7\ generation\ [0-9]+$ && "$st" == completed ]] \
+        && grep -q "cleanup resumed: the job is failed but its runner pid $runner is gone" "$JOBS7/$id.log"; then
+        pass "28 once the start time is readable again, a status call stops the left-over harness tree; release-stale then releases, the next write task runs"
+    else
+        fail "28 once the start time is readable again, a status call stops the left-over harness tree; release-stale then releases, the next write task runs"
+        echo "    harness=$child release-stale=$rc:$out next=$st"
+    fi
+    # A live runner whose start time cannot be read keeps its job (it may be ours); a provably reused pid does not.
+    sleeper2="$(spawn_sleeper)"
+    SLEEPERS="$SLEEPERS $sleeper2"
+    sleeper2_start="$(core_js 'console.log(core.processStart(Number(process.argv[1])) ?? "")' "$sleeper2")"
+    fixture_record "$JOBS7" pt-0900 "{\"workspaceRoot\":\"$repo7\",\"cwd\":\"$repo7\",\"runnerPid\":$sleeper2,\"runnerStartedAt\":\"$sleeper2_start\"}"
+    out="$(AGENT_TEST_PS_START=unavailable ad status pt-0900 --cwd "$repo7" --json | jfield job.status)"
+    out2="$(ad status pt-0900 --cwd "$repo7" --json | jfield job.status)"
+    if [[ -n "$sleeper2_start" && "$out" == running && "$out2" == running ]] && kill -0 "$sleeper2" 2>/dev/null; then
+        pass "28 a live runner whose start time is unreadable (unknown) or matches (ours) keeps its job running; nothing is signalled"
+    else
+        fail "28 a live runner whose start time is unreadable (unknown) or matches (ours) keeps its job running; nothing is signalled"
+        echo "    unreadable=$out readable=$out2 start=$sleeper2_start"
+    fi
+    core_js 'core.finalizeRecord(process.argv[1], { status: "failed", errorClass: "crash", note: "fixture done" });' "$JOBS7/pt-0900.json"
+    kill "$sleeper2" 2>/dev/null
+
+    # --- 29. cancel before the runner entered runJob: the runner still releases the reservation it was handed ---
+    local barrier="$TEST_ROOT/run-barrier-29" launches="$TEST_ROOT/launches-29.txt"
+    rm -f "$barrier" "$launches"
+    id="$(CORE_HARNESS_RUN_BARRIER="$barrier" AGENT_STUB_MODE=ok AGENT_STUB_LAUNCH_LOG="$launches" start_task --write --cwd "$repo8" --profile p1 --prompt-file "$prompt")"
+    rm -f "$TEST_ROOT/cancel-29.rc"
+    (
+        crc=0
+        ad cancel "$id" --cwd "$repo8" >"$TEST_ROOT/cancel-29.out" 2>&1 || crc=$?
+        echo "$crc" >"$TEST_ROOT/cancel-29.rc"
+    ) &
+    local cancel_pid=$!
+    st="$(wait_status "$id" 'cancelled|completed|failed' 10 --cwd "$repo8")"
+    touch "$barrier" # the runner enters runJob only now, its job already cancelled
+    wait_file "$TEST_ROOT/cancel-29.rc" || true
+    wait "$cancel_pid" 2>/dev/null
+    rc=0
+    err="$(AGENT_STUB_MODE=ok ad task --background --write --cwd "$repo8" --profile p1 --prompt-file "$prompt" 2>&1)" || rc=$?
+    id2="${err##* }"
+    out="$(wait_status "$id2" 'completed|failed|cancelled' 20 --cwd "$repo8")"
+    if [[ "$st" == cancelled && "$(cat "$TEST_ROOT/cancel-29.rc" 2>/dev/null)" == 0 && "$(cat "$TEST_ROOT/cancel-29.out")" == "cancelled $id" && ! -s "$launches" \
+        && "$rc" -eq 0 && "$out" == completed ]] && grep -q "job $id is cancelled already; nothing started" "$(jobs_dir_of "$repo8")/$id.log"; then
+        pass "29 cancel wins before the runner enters runJob: no harness starts, the runner releases the write reservation, the next write task runs without release-stale"
+    else
+        fail "29 cancel wins before the runner enters runJob: no harness starts, the runner releases the write reservation, the next write task runs without release-stale"
+        echo "    status=$st cancel=$(cat "$TEST_ROOT/cancel-29.rc" 2>/dev/null):$(cat "$TEST_ROOT/cancel-29.out" 2>/dev/null) launches=$(wc -l <"$launches" 2>/dev/null) next=$rc:$err/$out"
+    fi
+
+    # --- 30. one runner per job, also for two __run released into the claim at the same moment ---
+    barrier="$TEST_ROOT/claim-barrier-30"
+    launches="$TEST_ROOT/launches-30.txt"
+    rm -f "$barrier"* "$launches" "$TEST_ROOT"/run30-*.rc
+    mkdir -p "$JOBS/pt-9000"
+    cp "$prompt" "$JOBS/pt-9000/prompt.md"
+    fixture_record "$JOBS" pt-9000 "{\"workspaceRoot\":\"$repo\",\"cwd\":\"$repo\",\"promptPath\":\"$JOBS/pt-9000/prompt.md\"}"
+    for k in 1 2; do
+        (
+            krc=0
+            AGENT_TEST_RUN_BARRIER="$barrier" AGENT_STUB_MODE=ok AGENT_STUB_LAUNCH_LOG="$launches" ad __run pt-9000 "$JOBS" - >/dev/null 2>&1 || krc=$?
+            echo "$krc" >"$TEST_ROOT/run30-$k.rc"
+        ) &
+    done
+    local ready=0
+    for ((k = 0; k < 100; k++)); do
+        ready="$(compgen -G "$barrier.ready-*" | wc -l | tr -d ' ')"
+        if ((ready >= 2)); then break; fi
+        sleep 0.1
+    done
+    touch "$barrier" # both runners passed the pre-claim check; now both claim at once
+    wait
+    out="$(cat "$TEST_ROOT"/run30-*.rc 2>/dev/null | sort | tr '\n' ' ')"
+    st="$(wait_status pt-9000 'completed|failed|cancelled' 20)"
+    if [[ "$ready" -eq 2 && "$out" == "0 1 " && "$(wc -l <"$launches" | tr -d ' ')" == 1 && "$st" == completed ]] \
+        && grep -q "__run refused for pt-9000 in pid [0-9]*: runner pid [0-9]* owns the job" "$JOBS/pt-9000.log"; then
+        pass "30 two __run that both passed the pre-claim check claim at once: exactly one wins (exit 0, one harness launch), the other is refused (exit 1)"
+    else
+        fail "30 two __run that both passed the pre-claim check claim at once: exactly one wins (exit 0, one harness launch), the other is refused (exit 1)"
+        echo "    ready=$ready exit codes: $out launches=$(wc -l <"$launches" 2>/dev/null) status=$st"
+    fi
+
+    # --- 31. a process's identity does not move with the wall clock (Linux: /proc ticks, not procps' lstart) ---
+    out="$(core_js '
+const line = (comm, ticks = "987654") => `4242 (${comm}) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 ${ticks} 1000 10 0`;
+console.log(JSON.stringify([core.parseProcStat(line("node")), core.parseProcStat(line("a b) (c")), core.parseProcStat("garbage"), core.parseProcStat(line("x", "-"))]));')"
+    if [[ "$out" == '["987654","987654",null,null]' ]]; then
+        pass "31 parseProcStat reads field 22 (start ticks) after the last ')' of the command name, whatever the name holds"
+    else
+        fail "31 parseProcStat reads field 22 (start ticks) after the last ')' of the command name, whatever the name holds"
+        echo "    got: $out"
+    fi
+    local sleeper3
+    sleeper3="$(spawn_sleeper)"
+    SLEEPERS="$SLEEPERS $sleeper3"
+    out="$(core_js '
+const fs = await import("node:fs");
+const pid = Number(process.argv[1]);
+const own = core.processStart(pid);
+const linux = process.platform === "linux";
+const source = linux ? own === `ticks:${core.parseProcStat(fs.readFileSync(`/proc/${pid}/stat`, "utf8"))}` : /^[A-Z][a-z]{2} [A-Z][a-z]{2} \d+ \d\d:\d\d:\d\d \d{4}$/.test(own ?? "");
+console.log([source, core.processStart(pid) === own, core.processIdentity(pid, own), core.processIdentity(pid, "Thu Jan 1 00:00:00 1970"),
+  core.processIdentity(pid, "ticks:1"), linux ? "linux" : "other"].join(" "));' "$sleeper3")"
+    if [[ "$out" == "true true ours foreign foreign linux" || "$out" == "true true ours foreign unknown other" ]]; then
+        pass "31 processStart: /proc start ticks on Linux, lstart elsewhere; a stored value is compared in its own format (lstart via ps, ticks via /proc — never one with the other)"
+    else
+        fail "31 processStart: /proc start ticks on Linux, lstart elsewhere; a stored value is compared in its own format (lstart via ps, ticks via /proc — never one with the other)"
+        echo "    got: $out"
+    fi
+    kill "$sleeper3" 2>/dev/null
+    if [[ "$(uname -s)" == Linux ]]; then
+        # procps prints lstart as /proc/stat btime + start ticks, and btime moves with every wall-clock step: a ps that
+        # prints another lstart for every process is what a live job meets after one. Its identity must not care.
+        local shim="$TEST_ROOT/ps-shim" real_ps
+        real_ps="$(command -v ps)"
+        mkdir -p "$shim"
+        printf '#!/bin/bash\ncase " $* " in *lstart*) "%s" "$@" >/dev/null || exit $?; echo "Mon Jan  1 00:00:00 2001"; exit 0 ;; esac\nexec "%s" "$@"\n' "$real_ps" "$real_ps" >"$shim/ps"
+        chmod +x "$shim/ps"
+        rec="$TEST_ROOT/ready-31.json"
+        id="$(AGENT_STUB_MODE=hang AGENT_STUB_RECORD="$rec" start_task --write --cwd "$repo9" --profile p1 --prompt-file "$prompt")"
+        child="$(wait_child "$id" --cwd "$repo9")"
+        wait_file "$rec" || true
+        runner="$(ad status "$id" --cwd "$repo9" --json | jfield job.runnerPid)"
+        st="$(PATH="$shim:$PATH" ad status "$id" --cwd "$repo9" --json | jfield job.status)"
+        rc=0
+        err="$(PATH="$shim:$PATH" ad release-stale --cwd "$repo9" 2>&1)" || rc=$?
+        rc2=0
+        out2="$(PATH="$shim:$PATH" AGENT_STUB_MODE=ok ad task --background --write --cwd "$repo9" --profile p1 --prompt-file "$prompt" 2>&1)" || rc2=$?
+        sleep 1 # a runner that met a terminal claim would have started its ladder by now
+        local alive_after=no
+        if [[ -n "$child" ]] && kill -0 "$child" 2>/dev/null && kill -0 "$runner" 2>/dev/null; then alive_after=yes; fi
+        out="$(with_deadline 30 ad cancel "$id" --cwd "$repo9")"
+        if [[ "$st" == running && "$rc" -eq 2 && "$err" == *"is held by live runner pid $runner"* && "$rc2" -eq 2 && "$out2" == *"job $id is still running"* \
+            && "$alive_after" == yes && "$out" == "cancelled $id" ]] && gone "$child"; then
+            pass "31 Linux: with every lstart reading differently (a wall-clock step), a live write job stays running — status, release-stale and a second write task all see its runner — and cancel still stops it"
+        else
+            fail "31 Linux: with every lstart reading differently (a wall-clock step), a live write job stays running — status, release-stale and a second write task all see its runner — and cancel still stops it"
+            echo "    status=$st release-stale=$rc:$err second=$rc2:$out2 alive=$alive_after cancel=$out"
+        fi
+    else
+        echo "  [SKIP] 31 Linux only: a wall-clock step under a live job (macOS's lstart is the start time stored at fork; no step moves it)"
+    fi
+
+    # --- 32. cancel before the runner claimed a read-only job: the cleanup marker is left to that runner ---
+    barrier="$TEST_ROOT/run-barrier-32"
+    launches="$TEST_ROOT/launches-32.txt"
+    id="$(CORE_HARNESS_RUN_BARRIER="$barrier" AGENT_STUB_MODE=ok AGENT_STUB_LAUNCH_LOG="$launches" start_task --profile p1 --prompt-file "$prompt")"
+    runner="$(pgrep -f "__run $id " | head -1)"
+    out="$(with_deadline 30 ad cancel "$id")"
+    local marked_early=no
+    if [[ -e "$JOBS/$id.json.cleaned" ]]; then marked_early=yes; fi
+    touch "$barrier"
+    gone "$runner" || true
+    if [[ -n "$runner" && "$out" == "cancelled $id" && "$marked_early" == no && -e "$JOBS/$id.json.cleaned" && ! -s "$launches" ]] \
+        && grep -q "job $id is cancelled already; nothing started" "$JOBS/$id.log"; then
+        pass "32 cancel of a read-only job whose runner has not claimed it yet: no cleanup marker while that runner lives; it finds the job cancelled, starts nothing and writes the marker itself"
+    else
+        fail "32 cancel of a read-only job whose runner has not claimed it yet: no cleanup marker while that runner lives; it finds the job cancelled, starts nothing and writes the marker itself"
+        echo "    runner=$runner cancel=$out marked early: $marked_early launches=$(wc -l <"$launches" 2>/dev/null)"
+    fi
+
+    # --- 33. a job id stays taken while anything of the job is left, not only its record ---
+    out="$(core_js '
+const fs = await import("node:fs");
+const dir = process.argv[1];
+fs.mkdirSync(`${dir}/pt-0008`, { recursive: true });
+for (const name of ["pt-0003.json", "pt-0007.json.runner", "pt-0009.log", "pt-0010.json.cleaned", "pt-0011.json.terminal", "zt-0099.json.runner"]) fs.writeFileSync(`${dir}/${name}`, "{}");
+const a = core.allocateJob(dir, "pt", { status: "running" });
+fs.rmSync(`${dir}/${a}.json`);
+fs.writeFileSync(`${dir}/${a}.json.runner`, "{}");
+console.log(a, core.allocateJob(dir, "oc", { status: "running" }));' "$TEST_ROOT/alloc-traces")"
+    id="$(AGENT_STUB_MODE=ok start_task --profile p1 --prompt-file "$prompt")"
+    st="$(wait_status "$id" 'completed|failed|cancelled' 20)"
+    # The record alone, as a hand or a prune might remove it: its .terminal, .runner and .cleaned stay.
+    core_js '(await import("node:fs")).rmSync(process.argv[1]);' "$JOBS/$id.json"
+    id2="$(AGENT_STUB_MODE=ok start_task --profile p1 --prompt-file "$prompt")"
+    out2="$(wait_status "$id2" 'completed|failed|cancelled' 20)"
+    if [[ "$out" == "pt-0012 oc-0013" && "$st" == completed && "$id2" != "$id" && "$out2" == completed ]]; then
+        pass "33 allocateJob counts every trace of a job (side files, log, job dir): a record removed alone never hands its runner claim or cleanup marker to a new job under its id"
+    else
+        fail "33 allocateJob counts every trace of a job (side files, log, job dir): a record removed alone never hands its runner claim or cleanup marker to a new job under its id"
+        echo "    unit=$out first=$id/$st next=$id2/$out2"
+    fi
+
+    # --- 34. the probe asks invocation() (the contract's harness-less hook) whether a key is needed, not probe() ---
+    rec="$TEST_ROOT/probe-34.json"
+    keylog="$TEST_ROOT/keylog-34.txt"
+    rc=0
+    out="$(CORE_HARNESS_KEY_LOG="$keylog" TEST_SECRET="$SECRET" AGENT_STUB_MODE=ok AGENT_STUB_RESPONSE=PONG AGENT_STUB_RECORD="$rec" \
+        ad probe --profile pp --profile-json '{"harness":"plain-probe","auth":{"keyEnv":"TEST_SECRET"}}' 2>&1)" || rc=$?
+    if [[ "$rc" -eq 0 && "$out" == 'probe pp: completed response="PONG"' && "$(jfield argv <"$rec" 2>/dev/null)" == *'"--model","probe-of-1.0.0"'* \
+        && "$(jfield env.PLAIN_API_KEY <"$rec" 2>/dev/null)" == "$SECRET" && "$(cat "$keylog" 2>/dev/null)" == "resolved TEST_SECRET" ]]; then
+        pass "34 a probe() hook that reads req.harness runs only once the harness is known; the key is still resolved once, before discovery"
+    else
+        fail "34 a probe() hook that reads req.harness runs only once the harness is known; the key is still resolved once, before discovery"
+        echo "    exit=$rc out=${out//$SECRET/<SECRET>} keylog=$(cat "$keylog" 2>/dev/null)"
+    fi
+
+    # --- 35. ctx.exec keeps spawnSync's calling convention: errors, Buffer input, timeoutMs 0 ---
+    out="$(core_js '
+const { spawnSync } = await import("node:child_process");
+const exec = core.makeCtx({}).exec;
+const fields = (e) => JSON.stringify(e && { message: e.message, errno: e.errno, code: e.code, syscall: e.syscall, path: e.path, spawnargs: e.spawnargs });
+const missing = `${process.argv[1]}/no-such-binary`;
+const same = fields(exec(missing, ["x"]).error) === fields(spawnSync(missing, ["x"]).error);
+const echo = exec(process.execPath, ["-e", "process.stdin.pipe(process.stdout)"], { input: Buffer.from("bytes-in") });
+const typed = exec(process.execPath, ["-e", "process.stdin.pipe(process.stdout)"], { input: new Uint8Array([104, 105]) });
+const t0 = Date.now();
+const slow = exec(process.execPath, ["-e", "setTimeout(() => {}, 400)"], { timeoutMs: 0 });
+const t1 = Date.now();
+const late = exec(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], { timeoutMs: 200 });
+console.log([same, echo.stdout, typed.stdout, slow.status, slow.error === null, slow.timedOut, t1 - t0 >= 350, late.error?.code,
+  late.error?.syscall === `spawnSync ${process.execPath}`, late.timedOut].join(" "));' "$TEST_ROOT")"
+    if [[ "$out" == "true bytes-in hi 0 true false true ETIMEDOUT true true" ]]; then
+        pass "35 ctx.exec: a spawn error has spawnSync's fields (code, errno, syscall, path, spawnargs); Buffer / typed-array input; timeoutMs 0 is no deadline; a deadline is ETIMEDOUT"
+    else
+        fail "35 ctx.exec: a spawn error has spawnSync's fields (code, errno, syscall, path, spawnargs); Buffer / typed-array input; timeoutMs 0 is no deadline; a deadline is ETIMEDOUT"
+        echo "    got: $out"
+    fi
+
+    # --- 36. a SIGKILL to the runner's whole process group does not orphan an auxiliary command ---
+    pids="$TEST_ROOT/pids-36.txt"
+    id="$(AGENT_STUB_VERSION_HANG=ignore-term AGENT_STUB_PIDS="$pids" start_task --write --cwd "$repo10" --profile dh --profile-json '{"harness":"plain","discoverTimeoutMs":60000}' --prompt-file "$prompt")"
+    wait_lines "$pids" 1 || true
+    d1="$(sed -n 1p "$pids" 2>/dev/null)"
+    runner="$(ad status "$id" --cwd "$repo10" --json | jfield job.runnerPid)"
+    if [[ -n "$runner" ]]; then kill -KILL -- "-$runner" 2>/dev/null; fi # startJob makes the runner a group leader
+    local aux_gone=no
+    if gone "$d1"; then aux_gone=yes; fi
+    sj="$(ad status "$id" --cwd "$repo10" --json)"
+    rc=0
+    out="$(ad release-stale --cwd "$repo10" 2>&1)" || rc=$?
+    id2="$(AGENT_STUB_MODE=ok start_task --write --cwd "$repo10" --profile p1 --prompt-file "$prompt")"
+    st="$(wait_status "$id2" 'completed|failed|cancelled' 20 --cwd "$repo10")"
+    if [[ -n "$d1" && "$aux_gone" == yes && "$(jfield job.status <<<"$sj")" == failed && "$(jfield job.note <<<"$sj")" == "runner died" \
+        && -e "$(jobs_dir_of "$repo10")/$id.json.cleaned" && "$rc" -eq 0 && "$st" == completed ]]; then
+        pass "36 SIGKILL to the runner's process group during a discovery that hangs (and ignores SIGTERM): its supervisor, in a group of its own, ends the --version; the job is reaped, release-stale frees the worktree"
+    else
+        fail "36 SIGKILL to the runner's process group during a discovery that hangs (and ignores SIGTERM): its supervisor, in a group of its own, ends the --version; the job is reaped, release-stale frees the worktree"
+        echo "    stub=$d1 gone=$aux_gone $(jfield job.status <<<"$sj") note=$(jfield job.note <<<"$sj") release-stale=$rc:$out next=$st"
     fi
 
     # --- leak check: nothing this run started is still running ---

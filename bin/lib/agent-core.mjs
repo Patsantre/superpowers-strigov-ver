@@ -29,6 +29,10 @@
 //   return await runJob({ id, jobsDir, token, adapters })   with adapters = { <harness id>: adapter }.
 //   discover → prepareHome → invocation → the harness (runCli) → reduce → finalize → the terminal record. The runner
 //   owns every stop of its harness: it watches the record and runs the adapter's ladder once the job is cancelled.
+//   One runner per job: it claims <id>.json.runner exclusively before anything else and keeps its own and its
+//   harness's identity there (also after a terminal claim, when the record no longer changes); <id>.json.cleaned
+//   marks that the job's process tree is known to be stopped. Until then a repeated cancel and the reaper resume
+//   the cleanup, by verified identities only, and the verdict stays as it was claimed.
 // other verbs, for core ids (route zt- / task- ids to the wrappers before calling these):
 //   statusCommand({ cwd, id, json, all }), resultCommand({ cwd, id }), await cancelCommand({ cwd, id }),
 //   releaseStaleCommand({ cwd }) — each returns the exit code and writes to an { stdout, stderr } sink.
@@ -39,7 +43,14 @@
 // errors: print `${CLI_NAME}: ${error.message}` and exit with exitCodeOf(error): 2 for UsageError (refusal without
 //   launch), 1 otherwise. Also exported: redactor(values), filterEnv / buildEnv / passthroughNames, readSecretLine
 //   and checkKeyText (key set), writePrivateFile, writeAdapterFiles, dataPaths(), makeCtx(), terminateTree(),
+//   processIdentity(), boundedExec() (a short command under a hard deadline, with no controlling terminal),
 //   ERROR_CLASSES.
+// Process identity: every stored pid (runner, reservation holder, harness group leader) is kept with its start time
+//   (processStart: /proc ticks since boot on Linux, `ps -o lstart` on macOS — neither moves with the wall clock) and
+//   compared before the pid decides anything — liveness, a descendant snapshot, a signal. A pid alive with another
+//   start time is a stranger (`foreign`); one whose start time cannot be read, or was never recorded, is `unknown`,
+//   which never authorizes a signal and never counts as gone. harnessGroupState() and processIdentity() therefore
+//   return four states: a caller that signals on anything but "ours" is wrong.
 // The adapter contract (spec §3.2) — adapters return data, the core owns processes, files, signals and keys:
 //   { id, idPrefix, manifest: { sessionId: "preassign" | "first-event", sessionIdFormat?: "uuid" | "job-id",
 //     cancel: { ladder: [[signal, waitMs], …] }, helpArgv?, requiredFlags?, homeEnv? },
@@ -54,11 +65,17 @@
 //   (§3.6 А); a null value removes a name. `dirs` (absolute; created 0700) and `files` ({ path, mode, content }) must
 //   lie under the data root. `meta` is a small JSON object the record keeps, redacted (resumeCheck reads prev.meta,
 //   e.g. the config or profile directory a session lives in). invocation and prepareHome must be pure: startJob calls
-//   them once at task time (req.harness is null then) to refuse a profile.env that touches a mandatory name. Only
+//   them once at task time, and runProbe before discovery (req.harness is null then both times), to refuse a
+//   profile.env that touches a mandatory name and to learn whether a key is needed; probe() always gets the harness. Only
 //   reduce() decides success; the exit code is informational. discover / prepareHome / finalize / resumeCheck reach
-//   processes and files only through ctx.exec and ctx.fs. discover's ctx.exec runs through the profile's `wrap`
-//   (ctx.execHost does not); finalize gets job.env (the harness environment without the key), job.wrap and
-//   ctx.execHarness(args), which runs `<wrap> <bin> args` in that environment.
+//   processes and files only through ctx.exec and ctx.fs. ctx.exec(cmd, args, { timeoutMs, graceMs, cwd, env, input })
+//   is synchronous and returns { status, signal, stdout, stderr, error, timedOut, stopped } (error as spawnSync's); the
+//   command runs in a session and process group of its own (no controlling terminal; what it leaves in that group is
+//   killed when it is done) under a hard deadline (SIGTERM at timeoutMs, default 10 s, 0 or null for none; SIGKILL
+//   after graceMs) and, in a runner, is stopped the same way once the job is cancelled or the runner is gone
+//   (boundedExec). discover's ctx.exec runs through the profile's `wrap` (ctx.execHost does
+//   not); finalize gets job.env (the harness environment without the key), job.wrap and ctx.execHarness(args), which
+//   runs `<wrap> <bin> args` in that environment.
 //
 // Exit codes: 0 success · 1 runtime failure · 2 usage error or guard refusal (no job started).
 
@@ -72,6 +89,11 @@ export const CLI_NAME = "agent-dispatch";
 export const RUN_VERB = "__run";
 export const STATE_DIR_VAR = "AGENT_DISPATCH_STATE_DIR";
 export const TEST_BOOT_ID_VAR = "AGENT_TEST_BOOT_ID";
+// Tests only: "unavailable" makes every process start time unreadable (an unprivileged or broken ps, no /proc).
+export const TEST_PS_START_VAR = "AGENT_TEST_PS_START";
+// Tests only: a file a runner waits for between its pre-claim check and the exclusive runner claim (it first writes
+// `<file>.ready-<pid>`), so two runners can be released into the claim at the same moment.
+export const TEST_RUN_BARRIER_VAR = "AGENT_TEST_RUN_BARRIER";
 export const DEFAULT_TIMEOUT_MIN = 60;
 export const DEFAULT_MAX_PARALLEL = 2;
 export const DEFAULT_LADDER = [["SIGTERM", 5000], ["SIGKILL", 0]];
@@ -125,13 +147,17 @@ const STOP_POLL_MS = 250; // how often a runner checks its record for a terminal
 const SWEEP_ROUNDS = 10;
 const MAX_TIMER_MS = 2 ** 31 - 1; // setTimeout fires at once above this
 const EXEC_TIMEOUT_MS = 10_000;
+const EXEC_GRACE_MS = 1_000; // SIGTERM → SIGKILL for an auxiliary command (boundedExec)
+const EXEC_MARGIN_MS = 5_000; // the supervisor's own backstop beyond the command's deadline and grace
+const EXEC_MAX_BUFFER = 16 * 1024 * 1024;
+const PS_TIMEOUT_MS = 5_000; // ps and sysctl: killed (SIGKILL) and read as "unreadable" beyond this
 // stdout held in memory for reduce(): the head and the tail of the stream (the log keeps all of it), so a long event
 // stream never grows one string toward V8's limit of about 2^29 characters.
 const STDOUT_HEAD_CHARS = 1 << 20;
 const STDOUT_TAIL_CHARS = 32 << 20;
 const META_MAX_CHARS = 16_384;
 // Fields the runner sets while its job runs; a terminal claim that raced one of them carries it over (finalizeRecord).
-const RUNTIME_FIELDS = ["runnerPid", "childPid", "childStartedAt", "harnessVersion", "meta"];
+const RUNTIME_FIELDS = ["runnerPid", "runnerStartedAt", "childPid", "childStartedAt", "harnessVersion", "meta"];
 export const PROBE_PROMPT = "Reply with exactly: PONG\n";
 const PROBE_TIMEOUT_MS = 120_000;
 const REBOOT_NOTE = "system rebooted since the job started";
@@ -482,6 +508,71 @@ export function updateRunning(file, patch, when = null) {
 
 const isTerminalNow = (file) => fs.existsSync(terminalFile(file)) || TERMINAL.has(readRecord(file)?.status);
 
+// ---------- the runner claim and the cleanup marker ----------
+// <record>.runner is created once, atomically and exclusively (link(2)), by the one runner a job ever gets; it names
+// that runner { pid, startedAt, bootId } and, once spawned, its harness { childPid, childStartedAt }. Only its creator
+// rewrites it, so it stays current after a terminal claim froze the record — which is what lets cancel and the
+// reaper find a harness the record never got to name. It is kept with the job: a second `__run`, now or later, can
+// never claim the job again. <record>.cleaned marks that the job's processes are known to be stopped (written by
+// the runner when it ends, or by cancel / the reaper / release-stale once they verified it); a terminal job without
+// it may still own a live tree.
+const runnerFile = (file) => `${file}.runner`;
+const cleanedFile = (file) => `${file}.cleaned`;
+
+function claimRunnerFile(file, claim) {
+  const tmp = tmpFile(runnerFile(file));
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(claim)}\n`, { flag: "wx", mode: 0o600 });
+    fs.linkSync(tmp, runnerFile(file));
+    return true;
+  } catch (error) {
+    if (error.code === "EEXIST") return false;
+    throw error;
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
+// The claimer's update of its own claim file (the only writer, so a rename suffices). A start time of its own that
+// could not be read at the claim is filled in once it can, so the runner does not stay `unknown` for its whole life.
+function updateRunnerFile(file, patch) {
+  const current = readJson(runnerFile(file));
+  if (current?.pid !== process.pid) return;
+  const late = current.startedAt ? {} : { startedAt: ownStart() };
+  try {
+    writeRecord(runnerFile(file), { ...current, ...late, ...patch });
+  } catch {
+    // best effort: the record keeps the same fields while the job runs
+  }
+}
+
+function markCleaned(file) {
+  try {
+    fs.writeFileSync(cleanedFile(file), `${new Date().toISOString()}\n`);
+  } catch {
+    // best effort: the next cancel or reaper pass verifies again
+  }
+}
+
+// A terminal job whose process tree is not known to be stopped: it had (or may have had) a runner and no
+// <record>.cleaned yet.
+export function cleanupPending(jobsDir, record) {
+  if (!record || !TERMINAL.has(record.status) || typeof record.id !== "string") return false;
+  const file = jobFile(jobsDir, record.id);
+  if (fs.existsSync(cleanedFile(file))) return false;
+  return fs.existsSync(runnerFile(file)) || Number.isInteger(record.runnerPid) || Number.isInteger(record.childPid);
+}
+
+// The pids of a job with the start times recorded next to them: from the runner's claim file when there is one (it
+// outlives a terminal claim), else from the record. Each pid is paired with the start time of the same source.
+function jobProcesses(jobsDir, record) {
+  const claim = readJson(runnerFile(jobFile(jobsDir, record.id)));
+  const pair = (pid, startedAt) => ({ pid: Number.isInteger(pid) && pid > 0 ? pid : null, startedAt: typeof startedAt === "string" ? startedAt : null });
+  const runner = Number.isInteger(claim?.pid) ? pair(claim.pid, claim.startedAt) : pair(record.runnerPid, record.runnerStartedAt);
+  const child = Number.isInteger(claim?.childPid) ? pair(claim.childPid, claim.childStartedAt) : pair(record.childPid, record.childStartedAt);
+  return { runner, child };
+}
+
 export function listRecords(jobsDir) {
   let names = [];
   try {
@@ -498,14 +589,18 @@ export function listRecords(jobsDir) {
 
 // Atomic id allocation: one number sequence per workspace, shared by every core prefix (ct-, oc-, pi-, dt-), and
 // the record created exclusively ("wx"), so parallel read-only tasks never share an id. The record starts as
-// `running` without a runner; startJob removes it again on a refusal (the id was never announced).
+// `running` without a runner; startJob removes it again on a refusal (the id was never announced). A number stays
+// taken while anything of its job is left — the record, its .terminal / .runner / .cleaned side files, the log, the
+// job dir — not only the record: a record removed alone (by hand, or by a prune) must not hand its stale runner claim
+// or cleanup marker to a new job under the same id.
+const TRACE_NAME_RE = /^([a-z]{2})-(\d{4,})(?=$|\.)/;
 export function allocateJob(jobsDir, prefix, fields) {
   if (!/^[a-z]{2}$/.test(prefix ?? "") || FOREIGN_PREFIXES.has(prefix)) throw new Error(`invalid job id prefix: ${prefix}`);
   fs.mkdirSync(jobsDir, { recursive: true });
   for (let attempt = 0; attempt < 1000; attempt += 1) {
     const used = fs
       .readdirSync(jobsDir)
-      .map((name) => RECORD_NAME_RE.exec(name))
+      .map((name) => TRACE_NAME_RE.exec(name))
       .filter((match) => match && !FOREIGN_PREFIXES.has(match[1]))
       .map((match) => Number(match[2]));
     const id = formatId(prefix, 1 + Math.max(0, ...used));
@@ -524,7 +619,7 @@ export function allocateJob(jobsDir, prefix, fields) {
 function discardJob(jobsDir, id) {
   fs.rmSync(logFile(jobsDir, id), { force: true });
   fs.rmSync(jobDir(jobsDir, id), { recursive: true, force: true });
-  fs.rmSync(terminalFile(jobFile(jobsDir, id)), { force: true });
+  for (const side of [terminalFile, runnerFile, cleanedFile]) fs.rmSync(side(jobFile(jobsDir, id)), { force: true });
   fs.rmSync(jobFile(jobsDir, id), { force: true });
 }
 
@@ -592,7 +687,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // on macOS (no /proc there) and Linux (spec §3.10).
 export function processTable() {
   for (const ps of ["ps", "/bin/ps"]) {
-    const r = spawnSync(ps, ["-A", "-o", "pid=,ppid=,pgid="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+    const r = spawnSync(ps, ["-A", "-o", "pid=,ppid=,pgid="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: PS_TIMEOUT_MS, killSignal: "SIGKILL" });
     if (r.error || r.status !== 0) continue;
     const rows = [];
     for (const line of r.stdout.split("\n")) {
@@ -636,11 +731,57 @@ export function treeGroups(roots, table) {
 const ownPgid = (table) => table?.find((row) => row.pid === process.pid)?.pgid ?? null;
 const rootList = (roots) => (Array.isArray(roots) ? roots : [roots]).filter((pgid) => Number.isInteger(pgid) && pgid > 1);
 
-// The start time of a process (`ps -o lstart=`, in the C locale so that every caller reads the same text), or null.
-export function processStart(pid) {
+// The start time of a process: an identity that stays the same for the whole life of the process, whoever reads it.
+//   Linux: `ticks:<n>`, field 22 of /proc/<pid>/stat — the start in clock ticks since boot (10 ms), fixed when the
+//     process is created. Not `ps -o lstart`: procps recomputes lstart on every call as /proc/stat btime + those
+//     ticks, and btime moves with every step of the wall clock (NTP, a VM or WSL resync after sleep, `date -s`), after
+//     which every live process would read as another one.
+//   elsewhere (macOS): `ps -o lstart=` in the C locale and in UTC, so that every caller — a runner, a later cancel
+//     from another shell or time zone — reads the same text. macOS keeps the start as a wall-clock time stored at
+//     fork, so a clock step does not change it. Its resolution is one second: a pid reused within the second it was
+//     freed passes as the same process.
+// `like` is a stored start time this one is to be compared with: it is read in that one's format (a value recorded
+// on another platform, or by an older core, is never compared with text of another kind). Null when it cannot be read.
+const TICKS_PREFIX = "ticks:";
+
+export function processStart(pid, { like = null } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
+  if (process.env[TEST_PS_START_VAR] === "unavailable") return null;
+  const stored = typeof like === "string" && like !== "";
+  if (stored ? like.startsWith(TICKS_PREFIX) : process.platform === "linux") {
+    const ticks = procStartTicks(pid);
+    if (ticks !== null) return `${TICKS_PREFIX}${ticks}`;
+    if (stored) return null; // a recorded tick count is compared with nothing else
+    // A Linux without a readable /proc: lstart, the next best (such a value is compared as lstart from then on).
+  }
+  return psStart(pid);
+}
+
+// Field 22 (starttime) of a /proc/<pid>/stat line, or null. The command name (field 2) is in parentheses and may
+// itself hold spaces and parentheses, so the fields are counted after its last ")" (field 3 onward).
+export function parseProcStat(text) {
+  const close = String(text ?? "").lastIndexOf(")");
+  if (close < 0) return null;
+  const value = String(text).slice(close + 1).trim().split(/\s+/)[22 - 3];
+  return /^\d+$/.test(value ?? "") ? value : null;
+}
+
+function procStartTicks(pid) {
+  try {
+    return parseProcStat(fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function psStart(pid) {
   for (const ps of ["ps", "/bin/ps"]) {
-    const r = spawnSync(ps, ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: { ...process.env, LC_ALL: "C", LANG: "C" } });
+    const r = spawnSync(ps, ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+      timeout: PS_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
     if (r.error) continue;
     const text = (r.stdout ?? "").trim().replace(/\s+/g, " ");
     return r.status === 0 && text ? text : null;
@@ -648,21 +789,51 @@ export function processStart(pid) {
   return null;
 }
 
+let ownStartCache = null;
+// This process's own start time, as others will read it (processStart); null while it cannot be read (asked again
+// on the next call).
+export function ownStart() {
+  if (ownStartCache === null) ownStartCache = processStart(process.pid);
+  return ownStartCache;
+}
+
+// What a stored { pid, startedAt } names now. Every decision on a stored pid goes through this first:
+//   ours    — the pid lives with the start time recorded for it;
+//   foreign — the pid lives with another start time: the recorded process ended and the pid was reused;
+//   unknown — the pid lives, but its start time cannot be read now or was never recorded: it may be ours, so it is
+//             neither signalled nor treated as gone;
+//   gone    — no process has the pid.
+export function processIdentity(pid, startedAt) {
+  if (!Number.isInteger(pid) || pid <= 1 || !isAlive(pid)) return "gone";
+  if (typeof startedAt !== "string" || startedAt === "") return "unknown";
+  const now = processStart(pid, { like: startedAt });
+  if (now === null) return isAlive(pid) ? "unknown" : "gone";
+  return now === startedAt ? "ours" : "foreign";
+}
+
+// Why a pid that is "unknown" was not signalled: its start time is unreadable now, or none was recorded.
+const unconfirmedNote = (startedAt) =>
+  typeof startedAt === "string" && startedAt !== ""
+    ? "not signalled: it is alive, but its start time cannot be read to confirm it is the job's"
+    : "not signalled: it is alive, but no start time was recorded for it to confirm it is the job's";
+
+// A stored pid that may still be the process it was recorded for.
+const possiblyOurs = (state) => state === "ours" || state === "unknown";
+
 // Whether a harness process group recorded as { pgid, startedAt } is still the job's, before anything signals it by
 // that stored id (spec §3.6 А8: the tree widens zcode-dispatch's group-only kill, so a stale id must not reach a
 // stranger):
 //   ours    — the leader lives with the start time recorded at spawn, or the leader is gone but the group still has
 //             members (POSIX reuses no process group id while its group exists);
-//   foreign — the leader's pid lives with another start time (or one that cannot be read): the group ended and the
-//             pid now belongs to another process;
+//   foreign — the leader's pid lives with another start time: the group ended and the pid now belongs to another
+//             process;
+//   unknown — the leader's pid lives, but its start time cannot be read (or was never recorded): never signalled,
+//             and never released as gone (release-stale, the reaper's cleanup);
 //   gone    — neither the leader nor any member is left.
 export function harnessGroupState(pgid, startedAt) {
   if (!Number.isInteger(pgid) || pgid <= 1) return "gone";
-  if (isAlive(pgid)) {
-    const now = processStart(pgid);
-    if (now !== null) return typeof startedAt === "string" && now === startedAt ? "ours" : "foreign";
-    if (isAlive(pgid)) return "foreign"; // alive but unreadable: never signal on a guess
-  }
+  const leader = processIdentity(pgid, startedAt);
+  if (leader !== "gone") return leader;
   return groupAlive(pgid) ? "ours" : "gone";
 }
 
@@ -730,6 +901,33 @@ export function killTreeSync(roots, signal = "SIGKILL", { exclude = [] } = {}) {
   return groups;
 }
 
+// The process groups of everything a live process started, except its own group: a runner's harness and the
+// auxiliary commands of boundedExec (each leads a group of its own below the runner's supervisor). Callers verify
+// the pid's identity first (processIdentity) — the snapshot follows ppid links of whoever holds the pid now.
+function descendantGroupsOf(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return [];
+  const table = processTable() ?? [];
+  const own = table.find((row) => row.pid === pid)?.pgid ?? pid;
+  const children = new Map();
+  for (const row of table) {
+    if (!children.has(row.ppid)) children.set(row.ppid, []);
+    children.get(row.ppid).push(row);
+  }
+  const groups = new Set();
+  const seen = new Set();
+  const queue = [pid];
+  while (queue.length > 0) {
+    const next = queue.pop();
+    if (seen.has(next)) continue;
+    seen.add(next);
+    for (const child of children.get(next) ?? []) {
+      if (child.pgid > 1 && child.pgid !== own) groups.add(child.pgid);
+      queue.push(child.pid);
+    }
+  }
+  return [...groups];
+}
+
 // ---------- boot identity: pids recorded in an earlier boot belong to nobody of ours ----------
 // After a reboot the runnerPid / childPid / holderPid in the state files may name unrelated processes. Records and
 // reservations store the boot id they were written in (kern.bootsessionuuid on macOS,
@@ -743,7 +941,7 @@ let currentBootId;
 
 function readBootId() {
   if (process.platform === "darwin") {
-    const r = spawnSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], { encoding: "utf8" });
+    const r = spawnSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], { encoding: "utf8", timeout: PS_TIMEOUT_MS, killSignal: "SIGKILL" });
     const id = r.stdout?.trim();
     if (!r.error && r.status === 0 && id) return id;
   } else if (process.platform === "linux") {
@@ -828,8 +1026,11 @@ function refuseUnavailableReservation(jobsDir, workspaceRoot) {
   }
   if (readJson(`${file}.released`)?.token === record.token) return;
   const rebooted = bootOf(record.bootId) === "earlier";
-  if (!rebooted && isAlive(record.holderPid)) reservationGuard(record);
-  const reason = rebooted ? "the system rebooted since it was taken" : `runner pid ${record.holderPid} is not alive`;
+  const holder = rebooted ? "gone" : processIdentity(record.holderPid, record.holderStartedAt);
+  if (possiblyOurs(holder)) reservationGuard(record);
+  const reason = rebooted
+    ? "the system rebooted since it was taken"
+    : `runner pid ${record.holderPid} is not alive${holder === "foreign" ? " (the pid now belongs to another process)" : ""}`;
   throw new UsageError(
     `workspace reservation generation ${generation} is stale (${reason}); run ${CLI_NAME} release-stale --cwd ${JSON.stringify(workspaceRoot)}`,
   );
@@ -849,14 +1050,15 @@ function createReservation(file, reservation) {
   }
 }
 
-// Hands the reservation to the runner. The task process is the only writer of its generation file, so a temp file
-// renamed over it replaces it atomically, flushed before the rename.
-function updateReservation(file, token, holderPid) {
+// Hands the reservation to the runner, with the runner's start time (its identity for every later liveness check).
+// The task process is the only writer of its generation file, so a temp file renamed over it replaces it
+// atomically, flushed before the rename.
+function updateReservation(file, token, holderPid, holderStartedAt = null) {
   const current = readJson(file);
   if (current?.token !== token) return false;
   const temp = `${file}.tmp-${process.pid}-${randomUUID()}`;
   try {
-    fs.writeFileSync(temp, `${JSON.stringify({ ...current, holderPid })}\n`, { flag: "wx", mode: 0o600, flush: true });
+    fs.writeFileSync(temp, `${JSON.stringify({ ...current, holderPid, holderStartedAt })}\n`, { flag: "wx", mode: 0o600, flush: true });
     fs.renameSync(temp, file);
   } finally {
     fs.rmSync(temp, { force: true });
@@ -879,58 +1081,110 @@ function acquireReservation(jobsDir, jobId, workspaceRoot) {
     if (current) refuseUnavailableReservation(jobsDir, workspaceRoot);
 
     const file = reservationFile(jobsDir, generation);
-    const reservation = { holderPid: process.pid, jobId, token: randomUUID(), generation, createdAt: new Date().toISOString(), bootId: bootId() };
+    const reservation = { holderPid: process.pid, holderStartedAt: ownStart(), jobId, token: randomUUID(), generation, createdAt: new Date().toISOString(), bootId: bootId() };
     if (createReservation(file, reservation)) return { file, token: reservation.token };
     // Another task created this generation. Re-read the highest generation before deciding.
   }
 }
 
+// The runner waits (briefly) until the task process has handed the reservation over to it. A previous holder that
+// is gone, or whose pid now belongs to another process, will never hand it over.
 async function claimRunnerReservation(file, jobId, token) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const current = readJson(file);
     if (current?.token !== token || current.jobId !== jobId) return false;
     if (current.holderPid === process.pid) return true;
-    if (!isAlive(current.holderPid)) return false;
+    if (!possiblyOurs(processIdentity(current.holderPid, current.holderStartedAt))) return false;
     await sleep(10);
   }
   return false;
 }
 
-// Liveness check: no record is ever left `running` with a dead runner.
-export function reapDeadRunners(jobsDir) {
+const FOREIGN_NOTE = "not signalled: its leader pid now belongs to another process";
+
+// Liveness check: no record is ever left `running` with a dead runner, and a terminal job whose runner died before
+// its process tree was stopped (cleanupPending) gets that tree stopped here. A runner counts as dead only when its
+// pid is gone or provably reused (processIdentity: foreign); one that may still be ours (unknown) keeps its job. The
+// reaper's tool is one SIGKILL to the harness tree, and only to a group that is provably the job's. `except` names a
+// job whose pending cleanup the caller resumes itself (cancel, with the adapter's ladder). Returns what it did:
+// [{ id, action, groups? }].
+export function reapDeadRunners(jobsDir, { except = null } = {}) {
+  const done = [];
   for (const record of listRecords(jobsDir)) {
-    if (record.status !== "running") continue;
     const file = jobFile(jobsDir, record.id);
+    const log = logFile(jobsDir, record.id);
     const boot = bootOf(record.bootId);
-    if (boot === "earlier") {
-      // Its runnerPid / childPid may now be unrelated processes: finalize without any signal.
-      const after = finalizeRecord(file, { status: "failed", errorClass: "crash", note: REBOOT_NOTE });
-      if (after?.note === REBOOT_NOTE) appendLog(logFile(jobsDir, record.id), `${REBOOT_NOTE}; liveness check marked the job failed/crash, no process signalled`);
-      continue;
-    }
-    if (record.runnerPid == null) {
-      if (Date.now() - Date.parse(record.startedAt) > STARTUP_GRACE_MS) {
-        finalizeRecord(file, { status: "failed", errorClass: "crash", note: "runner never started" });
+    if (record.status !== "running") {
+      if (record.id !== except && cleanupPending(jobsDir, record)) {
+        const resumed = resumeCleanupSync(jobsDir, record, boot, log);
+        if (resumed) done.push({ id: record.id, ...resumed });
       }
       continue;
     }
-    if (isAlive(record.runnerPid)) continue;
+    if (boot === "earlier") {
+      // Its runnerPid / childPid may now be unrelated processes: finalize without any signal.
+      const after = finalizeRecord(file, { status: "failed", errorClass: "crash", note: REBOOT_NOTE });
+      if (after?.note === REBOOT_NOTE) appendLog(log, `${REBOOT_NOTE}; liveness check marked the job failed/crash, no process signalled`);
+      markCleaned(file); // nothing of a job outlives a reboot
+      done.push({ id: record.id, action: "rebooted" });
+      continue;
+    }
+    const procs = jobProcesses(jobsDir, record);
+    if (procs.runner.pid === null) {
+      if (Date.now() - Date.parse(record.startedAt) > STARTUP_GRACE_MS) {
+        finalizeRecord(file, { status: "failed", errorClass: "crash", note: "runner never started" });
+        done.push({ id: record.id, action: "never-started" });
+      }
+      continue;
+    }
+    const runner = processIdentity(procs.runner.pid, procs.runner.startedAt);
+    if (possiblyOurs(runner)) continue;
     // The harness outlives a dead runner; its group is signalled only while it is provably still the job's.
-    const group = boot === "current" && record.childPid ? harnessGroupState(record.childPid, record.childStartedAt) : null;
-    const killed = group === "ours" ? killTreeSync(record.childPid, "SIGKILL") : [];
+    const group = boot === "current" && procs.child.pid ? harnessGroupState(procs.child.pid, procs.child.startedAt) : null;
+    const killed = group === "ours" ? killTreeSync(procs.child.pid, "SIGKILL") : [];
     const after = finalizeRecord(file, { status: "failed", errorClass: "crash", note: "runner died" });
     if (after?.note === "runner died") {
-      const marked = "runner died; liveness check marked the job failed/crash";
+      const marked = `runner died${runner === "foreign" ? ` (pid ${procs.runner.pid} now belongs to another process)` : ""}; liveness check marked the job failed/crash`;
       appendLog(
-        logFile(jobsDir, record.id),
+        log,
         boot !== "current"
-          ? `${marked}; harness process group ${record.childPid} ${UNKNOWN_BOOT_NOTE}`
+          ? `${marked}; harness process group ${procs.child.pid} ${UNKNOWN_BOOT_NOTE}`
           : group === "foreign"
-            ? `${marked}; harness process group ${record.childPid} not signalled: its leader pid now belongs to another process`
-            : `${marked}${killed.length > 0 ? `; SIGKILL to process groups ${killed.join(",")}` : ""}`,
+            ? `${marked}; harness process group ${procs.child.pid} ${FOREIGN_NOTE}`
+            : group === "unknown"
+              ? `${marked}; harness process group ${procs.child.pid} ${unconfirmedNote(procs.child.startedAt)}`
+              : `${marked}${killed.length > 0 ? `; SIGKILL to process groups ${killed.join(",")}` : ""}`,
       );
     }
+    // A tree that was killed is confirmed gone by the next pass; one that cannot be confirmed stays pending.
+    if (boot === "current" && (group === null || group === "gone" || group === "foreign")) markCleaned(file);
+    done.push({ id: record.id, action: "runner-died", groups: killed });
   }
+  return done;
+}
+
+// The reaper's part of a pending cleanup (a terminal job, its tree not known to be stopped): nothing while the
+// runner may still live (it owns the stop) or while the boot cannot be confirmed; else one SIGKILL to a harness tree
+// that is provably the job's, and the marker once nothing of the job is left. Returns { action, groups } when it
+// signalled, else null.
+function resumeCleanupSync(jobsDir, record, boot, log) {
+  const file = jobFile(jobsDir, record.id);
+  if (boot === "earlier") {
+    markCleaned(file);
+    return null;
+  }
+  if (boot !== "current") return null; // nothing is signalled by a stored pid
+  const procs = jobProcesses(jobsDir, record);
+  const runner = processIdentity(procs.runner.pid, procs.runner.startedAt);
+  if (possiblyOurs(runner)) return null;
+  const group = harnessGroupState(procs.child.pid, procs.child.startedAt);
+  if (group === "ours") {
+    const killed = killTreeSync(procs.child.pid, "SIGKILL");
+    appendLog(log, `cleanup resumed: the job is ${record.status} but its runner pid ${procs.runner.pid} is gone and harness process group ${procs.child.pid} was alive; SIGKILL to process groups ${killed.join(",")}`);
+    return { action: "cleanup-resumed", groups: killed };
+  }
+  if (group === "gone" || group === "foreign") markCleaned(file);
+  return null;
 }
 
 // Allocation order of pending jobs: start time, then jobs dir and number as tie-breaks.
@@ -1257,17 +1511,167 @@ const readOnlyFs = {
   },
 };
 
-// Runs one short command (`--version`, `--help`, `auth status`): never through a shell, always with a timeout.
-function defaultExec(env) {
-  return (cmd, args = [], { timeoutMs = EXEC_TIMEOUT_MS, cwd, env: childEnv, input } = {}) => {
-    const r = spawnSync(cmd, args, { cwd, env: childEnv ?? filterEnv(env), input, encoding: "utf8", timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
-    return { status: r.status, signal: r.signal, stdout: r.stdout ?? "", stderr: r.stderr ?? "", error: r.error ?? null };
-  };
+// The supervisor of one auxiliary command (boundedExec), run as `node -e`. boundedExec starts it as the leader of a
+// session and process group of its own, and the command runs in that group: a SIGKILL to the caller's group (a
+// runner's) does not reach them, and the supervisor, which watches its caller, then stops the command itself. It sends
+// SIGTERM to the group at the deadline — or once the stop file exists (a runner's terminal claim), its caller is gone,
+// or it is signalled itself — and, while the command still runs after the grace, gives up on it: the caller SIGKILLs
+// the group, which is also how everything the command left in it is ended once the command is done. A supervisor
+// whose caller is gone SIGKILLs the group itself (this process included). It prints one JSON result and never waits on
+// the command beyond deadline + grace, whatever the command does with its signals or its pipes. Its config arrives on
+// stdin (the command's environment must not show in argv); argv repeats the command for ps. Should it not lead its
+// group after all (a Node without spawnSync's `detached`), the command gets a group of its own instead, as `pgid` on
+// stderr tells the caller.
+const EXEC_SUPERVISOR = String.raw`
+"use strict";
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const cfg = JSON.parse(fs.readFileSync(0, "utf8"));
+const parent = process.ppid;
+let leader = true;
+try { process.kill(-process.pid, 0); } catch { leader = false; }
+const chunks = { stdout: [], stderr: [] };
+const sizes = { stdout: 0, stderr: 0 };
+let child = null, pgid = leader ? process.pid : null, status = null, signal = null, error = null;
+let exited = false, timedOut = false, stopped = false, stopping = false, done = false, killTimer = null, closeTimer = null, poll = null;
+const callerGone = () => process.ppid !== parent;
+const failure = (e) => ({ code: typeof e.code === "string" ? e.code : null, errno: e.errno, detail: typeof e.code === "string" ? null : String(e.message) });
+const signalGroup = (sig) => { if (pgid) { try { process.kill(-pgid, sig); } catch {} } };
+const abandon = () => { signalGroup("SIGKILL"); process.exit(1); }; // a leader's SIGKILL ends this process too
+const finish = () => {
+  if (done) return;
+  done = true;
+  clearInterval(poll); clearTimeout(killTimer); clearTimeout(closeTimer);
+  if (callerGone()) return abandon();
+  for (const s of [child && child.stdout, child && child.stderr]) if (s) s.destroy();
+  if (child && child.pid && !exited) signal = "SIGKILL"; // still running: the caller's SIGKILL to the group ends it
+  const text = (k) => Buffer.concat(chunks[k]).toString("utf8");
+  const result = JSON.stringify({ status, signal, stdout: text("stdout"), stderr: text("stderr"), error, timedOut, stopped });
+  process.stdout.on("error", abandon);
+  process.stdout.write(result, () => process.exit(0));
+};
+const stop = (why) => {
+  if (stopping || done || !child || !child.pid) return;
+  stopping = true;
+  if (why === "timeout") { timedOut = true; error = { code: "ETIMEDOUT" }; }
+  else { stopped = true; error = { code: "ECANCELED", detail: "stopped: " + why }; }
+  signalGroup("SIGTERM"); // a leader gets it too: the handler below ignores a SIGTERM while stopping
+  killTimer = setTimeout(() => (callerGone() ? abandon() : finish()), cfg.graceMs);
+};
+for (const s of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(s, () => { if (s !== "SIGTERM" || !stopping) abandon(); });
+try {
+  const input = cfg.inputBase64 != null ? Buffer.from(cfg.inputBase64, "base64") : cfg.input;
+  child = spawn(cfg.cmd, cfg.args, { cwd: cfg.cwd || undefined, env: cfg.env, detached: !leader, stdio: ["pipe", "pipe", "pipe"] });
+  if (child.pid && !leader) pgid = child.pid;
+  if (pgid) process.stderr.write("pgid " + pgid + "\n"); // for the caller, should this supervisor be killed
+  child.on("error", (e) => { error = failure(e); finish(); });
+  for (const k of ["stdout", "stderr"]) {
+    child[k].on("data", (chunk) => {
+      sizes[k] += chunk.length;
+      if (sizes[k] > cfg.maxBuffer) {
+        if (!error) error = { code: "ENOBUFS" };
+        try { child.kill("SIGKILL"); } catch {}
+        return finish();
+      }
+      chunks[k].push(chunk);
+    });
+  }
+  child.stdin.on("error", () => {});
+  child.stdin.end(input == null ? "" : input);
+  child.on("exit", (code, sig) => { exited = true; status = code; signal = sig; if (!closeTimer) closeTimer = setTimeout(finish, 200); });
+  child.on("close", (code, sig) => { exited = true; if (status === null && signal === null) { status = code; signal = sig; } finish(); });
+  const deadline = cfg.timeoutMs > 0 ? Date.now() + cfg.timeoutMs : Infinity;
+  poll = setInterval(() => {
+    if (callerGone()) stop("its caller is gone");
+    else if (Date.now() >= deadline) stop("timeout");
+    else if (cfg.stopFile && fs.existsSync(cfg.stopFile)) stop("the job was cancelled");
+  }, 50);
+} catch (e) {
+  error = failure(e);
+  finish();
+}
+`;
+
+// Node's error of a failed spawnSync (code, errno, syscall, path, spawnargs; message `spawnSync <cmd> <code>`), which
+// ctx.exec has always returned.
+function execError(code, cmd, args, { errno = null, detail = null } = {}) {
+  const number = Number.isInteger(errno) ? errno : os.constants.errno[code] ? -os.constants.errno[code] : undefined;
+  return Object.assign(new Error(`spawnSync ${cmd} ${code}${detail ? ` (${detail})` : ""}`), {
+    ...(number !== undefined ? { errno: number } : {}),
+    code,
+    syscall: `spawnSync ${cmd}`,
+    path: cmd,
+    spawnargs: args,
+  });
 }
 
-// The ctx handed to adapter hooks. Tests inject `exec` and `fs`.
-export function makeCtx({ env = process.env, profile = {}, profileName = null, exec, fs: fsApi, ...rest } = {}) {
-  return { env, profile, profileName, platform: process.platform, paths: dataPaths(env), exec: exec ?? defaultExec(env), fs: fsApi ?? readOnlyFs, ...rest };
+// Runs one short auxiliary command (`--version`, `--help`, `auth status`, an export) synchronously, never through a
+// shell, under a hard deadline: the command runs in a session and process group of its own, led by its supervisor (so
+// a cancel that finds a stuck runner reaches it among the runner's descendants, and a SIGKILL to the runner's group
+// does not orphan it), gets SIGTERM at timeoutMs and SIGKILL graceMs later, and is stopped the same way once
+// `stopFile` exists or the caller is gone; anything it leaves in its group is SIGKILLed when it is done. It has no
+// controlling terminal, so it is not for a command that prompts on one. A plain spawnSync timeout only sends SIGTERM
+// and then waits for as long as the command ignores it. spawnSync's calling convention otherwise: `timeoutMs` 0 or
+// null is no deadline (a stop file and the caller's death still end the command); `input` is a string, a Buffer or a
+// typed array. Returns { status, signal, stdout, stderr, error, timedOut, stopped }; error is spawnSync's (code, errno,
+// syscall, path, spawnargs) with code ETIMEDOUT after the deadline, ECANCELED after a stop, ENOBUFS beyond maxBuffer,
+// the spawn error's (ENOENT, …) otherwise, or ESUPERVISOR when the supervisor itself failed.
+export function boundedExec(cmd, args = [], { timeoutMs = EXEC_TIMEOUT_MS, graceMs = EXEC_GRACE_MS, cwd, env = process.env, input, stopFile = null, maxBuffer = EXEC_MAX_BUFFER } = {}) {
+  const argv = (Array.isArray(args) ? args : []).map(String);
+  const ms = (value, fallback, min) => (typeof value === "number" && Number.isFinite(value) ? Math.min(Math.max(min, value), MAX_TIMER_MS) : fallback);
+  const binary = ArrayBuffer.isView(input);
+  const config = {
+    cmd: String(cmd),
+    args: argv,
+    cwd: cwd ?? null,
+    env,
+    input: binary || input == null ? null : String(input),
+    inputBase64: binary ? Buffer.from(input.buffer, input.byteOffset, input.byteLength).toString("base64") : null,
+    timeoutMs: timeoutMs === null || timeoutMs === 0 ? 0 : ms(timeoutMs, EXEC_TIMEOUT_MS, 1),
+    graceMs: ms(graceMs, EXEC_GRACE_MS, 0),
+    stopFile,
+    maxBuffer,
+  };
+  const r = spawnSync(process.execPath, ["-e", EXEC_SUPERVISOR, `${CLI_NAME}-exec`, config.cmd, ...argv], {
+    input: JSON.stringify(config),
+    encoding: "utf8",
+    env: { PATH: process.env.PATH ?? "" }, // the supervisor itself needs nothing; NODE_OPTIONS must not reach it
+    detached: true, // setsid: the supervisor leads the command's group (see EXEC_SUPERVISOR)
+    timeout: config.timeoutMs > 0 ? config.timeoutMs + config.graceMs + EXEC_MARGIN_MS : undefined,
+    killSignal: "SIGKILL",
+    maxBuffer: 16 * maxBuffer,
+  });
+  // What is left in the command's group — the command itself after a stop that outlasted its grace, what it started
+  // there, or all of it when the supervisor died — goes now: the announced group, else the supervisor's own (it leads
+  // the group from its start, before it could announce anything). A group id is not reused while the group has
+  // members, so groupAlive() makes the signal safe.
+  const announced = Number(/^pgid (\d+)$/m.exec(r.stderr ?? "")?.[1]);
+  const pgid = Number.isInteger(announced) ? announced : r.pid;
+  if (groupAlive(pgid)) killGroup(pgid, "SIGKILL");
+  let res = null;
+  try {
+    res = JSON.parse(r.stdout ?? "");
+  } catch {
+    res = null;
+  }
+  if (!isObject(res)) {
+    const why = r.error?.code ?? (r.signal ? `signal ${r.signal}` : `exit ${r.status}`);
+    return { status: null, signal: null, stdout: "", stderr: "", error: execError("ESUPERVISOR", config.cmd, argv, { detail: `its supervisor failed: ${why}` }), timedOut: false, stopped: false };
+  }
+  const code = typeof res.error?.code === "string" ? res.error.code : "ESUPERVISOR"; // a failure without a code of its own
+  const error = isObject(res.error) ? execError(code, config.cmd, argv, { errno: res.error.errno, detail: res.error.detail ?? null }) : null;
+  return { status: res.status ?? null, signal: res.signal ?? null, stdout: res.stdout ?? "", stderr: res.stderr ?? "", error, timedOut: res.timedOut === true, stopped: res.stopped === true };
+}
+
+function defaultExec(env, { stopFile = null } = {}) {
+  return (cmd, args = [], { timeoutMs = EXEC_TIMEOUT_MS, graceMs = EXEC_GRACE_MS, cwd, env: childEnv, input } = {}) =>
+    boundedExec(cmd, args, { timeoutMs, graceMs, cwd, env: childEnv ?? filterEnv(env), input, stopFile });
+}
+
+// The ctx handed to adapter hooks. Tests inject `exec` and `fs`. `stopFile`: a file whose appearance stops the
+// default exec's command (a runner passes its job's terminal claim).
+export function makeCtx({ env = process.env, profile = {}, profileName = null, exec, fs: fsApi, stopFile = null, ...rest } = {}) {
+  return { env, profile, profileName, platform: process.platform, paths: dataPaths(env), exec: exec ?? defaultExec(env, { stopFile }), fs: fsApi ?? readOnlyFs, ...rest };
 }
 
 function launchError(message) {
@@ -1632,7 +2036,8 @@ async function startJobUnredacted({ adapter, profileName, profile, role, write, 
   const log = logFile(ws.jobsDir, id);
   let reservation = null;
   let handedOff = false;
-  let announced = false; // a runner exists: from here on the job is finalized, never discarded
+  let announced = false; // a runner may exist: from here on the job is finalized, never discarded
+  let spawned = false; // a runner process was started
   try {
     const record = updateRunning(file, {
       sessionId: prev ? prev.sessionId : newSessionId(adapter, id),
@@ -1679,7 +2084,7 @@ async function startJobUnredacted({ adapter, profileName, profile, role, write, 
     }
     appendLog(log, `task ${id}: profile ${profileName} harness ${adapter.id} write=${write ? "yes" : "no"}${prev ? ` resumeOf=${prev.id}` : ""}`);
     const logFd = fs.openSync(log, "a");
-    let runner;
+    let runner = null;
     try {
       announced = true;
       // The runner works in the workspace root: a relative state dir is handed over resolved, so its data root
@@ -1694,7 +2099,8 @@ async function startJobUnredacted({ adapter, profileName, profile, role, write, 
       fs.closeSync(logFd);
     }
     if (!runner.pid) throw new Error(`failed to start the runner for ${id}`);
-    if (reservation && !updateReservation(reservation.file, reservation.token, runner.pid)) {
+    spawned = true;
+    if (reservation && !updateReservation(reservation.file, reservation.token, runner.pid, processStart(runner.pid))) {
       throw new Error(`workspace reservation was lost before the runner started for ${id}`);
     }
     runner.unref();
@@ -1703,7 +2109,11 @@ async function startJobUnredacted({ adapter, profileName, profile, role, write, 
   } catch (error) {
     if (!handedOff) {
       if (!announced && error instanceof UsageError) discardJob(ws.jobsDir, id); // refused: no trace, no job
-      else finalizeRecord(file, { status: "failed", errorClass: "launch", note: error.message });
+      else {
+        // The note is stored: it passes the redactor like the error itself (the key may be known by now).
+        finalizeRecord(file, { status: "failed", errorClass: "launch", note: redact(error?.message ?? String(error)) });
+        if (!spawned) markCleaned(file); // no runner, no harness: nothing to stop (a spawned runner marks it itself)
+      }
     }
     throw error;
   } finally {
@@ -1713,20 +2123,40 @@ async function startJobUnredacted({ adapter, profileName, profile, role, write, 
 
 // ---------- the runner (the CLI's RUN_VERB) ----------
 
+// Tests only (TEST_RUN_BARRIER_VAR): park between the pre-claim check and the claim until the barrier file exists.
+async function runBarrier(env) {
+  const barrier = env[TEST_RUN_BARRIER_VAR];
+  if (!barrier) return;
+  fs.writeFileSync(`${barrier}.ready-${process.pid}`, "");
+  for (const deadline = Date.now() + 30_000; !fs.existsSync(barrier) && Date.now() < deadline;) await sleep(10);
+}
+
 export async function runJob({ id, jobsDir, token, adapters = {}, env = process.env, ctx: ctxOverrides = {} }) {
   if (!isCoreJobId(id ?? "") || !jobsDir || !token) throw new UsageError(`usage: ${CLI_NAME} ${RUN_VERB} <id> <jobs-dir> <reservation-token|-> (internal)`);
   const file = jobFile(jobsDir, id);
   const log = logFile(jobsDir, id);
-  // One runner per job: only a job without a runner can be claimed, so a second `__run` (by hand, or duplicated)
-  // never starts a second harness and never touches the job's record, key or reservation.
-  const record = updateRunning(file, { runnerPid: process.pid }, (current) => current.runnerPid == null || current.runnerPid === process.pid);
-  if (!record) {
-    const current = readRecord(file);
-    if (current?.status !== "running") return 0; // cancelled (or otherwise terminal) before the runner started
-    appendLog(log, `${RUN_VERB} refused for ${id} in pid ${process.pid}: runner pid ${current.runnerPid} owns the job`);
+  const refuse = (owner) => {
+    appendLog(log, `${RUN_VERB} refused for ${id} in pid ${process.pid}: runner pid ${owner ?? "?"} owns the job`);
     return 1;
+  };
+  // One runner per job: the claim file is created exclusively (claimRunnerFile), so of two `__run` (by hand, or
+  // duplicated) racing for one job exactly one wins; the other never starts a harness and never touches the job's
+  // record, key or reservation. A record that already names another runner is refused without a try.
+  const before = readRecord(file);
+  if (!before) return 0; // no such job (startJob discards a job only before it spawns a runner)
+  if (before.status === "running" && before.runnerPid != null && before.runnerPid !== process.pid) return refuse(before.runnerPid);
+  await runBarrier(env);
+  if (!claimRunnerFile(file, { pid: process.pid, startedAt: ownStart(), bootId: bootId(), claimedAt: new Date().toISOString() })) {
+    return refuse(readJson(runnerFile(file))?.pid); // the job has (or had) its runner, which also finishes it
   }
+  // The job is this runner's from here on, whatever its record says: every way out releases the reservation handed
+  // to it (only its holder can, so nobody else's), removes the key and marks the cleanup done.
   const lock = token === "-" ? null : reservationFileForToken(jobsDir, token);
+  let reserved = null;
+  const holdReservation = async () => {
+    if (reserved === null) reserved = Boolean(lock) && (await claimRunnerReservation(lock, id, token));
+    return reserved;
+  };
   let redact = redactor();
   const fail = (errorClass, note) => {
     const text = redact(note);
@@ -1736,7 +2166,15 @@ export async function runJob({ id, jobsDir, token, adapters = {}, env = process.
   };
   const failClass = (error) => (ERROR_CLASSES.includes(error?.errorClass) ? error.errorClass : "launch");
   try {
-    if (token !== "-" && (!lock || !(await claimRunnerReservation(lock, id, token)))) return fail("launch", "workspace reservation was lost before the runner started");
+    const current = readRecord(file);
+    const record = current?.status === "running" ? updateRunning(file, { runnerPid: process.pid, runnerStartedAt: ownStart() }) : null;
+    if (!record) {
+      // Cancelled (or otherwise finished) before this runner started: nothing to run, but the reservation it was
+      // handed is still released below.
+      appendLog(log, `runner pid ${process.pid}: job ${id} is ${readRecord(file)?.status} already; nothing started`);
+      return 0;
+    }
+    if (token !== "-" && (!lock || !(await holdReservation()))) return fail("launch", "workspace reservation was lost before the runner started");
     const adapter = adapters[record.harness];
     if (!adapter) return fail("launch", `no adapter for harness ${record.harness}`);
     let secret = null;
@@ -1746,14 +2184,15 @@ export async function runJob({ id, jobsDir, token, adapters = {}, env = process.
       redact = redactor([secret]);
     }
     const profile = isObject(record.profileConfig) ? record.profileConfig : {};
-    const ctx = makeCtx({ env, profile, profileName: record.profile, ...ctxOverrides });
+    // ctx.exec's commands (discover, the help check, finalize's export) stop once the job is claimed terminal.
+    const ctx = makeCtx({ env, profile, profileName: record.profile, stopFile: terminalFile(file), ...ctxOverrides });
     let harness;
     try {
       harness = await discoverHarness(adapter, ctx);
     } catch (error) {
       return fail(failClass(error), error?.message ?? String(error));
     }
-    if (harness) updateRunning(file, { harnessVersion: harness.version });
+    if (harness) updateRunning(file, { harnessVersion: typeof harness.version === "string" ? redact(harness.version) : null });
     const req = requestOf(record, profile, harness, jobsDir);
     let plan;
     let run;
@@ -1782,6 +2221,9 @@ export async function runJob({ id, jobsDir, token, adapters = {}, env = process.
       ladder,
       exclude: [process.pid],
       onSpawn: (pid, { startedAt }) => {
+        // First the claim file, which a terminal claim does not freeze: if this runner dies from here on, cancel and
+        // the reaper still find the harness by its verified identity.
+        updateRunnerFile(file, { childPid: pid, childStartedAt: startedAt });
         dropSecret(jobsDir, id); // the key now lives only in the harness's environment
         if (updateRunning(file, { childPid: pid, childStartedAt: startedAt })) return null;
         return stopLabel(); // claimed terminal (cancelled) before the harness started
@@ -1839,7 +2281,10 @@ export async function runJob({ id, jobsDir, token, adapters = {}, env = process.
     return fail("crash", `runner error: ${error?.message ?? error}`);
   } finally {
     dropSecret(jobsDir, id);
-    if (lock) releaseReservation(lock, token);
+    if (lock && (await holdReservation())) releaseReservation(lock, token);
+    // runCli has returned (the harness exited and its tree was stopped) or never ran; auxiliary commands are
+    // synchronous and bounded: nothing of the job is left to stop.
+    markCleaned(file);
   }
 }
 
@@ -1871,25 +2316,42 @@ export async function runProbe({
   const dir = fs.mkdtempSync(path.join(base, `${profileName}-`));
   try {
     const ctx = makeCtx({ env, profile, profileName, ...ctxOverrides });
-    const harness = await discoverHarness(adapter, ctx);
     const promptPath = path.join(dir, "prompt.md");
     writePrivateFile(promptPath, prompt);
-    const req = jobLessRequest({
+    const base = jobLessRequest({
       profile,
       profileName,
       dir,
       cwd: cwd ? path.resolve(cwd) : dir,
       promptPath,
       promptBytes: Buffer.byteLength(prompt),
-      harness,
+      harness: null,
       sessionId: adapter.manifest?.sessionId === "preassign" ? randomUUID() : null,
     });
-    const plan = await planInvocation(adapter, req, ctx, { probe: true });
-    let secret = null;
-    if (plan.secretEnv.length > 0) {
-      secret = await resolveKey(resolveSecret, profileName, plan.secretEnv);
-      redact.add(secret);
+    // The key before discovery, as a job's runner has it (spec §3.5): discover() and the help check run commands
+    // whose diagnostics end up in errors, and the redactor must know the key by then. A job-less plan says whether the
+    // adapter asks for one: invocation() with req.harness null, exactly as startJob calls it (the contract), not
+    // probe(), which has only ever been called with the harness known. A profile.env clash is refused before the key
+    // source is read. Should invocation() fail without the harness after all, the key waits for the plan below.
+    let draft = null;
+    try {
+      draft = await planInvocation(adapter, base, ctx);
+    } catch {
+      draft = null;
     }
+    const clash = draft ? envConflicts(profile.env, draft) : [];
+    if (clash.length > 0) throw new Error(`profile env ${clash.join(", ")} conflicts with a mandatory setting`);
+    let secret = null;
+    const ensureKey = async (names) => {
+      if (secret !== null || names.length === 0) return;
+      secret = await resolveKey(resolveSecret, profileName, names);
+      redact.add(secret);
+    };
+    await ensureKey(draft?.secretEnv ?? []);
+    const harness = await discoverHarness(adapter, ctx);
+    const req = { ...base, harness };
+    const plan = await planInvocation(adapter, req, ctx, { probe: true });
+    await ensureKey(plan.secretEnv);
     const run = materialize(plan, { profile, secret, redact, env });
     const timeoutMin = positiveNumber(profile.timeoutMin, DEFAULT_TIMEOUT_MIN, `profile ${profileName}: timeoutMin`);
     const result = await runCli({
@@ -1920,7 +2382,7 @@ export async function runProbe({
       reportedModel: text(reduced?.reportedModel),
       usage: isObject(reduced?.usage) ? JSON.parse(redact(JSON.stringify(reduced.usage))) : null,
       errorText: reduced?.errorText ? redact(String(reduced.errorText)).slice(0, 4000) : null,
-      harness,
+      harness: harness ? { bin: redact(harness.bin), version: text(harness.version) } : null,
       exitCode: result.exitCode,
       signal: result.signal,
       stderrTail: result.stderrTail,
@@ -1992,71 +2454,108 @@ export function resultCommand({ cwd, id, env = process.env } = {}, out = default
 
 export async function cancelCommand({ cwd, id, env = process.env } = {}, out = defaultOut) {
   const ws = requireWorkspace(cwd, env);
-  reapDeadRunners(ws.jobsDir); // finalizes a job from an earlier boot, so its pids are never signalled below
+  // Finalizes a job from an earlier boot, so its pids are never signalled below. A pending cleanup of the job being
+  // cancelled is left to this command, which stops it with the adapter's ladder rather than the reaper's SIGKILL.
+  reapDeadRunners(ws.jobsDir, { except: isCoreJobId(id) ? id : null });
   const record = requireJob(ws.jobsDir, id);
   const file = jobFile(ws.jobsDir, record.id);
   const log = logFile(ws.jobsDir, record.id);
   // The cancelled record is written first, so the runner finishing meanwhile cannot overwrite it: the job is
   // cancelled by the dispatcher's own record, whatever the harness exits with (spec §3.6 А8).
   const after = record.status === "running" ? finalizeRecord(file, { status: "cancelled", errorClass: null, note: `cancelled by ${CLI_NAME} cancel` }) : record;
-  if (after.status !== "cancelled" || record.status !== "running") {
+  const fresh = record.status === "running" && after?.status === "cancelled";
+  // A job that was already terminal keeps its verdict; only a cleanup its claimer left unfinished (the claiming
+  // cancel and the runner both interrupted) is resumed.
+  if (!fresh && !cleanupPending(ws.jobsDir, after)) {
     out.stdout(`${record.id} is ${after.status}\n`);
     return 0;
   }
-  if (bootOf(record.bootId) !== "current") {
-    appendLog(log, `cancel: record set to cancelled; harness process group ${after.childPid} ${UNKNOWN_BOOT_NOTE}`);
-    out.stdout(`cancelled ${record.id} (harness process group ${after.childPid ?? "-"} ${UNKNOWN_BOOT_NOTE}; check it with: ps -g ${after.childPid ?? "<pgid>"})\n`);
+  const procs = jobProcesses(ws.jobsDir, after);
+  if (bootOf(after.bootId) !== "current") {
+    const group = procs.child.pid ?? "-";
+    appendLog(log, `cancel: ${fresh ? "record set to cancelled" : `the job is ${after.status}, cleanup pending`}; harness process group ${group} ${UNKNOWN_BOOT_NOTE}`);
+    out.stdout(
+      fresh
+        ? `cancelled ${record.id} (harness process group ${group} ${UNKNOWN_BOOT_NOTE}; check it with: ps -g ${procs.child.pid ?? "<pgid>"})\n`
+        : `${record.id} is ${after.status} (cleanup pending: harness process group ${group} ${UNKNOWN_BOOT_NOTE})\n`,
+    );
     return 0;
   }
   // The runner owns the stop: it sees the claim within STOP_POLL_MS, runs the adapter's ladder over the harness tree,
   // releases a write reservation and exits. cancel waits for that (bounded), so the tree is dead and free for the next
-  // write task when cancel returns; only a runner that is gone or stuck leaves the stop to cancel itself.
+  // write task when cancel returns; only a runner that is gone or stuck leaves the stop to cancel itself. A resumed
+  // cleanup waits only for what is left of that time since the claim: a runner that had it is stuck or gone.
   const ladder = normalizeLadder(after.cancelLadder);
-  appendLog(log, `cancel: record set to cancelled; the runner stops the process tree (${ladderText(ladder)})`);
+  appendLog(log, fresh ? `cancel: record set to cancelled; the runner stops the process tree (${ladderText(ladder)})` : `cancel: the job is ${after.status}, but its process tree is not known to be stopped; cleanup resumed`);
   const holders = jobHolders(ws.jobsDir, after);
   const waitMs = stopWaitMs(ladder);
-  const deadline = Date.now() + waitMs;
-  while (holders.some(isAlive) && Date.now() < deadline) await sleep(POLL_MS);
-  const latest = readRecord(file) ?? after;
-  const runner = Number.isInteger(latest.runnerPid) && isAlive(latest.runnerPid) ? latest.runnerPid : null;
-  const harnessLeft = Number.isInteger(latest.childPid) && harnessGroupState(latest.childPid, latest.childStartedAt) === "ours";
-  if (runner === null && !harnessLeft) {
-    out.stdout(`cancelled ${record.id}\n`);
-    return 0;
-  }
-  appendLog(log, runner !== null ? `cancel: runner pid ${runner} did not finish within ${waitMs} ms; cancel stops the tree itself` : "cancel: the runner is gone; cancel stops the tree itself");
-  const roots = harnessLeft ? [latest.childPid] : childGroupsOf(runner);
-  const stopped = await terminateTree(roots, ladder, {
-    exclude: [latest.runnerPid].filter(Number.isInteger),
-    log: (line) => appendLog(log, `cancel: ${line}`),
-  });
-  out.stdout(`cancelled ${record.id}${stopped.survivors.length > 0 ? ` (process groups still alive: ${stopped.survivors.join(",")})` : ""}\n`);
+  const claimedAt = fresh ? Date.now() : Date.parse(after.finishedAt);
+  const deadline = (Number.isFinite(claimedAt) ? claimedAt : Date.now()) + waitMs;
+  while (Date.now() < deadline && holders.some((holder) => possiblyOurs(processIdentity(holder.pid, holder.startedAt)))) await sleep(POLL_MS);
+  const { notes, stopped } = await stopJobTree(ws.jobsDir, readRecord(file) ?? after, ladder, log, waitMs);
+  const detail = notes.join("; ");
+  if (fresh) out.stdout(`cancelled ${record.id}${detail ? ` (${detail})` : ""}\n`);
+  else if (stopped || detail) out.stdout(`${record.id} is ${after.status} (cleanup resumed${detail ? `: ${detail}` : ""})\n`);
+  else out.stdout(`${record.id} is ${after.status}\n`); // its runner was just finishing: nothing was left to stop
   return 0;
 }
 
-// The processes cancel waits for: the job's runner and, for a write job, the holder of its unreleased reservation
-// (the runner itself once it started; the reservation names it before the record does).
+// What is left of a job once its runner had its time to stop it: the harness group when it is provably the job's,
+// and — while the runner itself lives (stuck) and is provably the job's — the groups of everything below it (a
+// harness the record does not name yet, an auxiliary command), all stopped with the adapter's ladder. A pid that is
+// foreign or unknown is never signalled, nor searched for descendants. The cleanup is marked done once neither the
+// runner, the reservation holder nor the harness may be alive — and only for a job that has a runner on record: one
+// whose runner has not claimed it yet (parked before runJob, or never to start) gets the marker from that runner, which
+// finds the job terminal and starts nothing. Returns { notes, stopped } for cancel's line (stopped: a ladder ran).
+async function stopJobTree(jobsDir, record, ladder, log, waitMs) {
+  const file = jobFile(jobsDir, record.id);
+  const procs = jobProcesses(jobsDir, record);
+  const runner = processIdentity(procs.runner.pid, procs.runner.startedAt);
+  const harness = harnessGroupState(procs.child.pid, procs.child.startedAt);
+  // The reservation names the runner before the runner's claim does (and the task process before that).
+  const waiting = jobHolders(jobsDir, record).filter((holder) => holder.pid !== procs.runner.pid && possiblyOurs(processIdentity(holder.pid, holder.startedAt)));
+  const recorded = fs.existsSync(runnerFile(file)) || procs.runner.pid !== null || procs.child.pid !== null;
+  const notes = [];
+  if (waiting.length > 0) appendLog(log, `cancel: pid ${waiting.map((holder) => holder.pid).join(",")} holds the job's reservation without having claimed the job; a runner that claims it now finds it ${record.status} and starts nothing`);
+  if (runner === "foreign") appendLog(log, `cancel: runner pid ${procs.runner.pid} not signalled: the pid now belongs to another process`);
+  if (runner === "unknown") notes.push(`runner pid ${procs.runner.pid} ${unconfirmedNote(procs.runner.startedAt)}`);
+  if (harness === "foreign") appendLog(log, `cancel: harness process group ${procs.child.pid} ${FOREIGN_NOTE}`);
+  if (harness === "unknown") notes.push(`harness process group ${procs.child.pid} ${unconfirmedNote(procs.child.startedAt)}`);
+  const roots = [...(harness === "ours" ? [procs.child.pid] : []), ...(runner === "ours" ? descendantGroupsOf(procs.runner.pid) : [])];
+  let survivors = [];
+  if (roots.length > 0) {
+    appendLog(log, runner === "ours" ? `cancel: runner pid ${procs.runner.pid} did not finish within ${waitMs} ms; cancel stops the tree itself` : "cancel: the runner is gone; cancel stops the tree itself");
+    const stopped = await terminateTree(roots, ladder, {
+      exclude: [procs.runner.pid].filter(Number.isInteger),
+      log: (line) => appendLog(log, `cancel: ${line}`),
+    });
+    survivors = stopped.survivors;
+    if (survivors.length > 0) notes.push(`process groups still alive: ${survivors.join(",")}`);
+  }
+  for (const note of notes) appendLog(log, `cancel: ${note}`);
+  if (recorded && waiting.length === 0 && !possiblyOurs(runner) && harness !== "unknown" && survivors.length === 0) markCleaned(file);
+  return { notes, stopped: roots.length > 0 };
+}
+
+// The processes cancel waits for, as { pid, startedAt }: the job's runner and, for a write job, the holder of its
+// unreleased reservation (the runner itself once it started; the reservation names it before the record does).
 function jobHolders(jobsDir, record) {
-  const pids = [];
-  if (Number.isInteger(record.runnerPid)) pids.push(record.runnerPid);
+  const holders = [];
+  const { runner } = jobProcesses(jobsDir, record);
+  if (runner.pid !== null) holders.push(runner);
   if (record.write === true) {
     const current = currentReservation(jobsDir);
     const held = current?.record;
-    if (held?.jobId === record.id && Number.isInteger(held.holderPid) && readJson(`${current.file}.released`)?.token !== held.token) pids.push(held.holderPid);
+    if (held?.jobId === record.id && Number.isInteger(held.holderPid) && readJson(`${current.file}.released`)?.token !== held.token) {
+      holders.push({ pid: held.holderPid, startedAt: typeof held.holderStartedAt === "string" ? held.holderStartedAt : null });
+    }
   }
-  return [...new Set(pids)];
+  return holders;
 }
 
 // How long cancel waits for the runner to stop the tree and exit: the poll, the ladder, the re-sweep, the pipe
 // drain and a margin.
 const stopWaitMs = (ladder) => STOP_POLL_MS + ladder.reduce((sum, [, waitMs]) => sum + waitMs, 0) + SWEEP_ROUNDS * POLL_MS + CLOSE_WAIT_MS + 2_000;
-
-// The process groups a runner's own children lead (it spawns its harness detached, so the harness leads one).
-function childGroupsOf(pid) {
-  if (!Number.isInteger(pid)) return [];
-  const rows = (processTable() ?? []).filter((row) => row.ppid === pid && row.pgid !== pid && row.pgid > 1);
-  return [...new Set(rows.map((row) => row.pgid))];
-}
 
 export function releaseStaleCommand({ cwd, env = process.env } = {}, out = defaultOut) {
   const ws = requireWorkspace(cwd, env);
@@ -2070,16 +2569,33 @@ export function releaseStaleCommand({ cwd, env = process.env } = {}, out = defau
   if (readJson(`${file}.released`)?.token === record.token) {
     throw new UsageError(`workspace reservation generation ${generation} is already released`);
   }
-  // Taken in an earlier boot: its holder and the job's harness are gone whatever their pids show now.
+  // Taken in an earlier boot: its holder and the job's harness are gone whatever their pids show now. Otherwise
+  // the reservation stays while any process of the job may still be alive: a holder, runner or harness group that is
+  // provably the job's, or whose identity cannot be read (unknown) — only gone or provably reused pids release it.
   const rebooted = bootOf(record.bootId) === "earlier";
-  if (!rebooted && isAlive(record.holderPid)) {
-    throw new UsageError(`workspace reservation generation ${generation} is held by live runner pid ${record.holderPid}`);
+  const holder = rebooted ? "gone" : processIdentity(record.holderPid, record.holderStartedAt);
+  if (possiblyOurs(holder)) {
+    const why = typeof record.holderStartedAt === "string" && record.holderStartedAt ? "its start time cannot be read" : "no start time was recorded for it";
+    const unconfirmed = holder === "unknown" ? ` (${why} to confirm whether it is still the job's runner)` : "";
+    throw new UsageError(`workspace reservation generation ${generation} is held by live runner pid ${record.holderPid}${unconfirmed}`);
   }
 
   const job = isCoreJobId(record.jobId) ? readRecord(jobFile(ws.jobsDir, record.jobId)) : null;
   const jobRebooted = rebooted || (job !== null && bootOf(job.bootId) === "earlier");
-  if (!jobRebooted && job?.childPid && harnessGroupState(job.childPid, job.childStartedAt) === "ours") {
-    throw new UsageError(`workspace reservation generation ${generation} still has live harness process group ${job.childPid}`);
+  if (!jobRebooted && job) {
+    const procs = jobProcesses(ws.jobsDir, job);
+    const runner = procs.runner.pid !== null && procs.runner.pid !== record.holderPid ? processIdentity(procs.runner.pid, procs.runner.startedAt) : "gone";
+    if (possiblyOurs(runner)) {
+      throw new UsageError(`workspace reservation generation ${generation}: job ${job.id} still has live runner pid ${procs.runner.pid}`);
+    }
+    const harness = harnessGroupState(procs.child.pid, procs.child.startedAt);
+    if (harness === "ours") {
+      throw new UsageError(`workspace reservation generation ${generation} still has live harness process group ${procs.child.pid}`);
+    }
+    if (harness === "unknown") {
+      const why = procs.child.startedAt ? "its start time cannot be read" : "no start time was recorded for it";
+      throw new UsageError(`workspace reservation generation ${generation} still has harness process group ${procs.child.pid} alive, unconfirmed (${why}); not released`);
+    }
   }
 
   const latest = currentReservation(ws.jobsDir);
@@ -2097,6 +2613,7 @@ export function releaseStaleCommand({ cwd, env = process.env } = {}, out = defau
       note: jobRebooted ? REBOOT_NOTE : "stale reservation released",
     });
   }
+  if (job) markCleaned(jobFile(ws.jobsDir, record.jobId)); // nothing of the job may be alive (checked above)
   if (!createReservation(`${file}.released`, { holderPid: process.pid, token: record.token })) {
     throw new UsageError(`workspace reservation generation ${generation} is already released`);
   }

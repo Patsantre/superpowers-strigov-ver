@@ -28,11 +28,13 @@
 //                  multi-byte character
 //   leak-secret    prints the value of $AGENT_STUB_SECRET_VAR (default PLAIN_API_KEY) to stderr in two chunks split
 //                  inside the value, then in the final answer, exit 0
-// Always: `--version` prints "agent-stub <AGENT_STUB_VERSION or the dialect's version>"; `--help` prints the
-// dialect's flags minus AGENT_STUB_HELP_DROP (comma-separated) and exits AGENT_STUB_HELP_EXIT (default 0);
-// `--print-env NAME` prints that variable (what a second
+// Always: `--version` prints "agent-stub <AGENT_STUB_VERSION or the dialect's version>" — or, with
+// AGENT_STUB_VERSION_HANG=ignore-term, ignores SIGTERM, appends its pid to AGENT_STUB_PIDS and never answers (a
+// discovery that hangs); `--help` prints the dialect's flags minus AGENT_STUB_HELP_DROP (comma-separated) and exits
+// AGENT_STUB_HELP_EXIT (default 0); `--print-env NAME` prints that variable (what a second
 // harness process such as `opencode export` sees). AGENT_STUB_CALL_LOG names a file that gets one line
-// "<version|help> <$WRAPPED or ->" per --version / --help call. AGENT_STUB_RECORD names a file that gets
+// "<version|help> <$WRAPPED or ->" per --version / --help call; AGENT_STUB_LAUNCH_LOG one line (the pid) per harness
+// run, i.e. per invocation that is not --version / --help / --print-env. AGENT_STUB_RECORD names a file that gets
 // {argv, stdin, cwd, env, pid, ppid} once stdin is read — after the signal dispositions are set, so it doubles as the
 // readiness handshake of the signal tests. AGENT_STUB_DELAY_MS: wait before acting. Descendants carry the
 // AGENT_STUB_PIDS path in their argv, so a test run can find (and kill) exactly its own.
@@ -79,6 +81,12 @@ for (const [option, verb] of [["--version", "version"], ["--help", "help"]]) {
   if (argv.includes(option)) appendLine(env.AGENT_STUB_CALL_LOG, `${verb} ${env.WRAPPED || "-"}`);
 }
 if (argv.includes("--version")) {
+  if (env.AGENT_STUB_VERSION_HANG === "ignore-term") {
+    process.on("SIGTERM", () => {});
+    appendLine(env.AGENT_STUB_PIDS, String(process.pid));
+    setInterval(() => {}, 1 << 30);
+    return;
+  }
   write(`agent-stub ${env.AGENT_STUB_VERSION || dialect.version}\n`);
   process.exit(0);
 }
@@ -88,6 +96,7 @@ if (argv.includes("--help")) {
   process.exitCode = Number(env.AGENT_STUB_HELP_EXIT || 0);
   return;
 }
+appendLine(env.AGENT_STUB_LAUNCH_LOG, String(process.pid));
 
 const sessionId = dialect.sessionId(flag);
 const final = (text) => write(dialect.final({ sessionId, text }));
