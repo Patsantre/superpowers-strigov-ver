@@ -16,6 +16,7 @@ Status: open. Prerequisite: 0.11.0 (Linux support, branch `feat/zcode-linux`). W
 
 ## What must change (by risk)
 
+0. **Where to get it.** Z.ai's site <https://zcode.z.ai> ("All Downloads") ships `ZCode-<ver>-win-{x64,arm64}.exe` (3.16.2 on 2026-10-20). The GitHub releases lag behind (v3.14.3).
 1. **The default install path.** It is probably `%LOCALAPPDATA%\Programs\ZCode` (electron-builder NSIS per-user default). ZCode patches its NSIS install section (`packages/desktop/scripts/patch-nsis-install-section.mjs`), so read that script and confirm on the machine. Look for `resources\glm\zcode.cjs`, `resources\config\provider\zcode-builtin.json` and `resources\app.asar`.
 2. **The prompt transport. This is the biggest functional gap.** The CLI's `-p` is a plain string and does not read stdin (U10). Windows limits a command line to 32,767 UTF-16 characters, while `MAX_PROMPT_BYTES` is 200 KiB today. Options:
    - (a) Set a win32 `MAX_PROMPT_BYTES` of about 30 000 characters, measured as UTF-16 length, not bytes. The existing dev-orchestrator rule then moves larger prompts to Luna fresh, announced.
