@@ -32,7 +32,9 @@ export const PINNED_MODEL = "GLM-5.3-Flash$max";
 export const VERIFIED_APP_VERSION = "3.15.1";
 export const VERIFIED_NODE_MAJOR = 26;
 export const PROMPT_TRANSPORT = "argv"; // "argv" | "stdin"
-export const MAX_PROMPT_BYTES = 200 * 1024;
+// The argv transport passes the whole prompt as one argument. Linux caps a single argument at 32 pages
+// (MAX_ARG_STRLEN: 131072 bytes with its NUL; a 131072-byte argument fails with E2BIG), macOS only the total.
+export const MAX_PROMPT_BYTES = process.platform === "linux" ? 120 * 1024 : 200 * 1024;
 export const APP_VERSION_PLIST_KEY = "CFBundleShortVersionString";
 export const SUPPORTED_PLATFORMS = ["darwin", "linux"];
 export const MODEL_ARGS = []; // MODEL_MECHANISM flag:<--name> → ["<--name>", PINNED_MODEL]
@@ -190,7 +192,9 @@ export function readAsarVersion(file) {
     if (!isObject(entry) || !Number.isSafeInteger(entry.size) || entry.size <= 0 || entry.size > 1024 * 1024) return null;
     let text;
     if (entry.unpacked === true) {
-      text = fs.readFileSync(path.join(`${file}.unpacked`, "package.json"), "utf8");
+      const unpacked = path.join(`${file}.unpacked`, "package.json");
+      if (fs.statSync(unpacked).size > 1024 * 1024) return null;
+      text = fs.readFileSync(unpacked, "utf8");
     } else {
       const offset = Number(entry.offset);
       if (!Number.isSafeInteger(offset) || offset < 0) return null;

@@ -342,7 +342,7 @@ VERDICT: GO
 | USAGE_REASONING_FIELD | none | U3 |
 | CACHED_IS_SUBSET_OF_INPUT | yes | U3 |
 | PROMPT_TRANSPORT | argv | U10 |
-| MAX_PROMPT_BYTES | 204800 | U10 |
+| MAX_PROMPT_BYTES | 204800 (macOS); 122880 on Linux, whose MAX_ARG_STRLEN caps one argument at 131072 bytes including its NUL (checked 2026-10-20: 131071 ok, 131072 E2BIG) | U10, "Linux" |
 | VERIFIED_APP_VERSION | 3.15.1 | header |
 | VERIFIED_NODE_MAJOR | 26 | header |
 | APP_VERSION_PLIST_KEY | CFBundleShortVersionString | U11 |

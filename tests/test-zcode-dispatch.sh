@@ -914,6 +914,24 @@ process.exit(injected && runner.status === "cancelled" && m.readRecord(file).sta
         max="$(const_of MAX_PROMPT_BYTES)"
         head -c $((max + 1)) /dev/zero | tr '\0' 'a' > "$TEST_ROOT/big.md"
         expect_exit 2 "10 prompt file larger than MAX_PROMPT_BYTES ($max)" "$ZD" task --background --prompt-file "$TEST_ROOT/big.md"
+        # A prompt of exactly MAX_PROMPT_BYTES is accepted and reaches the CLI (no E2BIG on Linux's 128 KiB
+        # single-argument cap); the stub then sees the whole prompt in its argv.
+        head -c "$max" /dev/zero | tr '\0' 'b' > "$TEST_ROOT/max.md"
+        rc=0
+        out="$(ZCODE_STUB_MODE=record ZCODE_STUB_RECORD="$TEST_ROOT/max-record.json" "$ZD" task --background --prompt-file "$TEST_ROOT/max.md" 2>&1)" || rc=$?
+        st=""
+        if [[ "$rc" -eq 0 && "$out" == "ZCode Task started in the background as zt-"* ]]; then
+            st="$(wait_status "${out##* }" 'completed|failed|cancelled' 20)"
+        fi
+        if [[ "$st" == completed ]] && REC="$TEST_ROOT/max-record.json" MAX="$max" node -e '
+const r = JSON.parse(require("node:fs").readFileSync(process.env.REC, "utf8"));
+const i = r.argv.indexOf("-p");
+process.exit(i >= 0 && r.argv[i + 1].length === Number(process.env.MAX) ? 0 : 1);'; then
+            pass "10 a prompt of exactly MAX_PROMPT_BYTES ($max) is accepted and reaches the CLI whole in argv"
+        else
+            fail "10 a prompt of exactly MAX_PROMPT_BYTES ($max) is accepted and reaches the CLI whole in argv"
+            echo "    exit: $rc out: $out status: $st"
+        fi
     else
         # stdin transport: the size guard does not apply (C1), so the big prompt starts a task.
         local max
