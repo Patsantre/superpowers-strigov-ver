@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.11.0" src="https://img.shields.io/badge/version-0.11.0-7c8cff?style=flat-square">
+  <img alt="Version 0.11.1" src="https://img.shields.io/badge/version-0.11.1-7c8cff?style=flat-square">
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square">
   <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-35d6a6?style=flat-square">
 </p>
@@ -39,21 +39,23 @@ Optional — the default implementer, **GLM-5.3-Flash via Z.ai's ZCode**: instal
 
 #### Linux: ZCode for the GLM channel
 
-Z.ai publishes no Linux build of ZCode, but its embedded CLI is plain JavaScript and runs on Linux under Node. The wrapper needs three things from a ZCode desktop install (the same version on every machine): `glm/` (the CLI), `config/provider/zcode-builtin.json`, and `app.asar` (the version source). Checked with ZCode 3.15.1 on Debian bookworm, Node 26.
+Z.ai ships an official Linux build of ZCode (beta) on <https://zcode.z.ai> ("All Downloads": `.deb`, `.rpm` and `.AppImage` for x64 and ARM64). The `.deb` and `.rpm` packages install into `/opt/ZCode`, which is where `zcode-dispatch` looks by default. Checked with the official `.deb` 3.16.2 (CLI 0.17.0) on Debian bookworm with Node 26: `doctor` is ok, and a probe reaches Z.ai.
 
 Steps for your agent (Claude Code on the Linux machine):
 
-1. Check the prerequisites: `node --version` (major ≥ 26), `flock --version` (util-linux; install it if missing), `git --version`.
-2. Choose the install root. Default: `/opt/ZCode` (needs sudo, ask the user). Without sudo: `~/.local/opt/ZCode`, and set `"env": { "ZCODE_APP": "/home/<user>/.local/opt/ZCode" }` in `~/.claude/settings.json` so every `zcode-dispatch` call sees it.
-3. Get the files into `<root>/resources/`. Pick the first source that is available:
-   - **A macOS install** (the user runs this on the Mac, or gives you SSH access): copy `/Applications/ZCode.app/Contents/Resources/{glm,config,app.asar}`, for example `rsync -a mac:/Applications/ZCode.app/Contents/Resources/{glm,config,app.asar} <root>/resources/`.
-   - **A Windows install**: copy `glm\`, `config\` and `app.asar` from the `resources\` folder of the ZCode install directory (usually `%LOCALAPPDATA%\Programs\ZCode\resources`; confirm by looking for `resources\glm\zcode.cjs`).
-   - **The official installer** from <https://github.com/zai-org/ZCode/releases> (ask the user before downloading). Unpack it with `7z x` (p7zip). A Windows `.exe` holds a nested `app-64.7z` that also needs `7z x`. Then copy the directory that contains `glm/zcode.cjs`, `config/` and `app.asar` (`find . -path '*/glm/zcode.cjs'`). A release older than the wrapper's verified version only makes `doctor` warn `app-version`. If `doctor` fails `auth: ZCode template incompatible`, that version cannot be used.
-   - **The source** at <https://github.com/zai-org/ZCode> (Apache-2.0): build the desktop app for Linux and use its `resources/`. This is the heaviest route, and the plugin has not tested it.
-4. Verify: `node <root>/resources/glm/zcode.cjs --version` prints the CLI version, and `zcode-dispatch doctor` shows `ok platform: linux (config lock: flock(1))` and `ok app: <root> <version>`. At this point only `personal-config` and `auth` may fail, because no key is stored yet.
-5. Hand the API key step to the user. Never ask for the key in the chat. Give the user one exact command line for their own terminal: the absolute path of `zcode-dispatch` and, if the install root is not `/opt/ZCode`, a `ZCODE_APP=<root>` prefix (their shell does not see Claude Code's `settings.json`), e.g. `ZCODE_APP=~/.local/opt/ZCode /path/to/bin/zcode-dispatch api-key set`. The user runs it and pastes the key at the hidden prompt. Then run `zcode-dispatch doctor --probe` (one short request): `probe: ok` means the GLM channel is up.
+1. Check the prerequisites: `node --version` (major ≥ 26; the wrapper runs the CLI with the system `node`, not the app's Electron), `flock --version` (util-linux; install it if missing), `git --version`.
+2. Install ZCode. Ask the user first: it needs sudo and a download of about 170 MB. Take the link for the machine's architecture (`uname -m`: `x86_64` → x64, `aarch64` → ARM64) from the "All Downloads" section of <https://zcode.z.ai>. Then:
+   - Debian/Ubuntu: `sudo apt install ./ZCode-<ver>-linux-<arch>.deb`
+   - Fedora/RHEL/openSUSE: `sudo dnf install ./ZCode-<ver>-linux-<arch>.rpm` (or `zypper install`)
+   - No sudo: download the `.AppImage`, run `chmod +x ZCode-*.AppImage && ./ZCode-*.AppImage --appimage-extract` in a directory of your choice, and set `"env": { "ZCODE_APP": "<that dir>/squashfs-root" }` in `~/.claude/settings.json` so every `zcode-dispatch` call sees it. (This route is not tested yet. `squashfs-root/resources/glm/zcode.cjs` must exist.)
+3. Verify: `node /opt/ZCode/resources/glm/zcode.cjs --version` prints the CLI version, and `zcode-dispatch doctor` shows `ok platform: linux (config lock: flock(1))` and `ok app: /opt/ZCode <version>`. At this point only `personal-config` and `auth` may fail, because no key is stored yet. `WARN app-version` only means the app is newer than the version the wrapper was verified on; the probe in step 4 decides.
+4. Hand the API key step to the user. Never ask for the key in the chat. Give the user one exact command line for their own terminal: the absolute path of `zcode-dispatch` and, for an AppImage install, a `ZCODE_APP=<dir>/squashfs-root` prefix (their shell does not see Claude Code's `settings.json`). The user runs it and pastes the key at the hidden prompt. Then run `zcode-dispatch doctor --probe` (one short request): `probe: ok` means the GLM channel is up.
 
-Do not install third-party ZCode CLI packages (for example `zcode-app-cli` from npm). Use only files from Z.ai's own app or source. Behind a proxy, export `ZCODE_HTTP_PROXY` (see above).
+Notes:
+- The package also puts `/usr/bin/zcode` on `PATH`. That is the desktop app's launcher, not the CLI; the wrapper never uses it.
+- Do not install third-party ZCode CLI packages (for example `zcode-app-cli` from npm).
+- Behind a proxy, export `ZCODE_HTTP_PROXY` (see above).
+- Without the official package (for example on an unsupported distribution), copying `resources/{glm,config,app.asar}` from a ZCode install of the same version on macOS (`/Applications/ZCode.app/Contents/Resources`) or Windows into `/opt/ZCode/resources/` also works.
 
 ### 2. Install the plugin
 
