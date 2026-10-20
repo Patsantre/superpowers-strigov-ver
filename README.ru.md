@@ -39,7 +39,7 @@ codex login
 
 #### Linux: ZCode для канала GLM
 
-У Z.ai есть официальная Linux-сборка ZCode (бета) на <https://zcode.z.ai> (раздел «All Downloads»: `.deb`, `.rpm` и `.AppImage` для x64 и ARM64). Пакеты `.deb` и `.rpm` ставятся в `/opt/ZCode` — именно там `zcode-dispatch` ищет ZCode по умолчанию. Проверено с официальным `.deb` 3.16.2 (CLI 0.17.0) на Debian bookworm с Node 26: `doctor` проходит, пробный запрос доходит до Z.ai.
+У Z.ai есть официальная Linux-сборка ZCode (бета) на <https://zcode.z.ai> (раздел «All Downloads»: `.deb`, `.rpm` и `.AppImage` для x64 и ARM64). Пакеты `.deb` и `.rpm` ставятся в `/opt/ZCode` — именно там `zcode-dispatch` ищет ZCode по умолчанию. Проверено со всеми официальными пакетами 3.16.2 (CLI 0.17.0, одинаковый во всех шести): `.deb` на Debian 12 (arm64 и x64), `.rpm` на Fedora 42 и распакованный `.AppImage` (arm64). Во всех случаях `doctor` проходит, а пробный запрос доходит до Z.ai.
 
 Шаги для вашего агента (Claude Code на Linux-машине):
 
@@ -47,7 +47,7 @@ codex login
 2. Поставить ZCode. Сначала спросить пользователя: нужен sudo и скачивание около 170 МБ. Ссылку под архитектуру машины (`uname -m`: `x86_64` → x64, `aarch64` → ARM64) взять в разделе «All Downloads» на <https://zcode.z.ai>. Дальше:
    - Debian/Ubuntu: `sudo apt install ./ZCode-<версия>-linux-<arch>.deb`
    - Fedora/RHEL/openSUSE: `sudo dnf install ./ZCode-<версия>-linux-<arch>.rpm` (или `zypper install`)
-   - Без sudo: скачать `.AppImage`, в выбранном каталоге выполнить `chmod +x ZCode-*.AppImage && ./ZCode-*.AppImage --appimage-extract` и прописать в `~/.claude/settings.json` `"env": { "ZCODE_APP": "<каталог>/squashfs-root" }`, чтобы этот путь видел каждый вызов `zcode-dispatch`. (Этот путь пока не проверялся. Должен существовать файл `squashfs-root/resources/glm/zcode.cjs`.)
+   - Без sudo: скачать `.AppImage`, в выбранном каталоге выполнить `chmod +x ZCode-*.AppImage && ./ZCode-*.AppImage --appimage-extract` и прописать в `~/.claude/settings.json` `"env": { "ZCODE_APP": "<каталог>/squashfs-root" }`, чтобы этот путь видел каждый вызов `zcode-dispatch`. (Распаковка не требует ни FUSE, ни sudo. После неё должен существовать файл `squashfs-root/resources/glm/zcode.cjs`.)
 3. Проверить: `node /opt/ZCode/resources/glm/zcode.cjs --version` печатает версию CLI, а `zcode-dispatch doctor` показывает `ok platform: linux (config lock: flock(1))` и `ok app: /opt/ZCode <версия>`. На этом этапе падать могут только `personal-config` и `auth`: ключ ещё не сохранён. `WARN app-version` значит лишь, что приложение новее версии, на которой проверялась обёртка; решает проба на шаге 4.
 4. Шаг с API-ключом передать пользователю. Никогда не просить ключ в чате. Дать пользователю одну готовую команду для его терминала: абсолютный путь к `zcode-dispatch` и, при установке из AppImage, префикс `ZCODE_APP=<каталог>/squashfs-root` (его shell не видит `settings.json` Claude Code). Пользователь запускает её и вставляет ключ в скрытое приглашение. После этого выполнить `zcode-dispatch doctor --probe` (один короткий запрос): `probe: ok` значит, что канал GLM работает.
 
