@@ -275,7 +275,7 @@ Main thread picks which hypothesis to test first (typically highest likelihood w
 
    **Then: single-shot Codex Astra high implementability check** — NOT a review loop, just one cross-opinion pass. Opus reasoned from patterns; Codex reads the code to verify each alternative is actually feasible.
 
-   Invocation per `../codex-invocation/SKILL.md`, relative to this skill's directory (`Read` it — that skill is manual-only and the Skill tool refuses it) (read-only, `--model gpt-6-astra --effort high`, no `--write`, no `--resume-last`, cap=1). The checker is the profile of the `adhoc-review` role (`"$AD" route adhoc-review`, per `../agent-invocation/SKILL.md`); by default Astra, the same command. Another profile is dispatched by its `harness=` as that skill's step 3 says (`zcode` via `$ZDISPATCH`, no model flags; a core harness via `"$AD" task --profile <p> --role adhoc-review`, no `--write`), with its reviewer preamble on `zcode` and core harnesses:
+   Invocation per `../codex-invocation/SKILL.md`, relative to this skill's directory (`Read` it — that skill is manual-only and the Skill tool refuses it) (read-only, `--model gpt-6-astra --effort high`, no `--write`, no `--resume-last`, cap=1). The checker is the profile of the `adhoc-review` role (`"$AD" route adhoc-review`, per `../agent-invocation/SKILL.md`); by default Astra, the same command. Another profile is dispatched by its `harness=` as that skill's step 3 says (`zcode` via `$ZDISPATCH`, no model flags; a core harness via `"$AD" task --profile <p> --role adhoc-review`, no `--write`), with its reviewer preamble on `zcode` and core harnesses; a route line with `readOnly=none` puts the job inside that skill's "No-edit check":
 
    ```
    IMPLEMENTABILITY CHECK — read-only, do not modify code.

@@ -753,6 +753,40 @@ console.log((fs.statSync(f).mode & 0o777).toString(8), (fs.statSync(`${process.a
         fail "7 writeSecretFile is 0600 in a 0700 job dir even under umask 000; redactor catches raw and JSON-escaped forms"
         echo "    got: $out"
     fi
+    # A cancel that lands while the key is resolved (a keyCmd waiting on a password manager): its claim finds no
+    # handoff file yet, the launch writes one after it and then fails; no runner will ever read it, so the launch
+    # removes it. startJob is driven directly; resolveSecret runs the cancel in another process before it returns.
+    local KC_SECRET="sk-test-$$-cancelled-q1w2e3r4"
+    out="$(KC_SECRET="$KC_SECRET" core_js '
+const fs = await import("node:fs");
+const { spawnSync } = await import("node:child_process");
+const [harness, adapterFile, repo, promptFile] = process.argv.slice(1);
+const { default: plain } = await import(pathToFileURL(adapterFile).href);
+const { jobsDir } = core.resolveWorkspace(repo);
+let id = null;
+const resolveSecret = async () => {
+  id = fs.readdirSync(jobsDir).filter((name) => /^pt-[0-9]+[.]json$/.test(name)).map((name) => core.readRecord(`${jobsDir}/${name}`))
+    .find((record) => record?.status === "running" && record.profile === "kc")?.id ?? null;
+  if (id) spawnSync(process.execPath, [harness, "cancel", id, "--cwd", repo], { stdio: "ignore" });
+  return process.env.KC_SECRET;
+};
+let thrown = "none";
+try {
+  await core.startJob({ adapter: plain, profileName: "kc", profile: { harness: "plain", auth: { keyEnv: "KC_SECRET" } }, cwd: repo, promptFile, resolveSecret, cliPath: harness });
+} catch (error) {
+  thrown = error.message;
+}
+const record = id ? core.readRecord(`${jobsDir}/${id}.json`) : null;
+console.log(JSON.stringify({ id, thrown, status: record?.status ?? null, secret: id ? fs.existsSync(`${jobsDir}/${id}/secret`) : null }));' \
+        "$HARNESS" "$FIX/adapters/plain.mjs" "$repo" "$prompt" 2>&1)"
+    if [[ "$(jfield thrown <<<"$out")" == *"became terminal before it started"* && "$(jfield status <<<"$out")" == cancelled \
+        && "$(jfield secret <<<"$out")" == false ]] && ! grep -rFq "$KC_SECRET" "$STATE"; then
+        pass "7 a cancel while the key is resolved: startJob throws, the job stays cancelled, and the handoff file written after that claim is removed (the key is in no state file)"
+    else
+        fail "7 a cancel while the key is resolved: startJob throws, the job stays cancelled, and the handoff file written after that claim is removed (the key is in no state file)"
+        echo "    got: ${out//$KC_SECRET/<SECRET>}"
+        grep -rlF "$KC_SECRET" "$STATE" | head -3
+    fi
 
     # --- 8. one write job per working tree; read-only jobs run beside it ---
     local wa
@@ -798,11 +832,11 @@ console.log((fs.statSync(f).mode & 0o777).toString(8), (fs.statSync(`${process.a
     out="$(ad count-running --profile mp)"
     id="$(AGENT_STUB_MODE=ok start_task --cwd "$repo2" --profile other --prompt-file "$prompt")"
     st="$(wait_status "$id" 'completed|failed|cancelled' 20 --cwd "$repo2")"
-    if [[ "$rc" -eq 2 && "$err" == *"profile mp is at maxParallel=1 (running: $m1)"* && "$out" == "1 $m1" && "$st" == completed \
+    if [[ "$rc" -eq 2 && "$err" == *"profile mp is at maxParallel=1 (running: $m1 cwd=$repo)" && "$out" == "1 $m1" && "$st" == completed \
         && "$(($(count_records "$JOBS2") - 1))" == "$before" && ! -e "$keylog" ]]; then
-        pass "9 maxParallel=1: a task of the same profile in another tree is refused (exit 2) naming the running job, leaves no record and never reads its key; the counter sees it; other profiles run"
+        pass "9 maxParallel=1: a task of the same profile in another tree is refused (exit 2) naming the running job and the tree it runs in, leaves no record and never reads its key; the counter sees it; other profiles run"
     else
-        fail "9 maxParallel=1: a task of the same profile in another tree is refused (exit 2) naming the running job, leaves no record and never reads its key; the counter sees it; other profiles run"
+        fail "9 maxParallel=1: a task of the same profile in another tree is refused (exit 2) naming the running job and the tree it runs in, leaves no record and never reads its key; the counter sees it; other profiles run"
         echo "    exit=$rc err=$err count=$out other=$st keylog=$(cat "$keylog" 2>/dev/null)"
     fi
     ad cancel "$m1" >/dev/null
@@ -826,9 +860,10 @@ console.log((fs.statSync(f).mode & 0o777).toString(8), (fs.statSync(`${process.a
     done
     wait
     out="$(cat "$TEST_ROOT/duo-a.rc" "$TEST_ROOT/duo-b.rc" | sort | tr '\n' ' ')"
-    local duo_id
+    local duo_id duo_root=""
     duo_id="$(grep -ho 'as pt-[0-9]*' "$TEST_ROOT/duo-a.out" "$TEST_ROOT/duo-b.out" | awk '{print $2}')"
-    if [[ "$out" == "0 2 " ]] && grep -q "profile duo is at maxParallel=1 (running: $duo_id)" "$TEST_ROOT/duo-a.out" "$TEST_ROOT/duo-b.out"; then
+    if grep -q "as $duo_id" "$TEST_ROOT/duo-a.out" 2>/dev/null; then duo_root="$repo"; else duo_root="$repo2"; fi
+    if [[ "$out" == "0 2 " ]] && grep -qF "profile duo is at maxParallel=1 (running: $duo_id cwd=$duo_root)" "$TEST_ROOT/duo-a.out" "$TEST_ROOT/duo-b.out"; then
         pass "9 two simultaneous tasks on a maxParallel=1 profile: exactly one runs, the other is refused naming it"
     else
         fail "9 two simultaneous tasks on a maxParallel=1 profile: exactly one runs, the other is refused naming it"
@@ -857,6 +892,40 @@ console.log(count({ jobsDir: a, id: "pt-0001", startedAt: sa }), count({ jobsDir
     else
         fail "9 runningJobsOfProfile: a pending job (no runner yet) counts against the caller only if allocated first; without self every running job counts"
         echo "    got: $out"
+    fi
+    # A workspace root holding ", " or a double quote is JSON-quoted in the refusal, so the list still splits at ", ".
+    local odd odd_shown
+    git init -q -b main "$TEST_ROOT/odd, \"q\" repo"
+    odd="$(cd "$TEST_ROOT/odd, \"q\" repo" && git rev-parse --show-toplevel)"
+    odd_shown="$(node -e 'console.log(JSON.stringify(process.argv[1]))' "$odd")"
+    m1="$(AGENT_STUB_MODE=hang start_task --cwd "$odd" --profile mpq --profile-json '{"harness":"plain","maxParallel":1}' --prompt-file "$prompt")"
+    wait_child "$m1" --cwd "$odd" >/dev/null
+    rc=0
+    err="$(ad task --background --cwd "$repo2" --profile mpq --profile-json '{"harness":"plain","maxParallel":1}' --prompt-file "$prompt" 2>&1)" || rc=$?
+    if [[ "$rc" -eq 2 && "$err" == *"profile mpq is at maxParallel=1 (running: $m1 cwd=$odd_shown)" ]]; then
+        pass "9 a running job whose workspace root holds ', ' and a double quote: the refusal names that root JSON-quoted"
+    else
+        fail "9 a running job whose workspace root holds ', ' and a double quote: the refusal names that root JSON-quoted"
+        echo "    exit=$rc err=$err"
+    fi
+    ad cancel "$m1" --cwd "$odd" >/dev/null
+    # Several running jobs are joined by ", "; a root with a control character is JSON-quoted too (records of
+    # pending jobs in a state root of their own: no runner, allocated a second before the refused task).
+    out="$(core_js '
+const fs = await import("node:fs");
+const dir = `${process.argv[1]}/state/fixture-0000/jobs`;
+fs.mkdirSync(dir, { recursive: true });
+const startedAt = new Date(Date.now() - 1000).toISOString();
+const rec = (id, workspaceRoot) => fs.writeFileSync(`${dir}/${id}.json`, JSON.stringify({ id, status: "running", profile: "ctl", workspaceRoot, startedAt, runnerPid: null, bootId: core.bootId() }));
+rec("pt-0001", "/tmp/ctl\nroot");
+rec("pt-0002", "/tmp/plain root");' "$TEST_ROOT/ctl-state")"
+    rc=0
+    err="$(AGENT_DISPATCH_STATE_DIR="$TEST_ROOT/ctl-state" ad task --background --cwd "$repo2" --profile ctl --profile-json '{"harness":"plain","maxParallel":2}' --prompt-file "$prompt" 2>&1)" || rc=$?
+    if [[ "$rc" -eq 2 && "$err" == *'profile ctl is at maxParallel=2 (running: pt-0002 cwd=/tmp/plain root, pt-0001 cwd="/tmp/ctl\nroot")' ]]; then
+        pass "9 several running jobs are joined by ', ', each with its root; a root with a control character is JSON-quoted"
+    else
+        fail "9 several running jobs are joined by ', ', each with its root; a root with a control character is JSON-quoted"
+        echo "    exit=$rc err=$err"
     fi
 
     # --- 10. cancel kills the whole tree, including descendants in process groups of their own ---
@@ -1140,6 +1209,49 @@ for (const f of [process.env.REC_FILE, `${process.env.REC_FILE}.terminal`]) {
 }'
     expect_refusal "16 the adapter's resumeCheck refuses (exit 2, 'dispatch --fresh')" "cannot resume $r1 on rp: session was started in /elsewhere" \
         --profile rp --profile-json '{"harness":"plain","model":"m1"}' --resume-task "$r1"
+    # A resumed job runs on the current profile, never on the record's snapshot: an env a sandboxed job wrote into the
+    # record (a NODE_OPTIONS preload, a PATH in front) never reaches the resumed harness. Who pays is bound like the
+    # model: another key source, keyVar or authHeader is refused before the key is read; a rotated value behind the
+    # same source resumes and reaches the harness.
+    local r2 rk evil="$TEST_ROOT/evil-preload.cjs" evil_mark="$TEST_ROOT/evil-preload.ran" SECRET2="sk-test-$$-rotated-z9y8x7w6"
+    printf 'require("node:fs").writeFileSync("%s", "ran");\n' "$evil_mark" >"$evil"
+    rk='{"harness":"plain","model":"m1","auth":{"keyEnv":"TEST_SECRET"},"keyVar":"KV1","authHeader":"h1","env":{"PLAIN_X":"one"}}'
+    r2="$(TEST_SECRET="$SECRET" AGENT_STUB_MODE=ok start_task --profile rk --profile-json "$rk" --prompt-file "$prompt")"
+    wait_status "$r2" 'completed|failed|cancelled' 20 >/dev/null
+    EVIL="$evil" EVIL_BIN="$TEST_ROOT/evil-bin" REC_FILE="$JOBS/$r2.json" node -e '
+const fs = require("node:fs");
+for (const f of [process.env.REC_FILE, `${process.env.REC_FILE}.terminal`]) {
+  if (!fs.existsSync(f)) continue;
+  const r = JSON.parse(fs.readFileSync(f, "utf8"));
+  r.profileConfig = { ...r.profileConfig, env: { NODE_OPTIONS: `--require ${process.env.EVIL}`, PATH: `${process.env.EVIL_BIN}:${process.env.PATH}`, PLAIN_X: "evil" } };
+  fs.writeFileSync(f, JSON.stringify(r));
+}'
+    expect_refusal "16 resume after the profile's key source changed: exit 2, dispatch --fresh (the key is never read)" \
+        "ran with another auth of profile rk than config.json has now; its session cannot continue; dispatch --fresh" \
+        --profile rk --profile-json '{"harness":"plain","model":"m1","auth":{"keyEnv":"OTHER_SECRET"},"keyVar":"KV1","authHeader":"h1"}' --resume-task "$r2"
+    expect_refusal "16 resume after the profile moved from a key to a login: exit 2, dispatch --fresh" "ran with another auth of profile rk" \
+        --profile rk --profile-json '{"harness":"plain","model":"m1","keyVar":"KV1","authHeader":"h1"}' --resume-task "$r2"
+    expect_refusal "16 resume after the profile's keyVar changed: exit 2, dispatch --fresh" "ran with another keyVar of profile rk" \
+        --profile rk --profile-json '{"harness":"plain","model":"m1","auth":{"keyEnv":"TEST_SECRET"},"keyVar":"KV2","authHeader":"h1"}' --resume-task "$r2"
+    expect_refusal "16 resume after the profile's authHeader changed: exit 2, dispatch --fresh" "ran with another authHeader of profile rk" \
+        --profile rk --profile-json '{"harness":"plain","model":"m1","auth":{"keyEnv":"TEST_SECRET"},"keyVar":"KV1","authHeader":"h2"}' --resume-task "$r2"
+    rec="$TEST_ROOT/resume-current.json"
+    rm -f "$rec" "$evil_mark"
+    id="$(TEST_SECRET="$SECRET2" AGENT_STUB_MODE=resume AGENT_STUB_RECORD="$rec" start_task --profile rk \
+        --profile-json '{"harness":"plain","model":"m1","auth":{"keyEnv":"TEST_SECRET"},"keyVar":"KV1","authHeader":"h1","env":{"PLAIN_X":"two"}}' \
+        --resume-task "$r2" --prompt-file "$prompt")"
+    st="$(wait_status "$id" 'completed|failed|cancelled' 20)"
+    sj="$(ad status "$id" --json)"
+    if [[ "$st" == completed && ! -e "$evil_mark" && "$(jfield job.resumeOf <<<"$sj")" == "$r2" && "$(jfield job.profileConfig.env.PLAIN_X <<<"$sj")" == two ]] \
+        && REC="$rec" EVIL_BIN="$TEST_ROOT/evil-bin" S2="$SECRET2" node -e '
+const e = JSON.parse(require("node:fs").readFileSync(process.env.REC, "utf8")).env;
+process.exit(e.PLAIN_X === "two" && !String(e.NODE_OPTIONS ?? "").includes("evil") && !String(e.PATH ?? "").includes(process.env.EVIL_BIN)
+  && e.PLAIN_API_KEY === process.env.S2 ? 0 : 1);'; then
+        pass "16 a resumed job runs on the current profile: the env written into the record (NODE_OPTIONS, PATH) never reaches the harness, a rotated key behind the same source resumes"
+    else
+        fail "16 a resumed job runs on the current profile: the env written into the record (NODE_OPTIONS, PATH) never reaches the harness, a rotated key behind the same source resumes"
+        echo "    status=$st preload-ran=$([[ -e "$evil_mark" ]] && echo yes || echo no) profileConfig=$(jfield job.profileConfig <<<"$sj")"
+    fi
 
     # --- 17. discover and the required-flag check (cached per bin and version) ---
     rec="$TEST_ROOT/noflag.json"
@@ -1402,6 +1514,28 @@ console.log(r.survivors.length, lines.some((line) => line.startsWith("SIGTERM to
         fail "22 probe: a failed run is classified like a job (failed/quota, exit 1); an empty key is refused (exit 2)"
         echo "    exit=$rc out=$out / exit=$rc3 out=$out3"
     fi
+    # An interrupted probe (Ctrl-C, a closed terminal): the harness leads a session of its own, so the signal never
+    # reaches it, and nothing else knows it; the probe kills its tree, removes its scratch dir and exits 128 + signal.
+    local probe_sig probe_pid probe_rc probe_want
+    for probe_sig in INT HUP; do
+        rec="$TEST_ROOT/probe-$probe_sig.json"
+        rm -f "$rec"
+        AGENT_STUB_MODE=hang AGENT_STUB_RECORD="$rec" node "$HARNESS" probe --profile pr >/dev/null 2>&1 &
+        probe_pid=$!
+        child=""
+        if wait_file "$rec"; then child="$(REC="$rec" node -e 'console.log(JSON.parse(require("node:fs").readFileSync(process.env.REC, "utf8")).pid)')"; fi
+        kill -"$probe_sig" "$probe_pid" 2>/dev/null
+        probe_rc=0
+        wait "$probe_pid" || probe_rc=$?
+        probe_want=$((128 + $(kill -l "$probe_sig")))
+        if [[ -n "$child" && "$probe_rc" -eq "$probe_want" ]] && gone "$child" && [[ -z "$(/bin/ls -A "$STATE/probe")" ]]; then
+            pass "22 SIG$probe_sig to a running probe: its harness tree is killed, its scratch dir removed, exit $probe_want"
+        else
+            fail "22 SIG$probe_sig to a running probe: its harness tree is killed, its scratch dir removed, exit $probe_want"
+            echo "    exit=$probe_rc harness=$child alive=$(kill -0 "$child" 2>/dev/null && echo yes || echo no) left: $(/bin/ls -A "$STATE/probe" 2>/dev/null)"
+            if [[ -n "$child" ]]; then kill -KILL "$child" 2>/dev/null; fi
+        fi
+    done
 
     # --- 23. bounded stdout (unit) ---
     out="$(core_js '

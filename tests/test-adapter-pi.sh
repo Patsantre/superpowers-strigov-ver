@@ -257,6 +257,8 @@ main() {
     "pi-ext-rel": { $login, "options": { "extensions": ["ext/provider.ts"] } },
     "pi-ext-typo": { $login, "options": { "extensions": ["builtin:llamacpp"] } },
     "pi-key-fast": { $zai, "timeoutMin": 0.02 },
+    "pi-key-tamper-root": { $zai, "wrap": ["sh", "$TEST_ROOT/tamper.sh", "$STATE", "$TEST_ROOT/tampered-root"] },
+    "pi-key-tamper-keys": { $zai, "wrap": ["sh", "$TEST_ROOT/tamper.sh", "$STATE/keys", "$TEST_ROOT/tampered-keys"] },
     "pi-native": { $zai, "sandbox": "native" },
     "pi-offline0": { $zai, "env": { "PI_OFFLINE": "0" } },
     "pi-clash-home": { $zai, "env": { "PI_CODING_AGENT_DIR": "$TEST_ROOT/elsewhere" } },
@@ -339,13 +341,20 @@ console.log(a?.id, a?.idPrefix);")"
         && "$line" == "$n" && "$st" == completed/ ]]
     verdict "2 auth key + an auth.json in the isolated home (a /login there): refused (exit 2, no job) until the file is gone" $? "rc=$ok err: $got" "after rm: $st"
     # A models.json in the isolated home is how a keyed profile reaches a custom endpoint ("apiKey": "$ZAI_API_KEY",
-    # [03 §5.3]): the task runs on the key; one whose apiKey is a literal is doctor's pi auth check's to report.
-    printf '{}\n' >"$STATE/homes/pi-key/pi/models.json"
+    # [03 §5.3]): the task runs on the key. An apiKey of its own there (a literal, a !command, another variable) would
+    # win over the key: refused like an auth.json, without the value in the message.
+    printf '%s\n' '{"providers":{"zai":{"baseUrl":"https://proxy.example/v1","api":"openai-completions","apiKey":"$ZAI_API_KEY"}}}' >"$STATE/homes/pi-key/pi/models.json"
     start AGENT_STUB_RECORD="$TEST_ROOT/rec/key-models.json" -- --profile pi-key --prompt-file "$prompt"
     st="$(outcome "$ID")"
+    printf '%s\n' '{"providers":{"zai":{"baseUrl":"https://proxy.example/v1","apiKey":"zai-literal-own-key-8080"}}}' >"$STATE/homes/pi-key/pi/models.json"
+    line="$(/bin/ls "$JOBS" | wc -l | tr -d ' ')"
+    run_ad task --profile pi-key --background --prompt-file "$prompt"
+    n="$(/bin/ls "$JOBS" | wc -l | tr -d ' ')"
     rm -f "$STATE/homes/pi-key/pi/models.json"
-    [[ "$st" == completed/ && "$(env_names "$TEST_ROOT/rec/key-models.json" '^ZAI_API_KEY$')" == "ZAI_API_KEY" ]]
-    verdict "2 auth key + a models.json in the isolated home (a custom endpoint): runs on the key" $? "status: $st"
+    [[ "$st" == completed/ && "$(env_names "$TEST_ROOT/rec/key-models.json" '^ZAI_API_KEY$')" == "ZAI_API_KEY" \
+        && "$RC" -eq 2 && "$ERR" == "agent-dispatch: profile pi-key: $STATE/homes/pi-key/pi/models.json: the apiKey of provider \"zai\" is a literal key, not \$ZAI_API_KEY / \${ZAI_API_KEY}: pi sends it instead of ZAI_API_KEY, so the job would bill another credential; set the value to \"\$ZAI_API_KEY\" (or use \"authHeader\": true with \"apiKey\": \"\$ZAI_API_KEY\") or remove it" \
+        && "$ERR" != *zai-literal-own-key-8080* && "$n" == "$line" ]]
+    verdict "2 auth key + a models.json in the isolated home: apiKey \$ZAI_API_KEY (a custom endpoint) runs on the key; a literal apiKey there is refused (exit 2, no job, the value not shown)" $? "status: $st" "rc=$RC err: $ERR jobs: $line → $n"
     start -u PI_CODING_AGENT_DIR AGENT_STUB_RECORD="$TEST_ROOT/rec/login-unset.json" -- --profile pi-login --prompt-file "$prompt"
     st="$(outcome "$ID")"
     [[ "$st" == completed/ && "$(env_names "$TEST_ROOT/rec/login-unset.json" '^PI_CODING_AGENT_DIR$')" == "" && ! -d "$STATE/homes/pi-login" ]]
@@ -620,6 +629,32 @@ const h = JSON.parse(lines[0]); h.cwd = "/somewhere/else"; lines[0] = JSON.strin
     got="$(leaks_of "$ID")"
     [[ "$st" == failed/timeout && -z "$got" ]] && grep -qF 'ZAI_API_KEY=<redacted>' "$JOBS/$ID/sessions/"*.jsonl
     verdict "6 a timed-out job: its session file is redacted too" $? "st: $st files with the key: $got"
+    # The record lives under state/, which a sandboxed job may write: a job that rewrites its own meta.sessionDir to
+    # the data root or to keys/ must not steer the runner's scrub there. The wrap runs the stub, then rewrites
+    # <jobs>/<id>.json (and records the meta.sessionDir it reads back, the one the runner's scrub sees); the scrub still
+    # takes <job dir>/sessions, and keys/zai keeps the key.
+    cat >"$TEST_ROOT/tamper.sh" <<'EOF'
+target="$1"
+mark="$2"
+shift 2
+dir=""
+prev=""
+for arg in "$@"; do
+    [ "$prev" = "--session-dir" ] && dir="$arg"
+    prev="$arg"
+done
+"$@"
+rc=$?
+node -e 'const fs = require("node:fs"); const [file, target, mark] = process.argv.slice(1); const r = JSON.parse(fs.readFileSync(file, "utf8")); r.meta = { ...(r.meta || {}), sessionDir: target }; fs.writeFileSync(file + ".tamper", JSON.stringify(r)); fs.renameSync(file + ".tamper", file); fs.writeFileSync(mark, JSON.parse(fs.readFileSync(file, "utf8")).meta.sessionDir);' "$(dirname "$dir").json" "$target" "$mark"
+exit $rc
+EOF
+    for line in root:"$STATE" keys:"$STATE/keys"; do
+        start AGENT_STUB_MODE=leak-secret AGENT_STUB_SECRET_VAR=ZAI_API_KEY -- --profile "pi-key-tamper-${line%%:*}" --prompt-file "$prompt"
+        st="$(outcome "$ID")"
+        got="$(leaks_of "$ID")"
+        [[ "$st" == completed/ && -z "$got" && "$(cat "$TEST_ROOT/tampered-${line%%:*}" 2>/dev/null)" == "${line#*:}" && "$(cat "$STATE/keys/zai")" == *"$ZKEY"* ]] && grep -qF 'key=<redacted>' "$JOBS/$ID/sessions/"*.jsonl
+        verdict "6 a job that rewrites its record meta.sessionDir to ${line%%:*} (${line#*:}): the scrub still redacts <job dir>/sessions only — keys/zai keeps the key" $? "st: $st meta.sessionDir before the scrub: $(cat "$TEST_ROOT/tampered-${line%%:*}" 2>/dev/null) files with the key: $got" "keys/zai holds the key: $(grep -cF "$ZKEY" "$STATE/keys/zai")"
+    done
 
     # --- 7. two read-only jobs at once: distinct sessions ---
     start AGENT_STUB_MODE=slow AGENT_STUB_DELAY_MS=600 AGENT_STUB_RECORD="$TEST_ROOT/rec/par1.json" -- --profile pi-many --prompt-file "$prompt"
@@ -653,14 +688,29 @@ const h = JSON.parse(lines[0]); h.cwd = "/somewhere/else"; lines[0] = JSON.strin
         && "$RC" -eq 1 && "$OUT" == *"FAIL pi-auth pi-key: $STATE/homes/pi-key/pi/auth.json exists: a credential stored there (pi /login) wins over ZAI_API_KEY; remove that file (a keyed profile needs no login); task refuses the profile (exit 2)"* \
         && ! -s "$TEST_ROOT/auth.log" ]]
     verdict "8 doctor FAILs a keyed profile that task refuses — home user, an auth.json in its isolated home — without running pi" $? "home user rc=$ok: $(grep -E 'pi-auth|env' <<<"$got")" "auth.json rc=$RC: $(grep pi-auth <<<"$OUT")"
-    # A models.json there is not refused: pi auth check decides — not ready (its apiKey is `$ZAI_API_KEY`, absent from
-    # doctor's env) is ok, ready (a literal key of its own) is the FAIL below.
-    printf '{}\n' >"$STATE/homes/pi-key/pi/models.json"
+    # A models.json there whose apiKey for zai is `$ZAI_API_KEY` is not refused: pi auth check decides — not ready (the
+    # variable is absent from doctor's env) is ok, ready (something else pi holds) is the FAIL below.
+    printf '%s\n' '{"providers":{"zai":{"baseUrl":"https://proxy.example/v1","apiKey":"${ZAI_API_KEY}"}}}' >"$STATE/homes/pi-key/pi/models.json"
     : >"$TEST_ROOT/auth.log"
     run_env AGENT_STUB_AUTH=not_ready AGENT_STUB_AUTH_LOG="$TEST_ROOT/auth.log" -- doctor --profile pi-key
     rm -f "$STATE/homes/pi-key/pi/models.json"
-    [[ "$OUT" == *"ok pi-auth pi-key: pi holds no credential of its own for zai"* && "$OUT" != *"models.json exists"* && -s "$TEST_ROOT/auth.log" ]]
-    verdict "8 doctor on a keyed profile whose isolated home holds a models.json: pi auth check runs and decides (not ready → ok)" $? "rc=$RC: $(grep pi-auth <<<"$OUT")"
+    [[ "$OUT" == *"ok pi-auth pi-key: pi holds no credential of its own for zai"* && "$OUT" != *"models.json"* && -s "$TEST_ROOT/auth.log" ]]
+    verdict "8 doctor on a keyed profile whose isolated home holds a models.json with apiKey \${ZAI_API_KEY}: pi auth check runs and decides (not ready → ok)" $? "rc=$RC: $(grep pi-auth <<<"$OUT")"
+    # One whose apiKey is a command: doctor FAILs it as task refuses it, and doctor --probe starts no pi — the same
+    # judgement (storedCredentialProblem) in all three, the command never shown.
+    printf '%s\n' '{"providers":{"zai":{"apiKey":"!printf zai-cmd-own-key-9090"}}}' >"$STATE/homes/pi-key/pi/models.json"
+    : >"$TEST_ROOT/auth.log"
+    rm -f "$TEST_ROOT/rec/probe-models.json"
+    run_env AGENT_STUB_AUTH=not_ready AGENT_STUB_AUTH_LOG="$TEST_ROOT/auth.log" -- doctor --profile pi-key
+    ok=$RC
+    got="$OUT"
+    run_env AGENT_STUB_RESPONSE=PONG AGENT_STUB_RECORD="$TEST_ROOT/rec/probe-models.json" -- doctor --profile pi-key --probe
+    rm -f "$STATE/homes/pi-key/pi/models.json"
+    want="$STATE/homes/pi-key/pi/models.json: the apiKey of provider \"zai\" is a !command, not \$ZAI_API_KEY / \${ZAI_API_KEY}: pi sends it instead of ZAI_API_KEY, so the job would bill another credential; set the value to \"\$ZAI_API_KEY\" (or use \"authHeader\": true with \"apiKey\": \"\$ZAI_API_KEY\") or remove it"
+    [[ "$ok" -eq 1 && "$got" == *"FAIL pi-auth pi-key: $want; task refuses the profile (exit 2)"* && ! -s "$TEST_ROOT/auth.log" \
+        && "$RC" -eq 1 && "$OUT" == *"FAIL pi-auth pi-key: $want"* && "$OUT" != *"ok probe"* && ! -e "$TEST_ROOT/rec/probe-models.json" \
+        && "$got$OUT$ERR" != *zai-cmd-own-key-9090* ]]
+    verdict "8 a models.json apiKey of its own (a !command): doctor FAIL pi-auth (pi not run) and doctor --probe refused (no pi started), as task refuses it; the command never shown" $? "doctor rc=$ok: $(grep pi-auth <<<"$got")" "probe rc=$RC: $(tail -2 <<<"$OUT") err: $ERR"
     run_env AGENT_STUB_AUTH=ready -- doctor --profile pi-key
     ok=$RC
     got="$OUT"
@@ -838,7 +888,7 @@ const holds = (f) => fs.readFileSync(f).includes(key);
 console.log(JSON.stringify([plan.map((e) => [path.relative(dir, e.path), e.mode.toString(8)]), [session, nested].map((f) => (fs.statSync(f).mode & 0o777).toString(8)),
   holds(session) || holds(nested) || text.includes("uoted"), text.split("<redacted>").length - 1, text.trim().split("\n").every((l) => JSON.parse(l)), fs.readFileSync(nested, "utf8"),
   [inode(clean), inode(blob)].every((n, i) => n === before[i]), holds(blob),
-  pi.resumeCheck({ id: "pi-0001", cwd: "/w", sessionId: "pi-0001", meta: { sessionDir: dir } }, {}, { job: { cwd: "/w" } }, ctx), pi.scrub(job, ctx), pi.scrub(job, { fs: ctx.fs })]));' "$TEST_ROOT")"
+  pi.resumeCheck({ id: "pi-0001", cwd: "/w", sessionId: "pi-0001", meta: { sessionDir: dir } }, {}, { job: { cwd: "/w", dir: path.join(root, "jobs", "pi-0002") } }, ctx), pi.scrub(job, ctx), pi.scrub(job, { fs: ctx.fs })]));' "$TEST_ROOT")"
     want='[[["2026-10-21T00-00-00-000Z_pi-0001.jsonl","640"],["nested/notes.txt","600"]],["640","600"],false,2,true,"raw <redacted>\n",true,true,null,[],[]]'
     [[ "$got" == "$want" ]]
     verdict "9 scrub: every text file of the session dir holding a key (raw or JSON-escaped, nested too) comes back redacted with its mode; clean and binary files untouched; still valid JSONL that resumes; nothing left on a second pass or without a redactor" $? "got:  $got" "want: $want"
@@ -880,19 +930,23 @@ console.log(JSON.stringify([plan.map((e) => path.relative(dir, e.path)), plan2.l
     [[ "$got" == "$want" ]]
     verdict "9 scrub never follows a symlink: a symlinked dir (nested too, the session dir itself, a loop) or file is skipped — the files outside keep their content, their dir its mode, the links stay links; real files beside them are still redacted" $? "got:  $got" "want: $want"
 
-    got="$(pi_js 'const files = {
-  "/d": ["2026-10-21T00-00-00-000Z_pi-0001.jsonl", "other.jsonl", "notes.txt"],
-  "/d/2026-10-21T00-00-00-000Z_pi-0001.jsonl": JSON.stringify({ type: "session", version: 3, id: "pi-0001", cwd: "/w" }) + "\n{}\n",
-  "/d/other.jsonl": JSON.stringify({ type: "session", version: 3, id: "pi-0009", cwd: "/w" }) + "\n",
+    got="$(pi_js 'const D = "/j/pi-0001/sessions";
+const files = {
+  [D]: ["2026-10-21T00-00-00-000Z_pi-0001.jsonl", "other.jsonl", "notes.txt"],
+  [`${D}/2026-10-21T00-00-00-000Z_pi-0001.jsonl`]: JSON.stringify({ type: "session", version: 3, id: "pi-0001", cwd: "/w" }) + "\n{}\n",
+  [`${D}/other.jsonl`]: JSON.stringify({ type: "session", version: 3, id: "pi-0009", cwd: "/w" }) + "\n",
 };
 const ctx = { fs: { readdir: (d) => files[d] ?? null, readFile: (f) => (typeof files[f] === "string" ? files[f] : null), exists: (f) => f in files, stat: () => null } };
-const prev = { id: "pi-0001", cwd: "/w", sessionId: "pi-0001", meta: { sessionDir: "/d" } };
-const check = (p, cwd) => pi.resumeCheck(p, {}, { job: { cwd } }, ctx);
+const prev = { id: "pi-0001", cwd: "/w", sessionId: "pi-0001", meta: { sessionDir: D } };
+const check = (p, cwd) => pi.resumeCheck(p, {}, { job: { cwd, dir: "/j/pi-0002" } }, ctx);
+const shapes = ["/j", "/j/pi-0001", "/elsewhere/pi-0001/sessions", "/j/zt-0001/sessions", "/j/pi-0001/../pi-0001/sessions", "j/pi-0001/sessions"].map((sessionDir) => check({ ...prev, meta: { sessionDir } }, "/w"));
+const resume = (meta) => pi.invocation({ profile: { harness: "pi", auth: "login", model: "openai/x" }, profileName: "p", write: false, job: { id: "pi-0002", dir: "/j/pi-0002", cwd: "/w" }, prompt: { path: "/w/p.md" }, sessionId: "pi-0001", resume: { sessionId: "pi-0001", prev: { id: "pi-0001", meta } }, harness: null },
+  { profileName: "p", env: {}, paths: { homes: "/h" }, fs: { readdir: () => null, readFile: () => null, exists: () => false, stat: () => null } }).meta.sessionDir;
 console.log(JSON.stringify([check(prev, "/w"), check({ ...prev, sessionId: "pi-0009" }, "/w"), check({ ...prev, cwd: "/x" }, "/w"), check({ ...prev, meta: null }, "/w"),
-  check({ ...prev, sessionId: "pi-0002" }, "/w"), check({ ...prev, cwd: "/v" }, "/v")]));')"
-    want='[null,null,"the pi session of pi-0001 was started in /x, not /w","job pi-0001 recorded no pi session dir","no pi session file with id pi-0002 for /w in /d; pi would start a new session","no pi session file with id pi-0001 for /v in /d; pi would start a new session"]'
+  check({ ...prev, sessionId: "pi-0002" }, "/w"), check({ ...prev, cwd: "/v" }, "/v"), new Set(shapes).size === 1 && shapes[0], resume({ sessionDir: "/j/pi-0003/sessions" }), resume({ sessionDir: "/" }), resume(null)]));')"
+    want='[null,null,"the pi session of pi-0001 was started in /x, not /w","job pi-0001 recorded no pi session dir","no pi session file with id pi-0002 for /w in /j/pi-0001/sessions; pi would start a new session","no pi session file with id pi-0001 for /v in /j/pi-0001/sessions; pi would start a new session","job pi-0001 recorded no pi session dir","/j/pi-0003/sessions","/j/pi-0001/sessions","/j/pi-0001/sessions"]'
     [[ "$got" == "$want" ]]
-    verdict "9 resumeCheck: same cwd, a recorded session dir, and a file whose header id and cwd match (any file name)" $? "got:  $got" "want: $want"
+    verdict "9 resumeCheck: same cwd, a recorded session dir, and a file whose header id and cwd match (any file name); a recorded dir is taken only as <jobs dir>/<core job id>/sessions — resumeCheck and the resume both fall back otherwise" $? "got:  $got" "want: $want"
 
     got="$(pi_js 'const calls = [];
 let status = 1;
@@ -957,22 +1011,77 @@ console.log(JSON.stringify([
     [[ "$got" == "$want" ]]
     verdict "9 a keyed profile on a stored credential: invocation and probe refuse it (UsageError) — home user, an auth.json in its isolated home — not doctor's job-less request nor a login profile; a resume's meta lists its id's session files" $? "got:  $got" "want: $want"
 
-    # A models.json in a keyed profile's isolated home is a custom endpoint (its apiKey `$<keyVar>`, [03 §5.3]):
-    # invocation and probe take it, never reading it; an auth.json beside it is still refused.
-    got="$(pi_js 'const reads = [];
-const present = new Set(["/data/homes/p/pi/models.json"]);
+    # A models.json in a keyed profile's isolated home is a custom endpoint [03 §5.3]: its apiKey for the job's provider
+    # must be the profile's own variable ($ZAI_API_KEY or ${ZAI_API_KEY}) or absent. A literal, a !command or another
+    # variable outranks the environment [03 §6]: invocation and probe refuse it, never naming the value, and doctor's
+    # pi auth check FAILs it with the same text. Another provider's key counts only when the model names no provider;
+    # a file that is not a JSON object (or not readable without following a symlink) is refused; an auth.json beside a
+    # good one still is. Header values take the same forms: a credential header (provider headers, models[].headers,
+    # modelOverrides) other than the own variable (after Bearer too), or any header that is a !command or another
+    # variable, is refused the same way.
+    got="$(pi_js 'const M = "/data/homes/p/pi/models.json";
+const files = { "/data/homes/p/pi": "" };
+const reads = [];
 const ctx = { profileName: "p", env: { PATH: "" }, paths: { homes: "/data/homes" },
-  fs: { exists: (f) => present.has(f), readFile: (f) => { reads.push(f); return null; }, readdir: () => null, stat: () => null },
-  exec: () => { throw new Error("pi was run"); } };
+  fs: { exists: (f) => f in files, readFile: (f, opts) => { reads.push([f, Boolean(opts?.flag)]); return files[f] ?? null; }, readdir: () => null, stat: () => null },
+  exec: () => ({ status: 1, stdout: "{}", stderr: "", error: null }) };
 const keyed = { harness: "pi", auth: { key: "zai" }, keyVar: "ZAI_API_KEY", model: "zai/glm-5.3", home: "isolated" };
 const req = (profile) => ({ profile, profileName: "p", write: false, job: { id: "pi-0002", dir: "/data/jobs/pi-0002", cwd: "/w" }, prompt: { path: "/w/p.md" }, sessionId: "pi-0002", resume: null, harness: null });
 const err = (fn) => { try { fn(); return null; } catch (error) { return `${error instanceof core.UsageError ? "UsageError" : "Error"}: ${error.message}`; } };
-const models = [err(() => pi.invocation(req(keyed), ctx)), err(() => pi.probe(req(keyed), ctx))];
-present.add("/data/homes/p/pi/auth.json");
-console.log(JSON.stringify([...models, err(() => pi.invocation(req(keyed), ctx)), reads]));')"
-    want='[null,null,"UsageError: profile p: /data/homes/p/pi/auth.json exists: a credential stored there (pi /login) wins over ZAI_API_KEY; remove that file (a keyed profile needs no login)",[]]'
+const zai = (apiKey) => JSON.stringify({ providers: { zai: { baseUrl: "https://proxy.example/v1", api: "openai-completions", ...(apiKey === undefined ? {} : { apiKey }) } } });
+// The zai entry with its own apiKey and these header fields (headers, models, modelOverrides).
+const zh = (entry) => JSON.stringify({ providers: { zai: { baseUrl: "https://proxy.example/v1", api: "openai-completions", apiKey: "$ZAI_API_KEY", ...entry } } });
+const seen = [];
+// [invocation, probe, doctor pi-auth] on one models.json content: the refusal kind when all three agree, else all three.
+const judge = (profile, text) => {
+  files[M] = text;
+  const auth = pi.doctorChecks(profile, ctx).find((c) => c.name === "pi-auth");
+  const out = [err(() => pi.invocation(req(profile), ctx)), err(() => pi.probe(req(profile), ctx)), `${auth.level} ${auth.hint}`];
+  seen.push(...out);
+  const kind = /is (a literal key|a !command|another variable|not a string)|cannot be read as a JSON object/.exec(out[0] ?? "")?.[0] ?? null;
+  const agree = out[0] === out[1] && (out[0] === null ? auth.level === "ok" : out[2] === `FAIL ${out[0].replace("UsageError: profile p: ", "")}; task refuses the profile (exit 2)`);
+  return agree ? kind : out;
+};
+const bare = { ...keyed, model: "glm-5.3" };
+const table = {
+  literal: judge(keyed, zai("sk-literal-value-111")),
+  command: judge(keyed, zai("!cat /secret-cmd-222")),
+  other: judge(keyed, zai("$OTHER_KEY_333")),
+  otherBraced: judge(keyed, zai("${OTHER_KEY_444}")),
+  number: judge(keyed, zai(5150)),
+  own: judge(keyed, zai("$ZAI_API_KEY")),
+  ownBraced: judge(keyed, zai("${ZAI_API_KEY}")),
+  noApiKey: judge(keyed, zai(undefined)),
+  empty: judge(keyed, "{}"),
+  otherProvider: judge(keyed, JSON.stringify({ providers: { openrouter: { apiKey: "sk-other-555" }, zai: { apiKey: "$ZAI_API_KEY" } } })),
+  noProviderInModel: judge(bare, JSON.stringify({ providers: { openrouter: { apiKey: "sk-other-555" }, zai: { apiKey: "$ZAI_API_KEY" } } })),
+  noProviderInModelOwn: judge(bare, JSON.stringify({ providers: { zai: { apiKey: "${ZAI_API_KEY}" }, local: { baseUrl: "http://127.0.0.1:8080/v1" } } })),
+  unparseable: judge(keyed, "{ \"providers\": "),
+  array: judge(keyed, "[]"),
+  providersNotObject: judge(keyed, "{\"providers\": []}"),
+  unreadable: judge(keyed, null),
+  hdrAuthLiteral: judge(keyed, zh({ headers: { Authorization: "Bearer sk-hdr-literal-666" } })),
+  hdrApiKeyCommand: judge(keyed, zh({ headers: { "x-api-key": "!cat /secret-hdr-777" } })),
+  hdrOtherVar: judge(keyed, zh({ headers: { "X-Custom": "$OTHER_HDR_888" } })),
+  hdrOwn: judge(keyed, zh({ headers: { "x-api-key": "${ZAI_API_KEY}" } })),
+  hdrBearerOwn: judge(keyed, zh({ headers: { Authorization: "Bearer ${ZAI_API_KEY}", "api-key": "$ZAI_API_KEY" } })),
+  hdrModel: judge(keyed, zh({ models: [{ id: "glm-5.3", headers: { Authorization: "sk-model-hdr-999" } }] })),
+  hdrOverride: judge(keyed, zh({ modelOverrides: { "glm-5.3": { headers: { "api-key": "sk-override-hdr-1010" } } } })),
+  hdrBenign: judge(keyed, zh({ headers: { "X-Title": "my app", "HTTP-Referer": "https://x" } })),
+  hdrOtherProvider: judge(keyed, JSON.stringify({ providers: { openrouter: { headers: { Authorization: "Bearer sk-or-hdr-1111" } }, zai: { apiKey: "$ZAI_API_KEY" } } })),
+};
+const where = (entry) => { files[M] = zh(entry); return /the header (.*?) is /.exec(err(() => pi.invocation(req(keyed), ctx)) ?? "")?.[1] ?? null; };
+const at = [where({ models: [{ id: "glm-5.3", headers: { Authorization: "sk-model-hdr-999" } }] }), where({ modelOverrides: { "glm-5.3": { headers: { "api-key": "sk-override-hdr-1010" } } } })];
+files[M] = zai("sk-literal-value-111");
+const full = err(() => pi.invocation(req(keyed), ctx));
+files[M] = zai("$ZAI_API_KEY");
+files["/data/homes/p/pi/auth.json"] = "";
+const beside = err(() => pi.invocation(req(keyed), ctx));
+const leaks = ["sk-literal-value-111", "cat /secret-cmd-222", "OTHER_KEY_333", "OTHER_KEY_444", "5150", "sk-other-555", "sk-hdr-literal-666", "cat /secret-hdr-777", "OTHER_HDR_888", "sk-model-hdr-999", "sk-override-hdr-1010", "sk-or-hdr-1111"].filter((secret) => seen.some((text) => String(text).includes(secret)));
+console.log(JSON.stringify([table, at, full, beside, leaks, reads.every(([f, noFollow]) => f === M && noFollow), reads.length > 0]));')"
+    want='[{"literal":"is a literal key","command":"is a !command","other":"is another variable","otherBraced":"is another variable","number":"is not a string","own":null,"ownBraced":null,"noApiKey":null,"empty":null,"otherProvider":null,"noProviderInModel":"is a literal key","noProviderInModelOwn":null,"unparseable":"cannot be read as a JSON object","array":"cannot be read as a JSON object","providersNotObject":"cannot be read as a JSON object","unreadable":"cannot be read as a JSON object","hdrAuthLiteral":"is a literal key","hdrApiKeyCommand":"is a !command","hdrOtherVar":"is another variable","hdrOwn":null,"hdrBearerOwn":null,"hdrModel":"is a literal key","hdrOverride":"is a literal key","hdrBenign":null,"hdrOtherProvider":null},["\"Authorization\" of provider \"zai\" (models[0])","\"api-key\" of provider \"zai\" (modelOverrides \"glm-5.3\")"],"UsageError: profile p: /data/homes/p/pi/models.json: the apiKey of provider \"zai\" is a literal key, not $ZAI_API_KEY / ${ZAI_API_KEY}: pi sends it instead of ZAI_API_KEY, so the job would bill another credential; set the value to \"$ZAI_API_KEY\" (or use \"authHeader\": true with \"apiKey\": \"$ZAI_API_KEY\") or remove it","UsageError: profile p: /data/homes/p/pi/auth.json exists: a credential stored there (pi /login) wins over ZAI_API_KEY; remove that file (a keyed profile needs no login)",[],true,true]'
     [[ "$got" == "$want" ]]
-    verdict "9 a models.json in a keyed profile's isolated home (a custom endpoint): invocation and probe take it without reading it; an auth.json beside it is refused" $? "got:  $got" "want: $want"
+    verdict "9 a models.json in a keyed profile's isolated home: apiKey \$ZAI_API_KEY / \${ZAI_API_KEY} / none / another provider's runs; a literal, a !command, another variable, a non-string, a bad file are refused by invocation, probe and doctor alike, the value never shown; so is a credential header (provider, models[], modelOverrides) other than the own variable (Bearer allowed) and any header that is a !command or another variable — a harmless literal header and another provider's header pass; read only with O_NOFOLLOW" $? "got:  $got" "want: $want"
 
     # The stub keeps a copy of the adapter's built-in extensions instead of require()-ing the ES module adapter (Node
     # 20.19+ / 22.12+ only): the two lists match, and a run naming one works where require() cannot load ES modules.

@@ -869,8 +869,13 @@ EOF
     id="${OUT##* }"
     run_ad task --profile ct-sub --background --cwd "$repo2" --prompt-file "$prompt"
     unset AGENT_STUB_MODE AGENT_STUB_DELAY_MS
-    [[ "$RC" -eq 2 && "$ERR" == "agent-dispatch: profile ct-sub is at maxParallel=1 (running: $id)" ]]
-    verdict "9 maxParallel=1: a second task of the profile (any tree) is refused, naming the running one" $? "rc=$RC err: $ERR first: $id"
+    [[ "$RC" -eq 2 && "$ERR" == "agent-dispatch: profile ct-sub is at maxParallel=1 (running: $id cwd=$repo)" ]]
+    verdict "9 maxParallel=1: a second task of the profile from another repository is refused, naming the running job and its workspace root" $? "rc=$RC err: $ERR first: $id"
+    # Ids are numbered per workspace: the named root is what the wait loop polls with (agent-invocation, Refusals), and
+    # status <id> --cwd <root> from the other repository finds that running job.
+    st="$(cd "$repo2" && ad status "$id" --cwd "$repo" --json 2>/dev/null | jfield job.status)"
+    [[ "$st" == running ]]
+    verdict "9 status <id> --cwd <the named root>, run from the other repository, finds the running job" $? "status: $st"
     run_ad cancel "$id"
     [[ "$RC" -eq 0 && "$OUT" == "cancelled $id" && "$(wait_status "$id" 'cancelled' 10)" == cancelled ]]
     verdict "9 cancel <ct-id> goes to the core: the job is cancelled" $? "rc=$RC out: $OUT"
@@ -1814,10 +1819,10 @@ EOF
     git -C "$t_dir/sub" "${git_id[@]}" commit -q --allow-empty -m s1
     run_ad tree-state --cwd "$t_dir" --since "$t_m"
     t_sub+=("$OUT")
-    [[ "${t_sub[0]}" == "tree "*": changed since ${t_m:0:7}: sub" && "${t_sub[1]}" == "tree $t_m: unchanged" \
-        && "${t_sub[2]}" == "tree "*": changed since ${t_m:0:7}: sub" && "${t_sub[3]}" == "tree "*": changed since ${t_m:0:7}: sub" \
+    [[ "${t_sub[0]}" == "tree "*": changed since ${t_m:0:7}: sub (nested repository)" && "${t_sub[1]}" == "tree $t_m: unchanged" \
+        && "${t_sub[2]}" == "tree "*": changed since ${t_m:0:7}: sub (nested repository)" && "${t_sub[3]}" == "tree "*": changed since ${t_m:0:7}: sub (nested repository)" \
         && "${t_sub[0]}" != "${t_sub[2]}" ]]
-    verdict "16 a submodule with ignore = all: an edit or a new file inside it, or a moved HEAD, names it; a revert gives the old id" $? "${t_sub[@]}"
+    verdict "16 a submodule with ignore = all: an edit or a new file inside it, or a moved HEAD, names it as a nested repository; a revert gives the old id" $? "${t_sub[@]}"
     git init -q -b main "$t_dir/emb"
     printf 'e\n' >"$t_dir/emb/e.txt"
     git -C "$t_dir/emb" add e.txt && git -C "$t_dir/emb" "${git_id[@]}" commit -qm e0
@@ -1828,8 +1833,41 @@ EOF
     t_out="$OUT"
     git -C "$t_dir/emb" checkout -q -- e.txt
     run_ad tree-state --cwd "$t_dir" --since "$t_e"
-    [[ "$t_out" == "tree "*": changed since ${t_e:0:7}: emb" && "$OUT" == "tree $t_e: unchanged" ]]
-    verdict "16 an untracked nested repository: an edit inside it names it; a revert gives the old id" $? "edited: $t_out" "reverted: $OUT"
+    [[ "$t_out" == "tree "*": changed since ${t_e:0:7}: emb (nested repository)" && "$OUT" == "tree $t_e: unchanged" ]]
+    verdict "16 an untracked nested repository: an edit inside it names it as a nested repository; a revert gives the old id" $? "edited: $t_out" "reverted: $OUT"
+    # Nested repositories come first: past the 10-path cap (here a01.txt … a11.txt sort before emb) one still shows.
+    for t_i in 01 02 03 04 05 06 07 08 09 10 11; do printf 'n\n' >"$t_dir/a$t_i.txt"; done
+    printf 'f\n' >>"$t_dir/emb/e.txt"
+    run_ad tree-state --cwd "$t_dir" --since "$t_e"
+    t_out="$OUT"
+    git -C "$t_dir/emb" checkout -q -- e.txt
+    rm -f "$t_dir"/a??.txt
+    [[ "$t_out" == "tree "*": changed since ${t_e:0:7}: emb (nested repository), a01.txt, a02.txt, a03.txt, a04.txt, a05.txt, a06.txt, a07.txt, a08.txt, a09.txt (+2 more)" ]]
+    verdict "16 a nested repository is named first, so the 10-path cap never hides it" $? "$t_out"
+    # The limit of the documented revert (agent-invocation, the no-edit check), pinned: phase work before the baseline
+    # (an uncommitted edit of a.txt), then a job edits a.txt and emb/e.txt. The one command restores a.txt to the phase
+    # state, but the parent patch holds only a gitlink line for emb, which git apply skips: the edit inside stays and
+    # a second --since still names emb. The user reverts inside that repository by hand.
+    printf 'phase\n' >>"$t_dir/a.txt"
+    run_ad tree-state --cwd "$t_dir"
+    printf '%s\n' "$OUT" >"$TEST_ROOT/nested.tree"
+    printf 'job\n' >>"$t_dir/a.txt"
+    printf 'job\n' >>"$t_dir/emb/e.txt"
+    run_ad tree-state --cwd "$t_dir" --since "$(cut -c6- "$TEST_ROOT/nested.tree")"
+    t_out="$OUT"
+    local t_after="${OUT#tree }" t_rc
+    t_after="${t_after%%:*}"
+    (cd "$t_dir" && git diff-tree -p --binary "$t_after" "$(cut -c6- "$TEST_ROOT/nested.tree")" | git apply) 2>"$TEST_ROOT/apply.err"
+    t_rc=$?
+    run_ad tree-state --cwd "$t_dir" --since "$(cut -c6- "$TEST_ROOT/nested.tree")"
+    local t_base
+    t_base="$(cut -c6-12 "$TEST_ROOT/nested.tree")"
+    [[ "$t_out" == "tree $t_after: changed since $t_base: emb (nested repository), a.txt" && "$(cat "$t_dir/a.txt")" == $'x\nphase' \
+        && "$(tail -1 "$t_dir/emb/e.txt")" == job && "$OUT" == "tree "*": changed since $t_base: emb (nested repository)" ]]
+    verdict "16 the documented revert restores a plain file to the phase state and cannot touch a nested repository: its edit stays, --since still names it" $? \
+        "before: $t_out" "apply rc=$t_rc: $(cat "$TEST_ROOT/apply.err")" "a.txt: $(cat "$t_dir/a.txt" | tr '\n' '|') emb/e.txt: $(tr '\n' '|' <"$t_dir/emb/e.txt")" "after: $OUT"
+    git -C "$t_dir" checkout -q -- a.txt
+    git -C "$t_dir/emb" checkout -q -- e.txt
     # A nested repository without a commit cannot be indexed: exit 1 with git's whole message (its first line is the
     # warning about emb), so the path reaches the user.
     git init -q -b main "$t_dir/fixtures/r"

@@ -965,6 +965,23 @@ export function treeState(root) {
 // split the line or blur the list.
 const shownPath = (name) => (/[\x00-\x1f\x7f]|, |^"/.test(name) ? JSON.stringify(name) : name);
 
+// The changed paths between two tree ids, nested repositories first: a path whose mode is 160000 on either side (a
+// submodule or a nested repository, a gitlink) as "<path> (nested repository)". The parent's revert patch carries only
+// a gitlink line for one, which `git apply` skips, so the orchestrator names them apart; listed first, the 10-path cap
+// of the line never hides one.
+function changedPaths(root, since, tree) {
+  const raw = gitOut(root, ["diff-tree", "-r", "--no-renames", "--ignore-submodules=none", "--raw", "-z", since, tree]).split("\0");
+  const nested = [];
+  const plain = [];
+  // -z --raw: ":<mode> <mode> <id> <id> <status>" and the path, as two fields (one path each without renames).
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    const [srcMode, dstMode] = raw[i].slice(1).split(" ");
+    if (srcMode === "160000" || dstMode === "160000") nested.push(`${shownPath(raw[i + 1])} (nested repository)`);
+    else plain.push(shownPath(raw[i + 1]));
+  }
+  return [...nested, ...plain];
+}
+
 function cmdTreeState(args) {
   const { values } = parse(args, { cwd: { type: "string" }, since: { type: "string" } }, 0);
   const since = values.since;
@@ -979,9 +996,8 @@ function cmdTreeState(args) {
     // the same content under another spelling and would read as changed with no path to name.
     const type = spawnSync("git", ["cat-file", "-t", since], { cwd: root, encoding: "utf8", timeout: STORE_TIMEOUT_MS });
     if (since.length !== tree.length || type.status !== 0 || type.stdout.trim() !== "tree") throw new UsageError(sinceUsage);
-    const diff = ["diff-tree", "-r", "--no-renames", "--ignore-submodules=none", "--name-only", "-z", since, tree];
-    const changed = gitOut(root, diff).split("\0").filter(Boolean);
-    const shown = changed.slice(0, 10).map(shownPath).join(", ") + (changed.length > 10 ? ` (+${changed.length - 10} more)` : "");
+    const changed = changedPaths(root, since, tree);
+    const shown = changed.slice(0, 10).join(", ") + (changed.length > 10 ? ` (+${changed.length - 10} more)` : "");
     out(`tree ${tree}: changed since ${since.slice(0, 7)}: ${shown}\n`);
   }
   return 0;

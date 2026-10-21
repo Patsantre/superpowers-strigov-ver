@@ -58,7 +58,7 @@ Read the plan file's first 30 lines and check: file starts with `---`; frontmatt
 
 This skill produces plans in the YAML-frontmatter + phases format consumed natively by `dev-orchestrator`. The TDD discipline (failing test → minimal impl → passing test → commit) lives **inside** each phase as the step pattern — phases are the orchestration unit, TDD steps are the work pattern. The canonical format definition lives in `../dev-orchestrator/opus-plan-writer-prompt.md` Mode A — keep this skill's format guidance below in sync with it.
 
-**Codex Astra xhigh** reviews the plan after the Opus writer produces it — precisely, the profile of the `plan-reviewer` role (`"$AD" route plan-reviewer`, per `../agent-invocation/SKILL.md`); by default Astra, the same command. Reuse `../dev-orchestrator/codex-plan-reviewer-prompt.md` verbatim (built-in `--model gpt-6-astra --effort xhigh`, no `--write`, fresh task each round; adapt the opening line to name this skill instead of dev-orchestrator). The review stages, finding classes, and output format apply unchanged. Loop cap=4.
+**Codex Astra xhigh** reviews the plan after the Opus writer produces it — precisely, the profile of the `plan-reviewer` role (`"$AD" route plan-reviewer`, per `../agent-invocation/SKILL.md`); by default Astra, the same command. Reuse `../dev-orchestrator/codex-plan-reviewer-prompt.md` verbatim (built-in `--model gpt-6-astra --effort xhigh`, no `--write`, fresh task each round; adapt the opening line to name this skill instead of dev-orchestrator). A route line with `readOnly=none` puts the job inside `../agent-invocation/SKILL.md` "No-edit check". The review stages, finding classes, and output format apply unchanged. Loop cap=4.
 
 Verdict handling (identical to dev-orchestrator Step 2):
 

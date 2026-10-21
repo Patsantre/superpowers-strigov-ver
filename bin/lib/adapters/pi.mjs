@@ -15,8 +15,9 @@
 //   so resumeCheck looks for the session file before a resume and finalize() turns that warning, or the new session
 //   file pi created, into resume-lost.
 // - pi writes every message of a run into that session file as it is [03 §6 "Leak risks" 4], beyond the core's
-//   stream redaction: scrub() hands the core those files with the job's redactor applied after every run, so a key
-//   the model or a tool printed does not stay in the job dir (spec §3.5).
+//   stream redaction: scrub() hands the core those files with the job's redactor applied when the runner finishes the
+//   job, so a key the model or a tool printed does not stay in the job dir (spec §3.5; a runner that dies itself
+//   leaves them unscrubbed).
 // - Read-only reviewer = `--tools read,grep,find,ls` (no bash, so no git; spec §3.6 A4) with `--no-mcp` (MCP tools
 //   survive `--tools` otherwise [03 §15 item 18]); the writer gets pi's defaults plus grep/find/ls [03 §16.2].
 // - `--no-approve` keeps the repository's `.pi/*` (settings, models, extensions, MCP) out (spec §3.6 A5);
@@ -27,8 +28,11 @@
 //   isolated (PI_CODING_AGENT_DIR = <data>/homes/<profile>/pi, the same dir `profile env` prints): pi prefers a
 //   credential stored in its own auth.json, then a provider apiKey in its models.json, over the environment, so a key
 //   saved in the user's pi would silently win over ours [03 §6]. A keyed profile with "home": "user", or one whose
-//   isolated home holds an auth.json, is refused (exit 2). A models.json there is a custom endpoint, its apiKey
-//   normally `$<keyVar>` [03 §5.3]: it runs, and doctor's pi auth check names one holding a key of its own. With
+//   isolated home holds an auth.json, is refused (exit 2). A models.json there is a custom endpoint: it runs while the
+//   apiKey of the job's provider is `$<keyVar>` / `${<keyVar>}` or absent [03 §5.3]; any other (a literal, a
+//   `!command`, another variable) is refused the same way, and so is a credential header (provider `headers`,
+//   `models[].headers`, `modelOverrides`) other than `$<keyVar>` / `${<keyVar>}` (optionally after `Bearer `), any
+//   header value that is a `!command` or another variable, and a file that cannot be read as JSON. With
 //   "home": "user" (a login) the caller's PI_CODING_AGENT_DIR passes (manifest.homeEnv).
 // - pi exits 0 when the provider fails: reduce() reads the events — the last assistant `message_end` (its text,
 //   stopReason, errorMessage) and `agent_settled` (the terminal marker, `aborted`) [03 §3.1, §3.3].
@@ -39,12 +43,12 @@
 // Never run: `pi auth print-api-key` / `print-bearer-token` (they print secrets) and `--api-key` (visible in ps)
 // [03 §5.1, §6].
 //
-// Pure data, as the contract asks: processes and files only through ctx.exec / ctx.fs (node:fs gives scrub only its
-// O_NOFOLLOW flag).
+// Pure data, as the contract asks: processes and files only through ctx.exec / ctx.fs (node:fs gives only its
+// O_NOFOLLOW flag, to scrub and to the read of models.json).
 
 import { constants as fsConstants } from "node:fs";
 import path from "node:path";
-import { UsageError, filterEnv, parseEvents } from "../agent-core.mjs";
+import { UsageError, filterEnv, isCoreJobId, parseEvents } from "../agent-core.mjs";
 
 // The version the facts were read from (pi itself was not run, [03] header); doctor names any other one.
 export const VERIFIED_VERSIONS = ["1.3.0"];
@@ -96,9 +100,9 @@ function secretEnvOf(profile) {
 // "owns" its provider [03 §6] — so a job would bill that credential while `channels` names the key. In the user's own
 // pi home those files are the user's business: a keyed profile runs in its isolated home only (its default); there,
 // an auth.json (a /login through `profile env`, or a login profile of the same name before) refuses the run. Only its
-// existence is checked: the adapter never reads a credential store. A models.json is not refused: it is how a keyed
-// profile reaches a custom endpoint (`"apiKey": "$<keyVar>"`, [03 §5.3]); one whose apiKey is a literal or a command
-// is what doctor's pi auth check reports (authCheck).
+// existence is checked: the adapter never reads pi's credential store. A models.json is how a keyed profile reaches a
+// custom endpoint (`"apiKey": "$<keyVar>"`, [03 §5.3]): modelsJsonProblem reads it. task, doctor --probe and doctor's
+// pi auth check (authCheck) all judge through this function, so they agree.
 function storedCredentialProblem(profile, ctx) {
   if (!keyed(profile)) return null;
   const keyVar = profile.keyVar || "keyVar";
@@ -110,7 +114,64 @@ function storedCredentialProblem(profile, ctx) {
   if (ctx?.fs?.exists?.(auth) === true) {
     return `${auth} exists: a credential stored there (pi /login) wins over ${keyVar}; remove that file (a keyed profile needs no login)`;
   }
-  return null;
+  return modelsJsonProblem(profile, ctx, path.join(agentDir, "models.json"), keyVar);
+}
+
+// What an apiKey or header value of models.json is, for a message that never names the value itself.
+const apiKeyKind = (value) => (typeof value !== "string" ? "not a string" : value.startsWith("!") ? "a !command" : value.startsWith("$") ? "another variable" : "a literal key");
+
+// A header whose name says it carries a credential: the provider SDKs merge custom headers over the auth header they
+// build from the apiKey or the environment.
+const CREDENTIAL_HEADER_RE = /^(proxy-)?authorization$|api[-_]?key|token|secret/i;
+
+// The header maps of one provider entry of models.json, each with where it sits: the provider's own, each model's
+// (models[i]) and each override's (modelOverrides) [03 §5.3].
+function headerMapsOf(entry) {
+  const maps = [["", entry.headers]];
+  if (Array.isArray(entry.models)) entry.models.forEach((model, i) => maps.push([` (models[${i}])`, model?.headers]));
+  if (isObject(entry.modelOverrides)) for (const [id, override] of Object.entries(entry.modelOverrides)) maps.push([` (modelOverrides ${JSON.stringify(id)})`, override?.headers]);
+  return maps.filter(([, headers]) => isObject(headers));
+}
+
+// An apiKey or a header value in models.json is `$VAR` / `${VAR}`, a literal or a `!command`, and pi uses it over the
+// environment [03 §5.3, §6]: only `$<keyVar>` / `${<keyVar>}` sends the profile's key. Why the isolated models.json
+// would bill another credential, or null (no file): in an entry of the job's provider (of every provider when the
+// model names none), an apiKey that is anything else; a credential header (CREDENTIAL_HEADER_RE) other than those two,
+// optionally after `Bearer `; any header that is a `!command` or another variable; or a file pi might read otherwise
+// than the adapter does — unreadable, a symlink (the no-follow read of scrub), not UTF-8 text, not a JSON object. A
+// harmless literal header (X-Title) passes. The value is never put in the message.
+function modelsJsonProblem(profile, ctx, file, keyVar) {
+  if (ctx?.fs?.exists?.(file) !== true) return null;
+  const text = textOfFile(ctx.fs.readFile?.(file, NO_FOLLOW) ?? null);
+  let doc = null;
+  try {
+    doc = text === null ? null : JSON.parse(text);
+  } catch {
+    doc = null;
+  }
+  if (!isObject(doc) || (doc.providers !== undefined && !isObject(doc.providers))) {
+    return `${file} cannot be read as a JSON object (a symlink is not followed), so a provider apiKey or header pi would send there instead of ${keyVar} cannot be checked; fix or remove that file`;
+  }
+  const own = [`$${keyVar}`, `\${${keyVar}}`];
+  const ownHeader = [...own, ...own.map((value) => `Bearer ${value}`)];
+  const provider = providerOf(profile.model);
+  const problems = [];
+  for (const [name, entry] of Object.entries(doc.providers ?? {})) {
+    if ((provider !== null && name !== provider) || !isObject(entry)) continue;
+    const of = `provider ${JSON.stringify(name)}`;
+    if (entry.apiKey !== undefined && !own.includes(entry.apiKey)) problems.push(`the apiKey of ${of} is ${apiKeyKind(entry.apiKey)}`);
+    for (const [where, headers] of headerMapsOf(entry)) {
+      for (const [header, value] of Object.entries(headers)) {
+        if (ownHeader.includes(value)) continue;
+        const resolved = typeof value === "string" && (value.startsWith("!") || value.startsWith("$"));
+        if (!resolved && !CREDENTIAL_HEADER_RE.test(header)) continue;
+        const bare = typeof value === "string" ? value.replace(/^Bearer\s+/i, "") : value;
+        problems.push(`the header ${JSON.stringify(header)} of ${of}${where} is ${apiKeyKind(bare)}`);
+      }
+    }
+  }
+  if (problems.length === 0) return null;
+  return `${file}: ${problems.join(", ")}, not $${keyVar} / \${${keyVar}}: pi sends it instead of ${keyVar}, so the job would bill another credential; set the value to "$${keyVar}" (or use "authHeader": true with "apiKey": "$${keyVar}") or remove it`;
 }
 
 // The refusal of storedCredentialProblem, as task (exit 2) and doctor --probe give it.
@@ -119,13 +180,22 @@ function refuseStoredCredential(profile, ctx, profileName) {
   if (problem) throw new UsageError(`profile ${profileName ?? ctx?.profileName ?? "-"}: ${problem}`);
 }
 
+// A session dir recorded in a job's meta, only in the shape the adapter writes it — <jobs dir>/<core job id>/sessions
+// — else null. The record lives under state/, which a sandboxed job may write: a dir taken from it as written would
+// let the job choose the tree the runner's scrub rewrites (keys/, the data root) and the dir a resume runs in.
+function recordedSessionDir(meta, jobsDir) {
+  const dir = meta?.sessionDir;
+  if (typeof dir !== "string" || !path.isAbsolute(dir) || path.normalize(dir) !== dir || path.basename(dir) !== "sessions") return null;
+  return path.dirname(path.dirname(dir)) === jobsDir && isCoreJobId(path.basename(path.dirname(dir))) ? dir : null;
+}
+
 // Where the session of a job lives: a fresh job starts <its job dir>/sessions; a resumed one returns to the dir its
-// chain started in, recorded in the previous job's meta.
+// chain started in, recorded in the previous job's meta (recordedSessionDir), else the previous job's own.
 function sessionDirOf(req) {
   if (!req.resume) return path.join(req.job.dir, "sessions");
   const prev = req.resume.prev;
-  if (typeof prev?.meta?.sessionDir === "string" && prev.meta.sessionDir) return prev.meta.sessionDir;
-  return prev?.id ? path.join(path.dirname(req.job.dir), prev.id, "sessions") : path.join(req.job.dir, "sessions");
+  const jobsDir = path.dirname(req.job.dir);
+  return recordedSessionDir(prev?.meta, jobsDir) ?? (isCoreJobId(prev?.id) ? path.join(jobsDir, prev.id, "sessions") : path.join(req.job.dir, "sessions"));
 }
 
 // ---------- reduce: the outcome from the JSON event stream [03 §3.1] ----------
@@ -335,9 +405,9 @@ function authCheck(profile, ctx) {
     if (r.status === 1) return { name: "pi-auth", level: "FAIL", hint: `pi holds no credential for ${provider} in ${where}; ${loginHint}` };
     if (r.status === 2) return { name: "pi-auth", level: "FAIL", hint: `the credential pi holds for ${provider} in ${where} is invalid${authType}; ${loginHint}` };
   } else {
-    // An isolated home without an auth.json (storedCredentialProblem refuses one): a models.json apiKey that is a
-    // literal or a command, or anything else pi holds of its own, comes before the environment [03 §6]; pi auth check
-    // names only its type.
+    // An isolated home without an auth.json or a models.json apiKey or credential header of its own
+    // (storedCredentialProblem refuses them): anything else pi holds of its own comes before the environment [03 §6];
+    // pi auth check names only its type.
     const fix = `remove it from ${where}`;
     if (r.status === 0) {
       return { name: "pi-auth", level: "FAIL", hint: `pi already holds a credential for ${provider} in ${where}${authType}; pi prefers it to the key in ${profile.keyVar}, so the key from agent-dispatch is not used — ${fix}` };
@@ -511,12 +581,14 @@ const pi = {
     return created ? lost(`pi started a new session file ${created} in ${dir} instead of resuming session ${sessionId}`) : null;
   },
 
-  // After every run — completed, failed, timed out or cancelled — the core passes the job's redactor (ctx.redact, which
-  // knows the key) and writes back what this returns: each text file of the session dir that held a registered value,
+  // When the runner finishes a job — completed, failed, timed out or cancelled (not when the runner itself dies: the
+  // reaper has no key to redact with) — the core passes the job's redactor (ctx.redact, which knows the key) and writes
+  // back what this returns: each text file of the session dir that held a registered value,
   // redacted (<redacted>, as in the log), with its mode. A resume reads only the header's id and cwd
-  // (findSessionHeader), which redaction leaves alone, and the model gets <redacted> where the key was.
+  // (findSessionHeader), which redaction leaves alone, and the model gets <redacted> where the key was. The session dir
+  // comes from the record only in the adapter's own shape (recordedSessionDir), else <job dir>/sessions.
   scrub(job, ctx) {
-    const dir = job?.record?.meta?.sessionDir ?? (job?.dir ? path.join(job.dir, "sessions") : null);
+    const dir = job?.dir ? (recordedSessionDir(job.record?.meta, path.dirname(job.dir)) ?? path.join(job.dir, "sessions")) : null;
     if (typeof ctx?.redact !== "function" || typeof dir !== "string" || !dir) return [];
     return scrubSessionFiles(ctx.fs, dir, ctx.redact);
   },
@@ -525,8 +597,9 @@ const pi = {
   // header id matches; otherwise pi would silently start fresh [03 §4, §15 items 6, 8].
   resumeCheck(prev, profile, req, ctx) {
     if (prev.cwd !== req.job.cwd) return `the pi session of ${prev.id} was started in ${prev.cwd}, not ${req.job.cwd}`;
-    const dir = prev.meta?.sessionDir;
-    if (typeof dir !== "string" || !dir) return `job ${prev.id} recorded no pi session dir`;
+    // The dir the resume will use (sessionDirOf): a recorded one of another shape is no session dir of this adapter.
+    const dir = req.job?.dir ? recordedSessionDir(prev.meta, path.dirname(req.job.dir)) : null;
+    if (!dir) return `job ${prev.id} recorded no pi session dir`;
     if (!findSessionHeader(ctx.fs, dir, prev.sessionId, req.job.cwd)) {
       return `no pi session file with id ${prev.sessionId} for ${req.job.cwd} in ${dir}; pi would start a new session`;
     }

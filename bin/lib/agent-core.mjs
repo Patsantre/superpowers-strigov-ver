@@ -126,11 +126,13 @@ export const PATTERN_ORDER = [
   ["context", "context"], ["blocked", "blocked"], ["rate-limit", "rate-limit"], ["server", "server"],
   ["transient", "server"], ["launch", "launch"],
 ];
-// A resumed job keeps its profile snapshot; these fields must still match the current profile (spec §3.6 А12).
-// A resume runs on the recorded profile snapshot, so its binary and its sandbox (bin, wrap, sandbox) must still match
-// config.json too: a job under a sandbox may write the data dir's state/, and a record it rewrote must not let the
-// next run of its session go unsandboxed.
-export const RESUME_BOUND_FIELDS = ["harness", "model", "endpoint", "home", "bin", "wrap", "sandbox"];
+// A resumed job runs on the current profile (config.json), never on the record's snapshot: a job under a sandbox may
+// write the data dir's state/, and an env, bin or wrap it rewrote there must never reach the next run of its session.
+// The snapshot only decides refusal: these fields of it must still match the current profile (spec §3.6 А12) — what
+// the session lives with (harness, model, endpoint, home), what runs it (bin, wrap, sandbox) and who pays for it
+// (auth: the key source or the login; keyVar / authHeader: the variable the key reaches the harness in). A rotated
+// value behind the same key source is no drift.
+export const RESUME_BOUND_FIELDS = ["harness", "model", "endpoint", "home", "bin", "wrap", "sandbox", "auth", "keyVar", "authHeader"];
 export const REDACTED = "<redacted>";
 export const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 export const PROFILE_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
@@ -181,6 +183,8 @@ const META_MAX_CHARS = 16_384;
 const RUNTIME_FIELDS = ["runnerPid", "runnerStartedAt", "childPid", "childStartedAt", "harnessVersion", "meta"];
 export const PROBE_PROMPT = "Reply with exactly: PONG\n";
 const PROBE_TIMEOUT_MS = 120_000;
+// The signals that end a probe early (runProbe): a Ctrl-C, a kill, a closed terminal.
+const PROBE_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"];
 const REBOOT_NOTE = "system rebooted since the job started";
 const UNKNOWN_BOOT_NOTE = "not signalled: the boot it was started in cannot be confirmed (the boot id was unreadable)";
 // <prefix>-NNNN; zt- belongs to zcode-dispatch, task- to the Codex companion.
@@ -489,10 +493,14 @@ function writeRecord(file, record) {
 
 // Terminal statuses are sticky: a completed / failed / cancelled record is never rewritten by anyone but its claimer,
 // also when two finalizers (cancel and the runner) race — exactly one claim succeeds. The claim also removes the key
-// handoff file.
+// handoff file, and so does every later call on the terminal record: a launch can write that file after a cancel
+// claimed the job, and no runner starts a harness for a terminal record.
 export function finalizeRecord(file, patch) {
   const current = readRecord(file);
-  if (!current || TERMINAL.has(current.status)) return current;
+  if (!current || TERMINAL.has(current.status)) {
+    if (typeof current?.id === "string") dropSecret(path.dirname(file), current.id);
+    return current;
+  }
   let next = { ...current, ...patch, finishedAt: new Date().toISOString() };
   const tmp = tmpFile(file);
   fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`);
@@ -1516,6 +1524,10 @@ export function runningJobsOfProfile(profileName, { env = process.env, self = nu
   return running;
 }
 
+// A workspace root in the maxParallel refusal (spec §3.9): JSON-quoted when it holds ", ", a double quote or a control
+// character, so the list still splits at ", " and every root reads back as one argument.
+const shownRoot = (root) => (typeof root !== "string" ? "-" : /[\x00-\x1f\x7f"]|, /.test(root) ? JSON.stringify(root) : root);
+
 // ---------- running a harness ----------
 
 // Feeds text to `write` in whole lines with `redact` applied, so a secret split across chunks is still caught. A very
@@ -2335,8 +2347,8 @@ async function startJobUnredacted({ adapter, profileName, profile, role, write, 
   if (write) refuseUnavailableReservation(ws.jobsDir, ws.root); // fail fast, before any job state exists
   reapDeadRunners(ws.jobsDir);
   const prev = resumeTaskId ? resolveResume(ws.jobsDir, resumeTaskId, profileName, profile) : null;
-  // A resumed job runs on its recorded profile snapshot (spec §3.6 А12).
-  const runProfile = prev ? { ...prev.profileConfig } : structuredClone(profile);
+  // A resumed job runs on the current profile too; the snapshot only decided the refusal above (spec §3.6 А12).
+  const runProfile = structuredClone(profile);
   const ladder = normalizeLadder(adapter.manifest?.cancel?.ladder);
 
   const id = allocateJob(ws.jobsDir, adapter.idPrefix, {
@@ -2407,7 +2419,9 @@ async function startJobUnredacted({ adapter, profileName, profile, role, write, 
     }
     const others = runningJobsOfProfile(profileName, { env, self: { jobsDir: ws.jobsDir, id, startedAt: record.startedAt } });
     if (others.length >= maxParallel) {
-      throw new UsageError(`profile ${profileName} is at maxParallel=${maxParallel} (running: ${others.map((job) => job.id).join(", ")})`);
+      // Ids are numbered per workspace: each names its workspace root, which `status <id> --cwd <root>` needs.
+      const running = others.map((job) => `${job.id} cwd=${shownRoot(job.workspaceRoot)}`).join(", ");
+      throw new UsageError(`profile ${profileName} is at maxParallel=${maxParallel} (running: ${running})`);
     }
     if (write) reservation = acquireReservation(ws.jobsDir, id, ws.root);
     // The key last (spec §3.3): a task refused above never ran keyCmd, which may ask the password manager to confirm.
@@ -2458,6 +2472,9 @@ async function startJobUnredacted({ adapter, profileName, profile, role, write, 
         finalizeRecord(file, { status: "failed", errorClass: "launch", note: redact(error?.message ?? String(error)) });
         if (!spawned) markCleaned(file); // no runner, no harness: nothing to stop (a spawned runner marks it itself)
       }
+      // No runner will ever read or remove the handoff file — also when a cancel claimed the job before it was
+      // written, so that claim never saw it.
+      if (!spawned) dropSecret(ws.jobsDir, id);
     }
     throw error;
   } finally {
@@ -2687,6 +2704,9 @@ async function settledSurvivors(jobsDir, id) {
 // private scratch dir under <data root>/probe, removed afterwards; the harness runs there unless `cwd` is given.
 // Returns the redacted outcome { status, errorClass, response, sessionId, reportedModel, usage, errorText, harness,
 // exitCode, signal, stderrTail }; the CLI judges the answer (PONG) and prints the doctor lines.
+// The harness leads a session of its own (runCli), so a Ctrl-C or a closed terminal never reaches it, and no record
+// or ownership log names it: while the probe runs, SIGINT / SIGTERM / SIGHUP to this process kill the harness tree
+// (once its start time confirms it is still ours), remove the scratch dir and exit with 128 + the signal number.
 export async function runProbe({
   adapter,
   profileName,
@@ -2705,6 +2725,22 @@ export async function runProbe({
   const base = path.join(stateRoot(env), "probe");
   ensurePrivateDir(base);
   const dir = fs.mkdtempSync(path.join(base, `${profileName}-`));
+  let harnessPid = null;
+  let harnessStart = null;
+  const onSignal = (signal) => {
+    try {
+      if (harnessPid && harnessGroupState(harnessPid, harnessStart) === "ours") killTreeSync(harnessPid, "SIGKILL");
+    } catch {
+      // the exit goes on
+    }
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+    process.exit(128 + (os.constants.signals[signal] ?? 0));
+  };
+  for (const signal of PROBE_SIGNALS) process.on(signal, onSignal);
   try {
     const ctx = makeCtx({ env, profile, profileName, ...ctxOverrides });
     const promptPath = path.join(dir, "prompt.md");
@@ -2755,6 +2791,11 @@ export async function runProbe({
       timeoutMs: Math.min(timeoutMs, timeoutMin * 60_000),
       redact,
       ladder: normalizeLadder(adapter.manifest?.cancel?.ladder),
+      onSpawn: (pid, { startedAt }) => {
+        harnessPid = pid;
+        harnessStart = startedAt;
+        return null; // a label would start the ladder at once
+      },
     });
     const io = { ...harnessIo(result), cancelled: false };
     let reduced = null;
@@ -2783,6 +2824,7 @@ export async function runProbe({
   } catch (error) {
     throw redactError(error, redact);
   } finally {
+    for (const signal of PROBE_SIGNALS) process.off(signal, onSignal);
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }

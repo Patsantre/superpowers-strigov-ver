@@ -218,7 +218,7 @@ Instruct Opus: "After writing the spec, review it with fresh eyes and fix inline
 
 **Codex Astra Spec Review (after Opus returns):**
 
-Dispatch the `spec-reviewer` profile (`"$AD" route spec-reviewer`; by default Codex Astra xhigh, the same command: `--model gpt-6-astra --effort xhigh`) using `./spec-reviewer-prompt.md`. Read-only, no `--write`. Loop cap=4.
+Dispatch the `spec-reviewer` profile (`"$AD" route spec-reviewer`; by default Codex Astra xhigh, the same command: `--model gpt-6-astra --effort xhigh`) using `./spec-reviewer-prompt.md`. Read-only, no `--write`; a route line with `readOnly=none` puts the job inside `../agent-invocation/SKILL.md` "No-edit check". Loop cap=4.
 
 Verdict handling:
 - `APPROVED` → commit the spec file from main thread (`git add <path>` + `git commit` with subject `docs(specs): add <topic>`, Co-Authored-By trailer). Then User Review Gate.

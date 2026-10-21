@@ -320,30 +320,87 @@ expect_absent skills/agent-invocation/SKILL.md 'is not filtered' 'agent-invocati
 expect_new skills/agent-invocation/SKILL.md $'\n## In-session roles on an external profile\n' 'agent-invocation: the recipe heading (a line of its own, not a quoted cross-reference)'
 expect_new skills/agent-invocation/SKILL.md '`--write` for every role except `diagnosis` and `final-review` (`roleKinds` in `agents-defaults.json`;' 'recipe: the write classes (= roleKinds; mirrored by SESSION_READ_ROLES in test-agent-dispatch.sh)'
 expect_new skills/agent-invocation/SKILL.md 'the implementers and every in-session role except `diagnosis` and `final-review` ("## In-session roles on an external profile" item 2)' 'step 3: --write for every in-session role but the read kinds'
-expect_new skills/agent-invocation/SKILL.md '4. **No-edit check** — around every `gate`, `phase-review`, `phase-review.escalated` and `integration-check` job, and every `diagnosis` or `final-review` job whose route line says `readOnly=none`' 'recipe: the no-edit check covers every run-kind job and read roles on readOnly=none (F2)'
-expect_new skills/agent-invocation/SKILL.md '`"$AD" tree-state [--cwd W] > <prompt-file>.tree` right before the dispatch' 'recipe: the no-edit baseline lives in a file, so a compaction cannot lose it'
-expect_new skills/agent-invocation/SKILL.md 'as soon as the job ends, whatever its status — after the `result` of a `completed` job, before any retry or switch of a `failed` or `cancelled` one (item 7)' 'recipe: a failed or cancelled job is compared too'
-expect_new skills/agent-invocation/SKILL.md '`unchanged` → go on. `changed since …: <paths>` → that run'"'"'s verdict does not count and nothing is committed: ask the user exactly one question' 'recipe: the no-edit check ends in one question'
+expect_new skills/agent-invocation/SKILL.md '4. **No-edit check** — every `gate`, `phase-review`, `phase-review.escalated` and `integration-check` job, and every `diagnosis` or `final-review` job whose route line says `readOnly=none`, runs inside "## No-edit check" below' 'recipe: item 4 points at the no-edit check'
+# The no-edit check has a section of its own: every run-kind job on an external profile and every read-kind job on
+# readOnly=none (final review F2), reached from the recipe and from every reviewer dispatch.
+expect_new skills/agent-invocation/SKILL.md $'\n## No-edit check\n' 'agent-invocation: the no-edit check heading (a line of its own)'
+expect_new skills/agent-invocation/SKILL.md 'Every job of a `run` role (`gate`, `phase-review`, `phase-review.escalated`, `integration-check`) on an external profile, and every job of a `read` role (`plan-reviewer`, `spec-reviewer`, `control-review`, `final-review`, `diagnosis`, `adhoc-review`) whose route line says `readOnly=none`' 'no-edit check: every run role and every read role on readOnly=none (F2)'
+expect_new skills/agent-invocation/SKILL.md 'never under `routes: default`, whose chains keep these roles in the session or the Codex sandbox' 'no-edit check: never under routes: default (F2)'
+expect_new skills/agent-invocation/SKILL.md 'a reviewer or `diagnosis`, is allowed, `route` adds a one-line warning on stderr, and "## No-edit check" brackets the job' 'readOnly=none: the route format points at the no-edit check (F2)'
+expect_new skills/agent-invocation/SKILL.md '`gate`, `phase-review`, `phase-review.escalated` and `control-review` — the verification gate (dev-orchestrator Step 3.5)' 'no-edit check: control-review restarts from the gate (F2)'
+expect_new skills/agent-invocation/SKILL.md '`plan-reviewer` / `spec-reviewer` — a fresh review of the plan / spec as it now stands, at the same round number, with nothing from the voided verdict in the ledger; a checked review'"'"'s `APPROVED` is committed (`docs(plans): add …` / `docs(specs): add …`) only after its `unchanged` line' 'no-edit check: plan / spec review restart, commit only after unchanged (F2)'
+expect_new skills/agent-invocation/SKILL.md '`adhoc-review` — the verdict is void and the review re-runs' 'no-edit check: adhoc-review restart (F2)'
+expect_new_count "$ORCH" 'A route line with `readOnly=none` puts the job inside `agent-invocation` "No-edit check".' 2 'Step 2 and Step 4.2 point at the no-edit check (F2)'
+for f in skills/dev-orchestrator/codex-plan-reviewer-prompt.md skills/dev-orchestrator/codex-control-review-prompt.md \
+         skills/brainstorming/spec-reviewer-prompt.md skills/dev-orchestrator/final-review-prompt.md; do
+    expect_new "$f" '`route` warns, and the job runs inside `../agent-invocation/SKILL.md` "No-edit check"' "$f: glm points at the no-edit check (F2)"
+done
+for f in skills/requesting-code-review/SKILL.md skills/systematic-debugging/SKILL.md; do
+    expect_new "$f" 'with its reviewer preamble on `zcode` and core harnesses; a route line with `readOnly=none` puts the job inside that skill'"'"'s "No-edit check"' "$f: adhoc-review points at the no-edit check (F2)"
+done
+for f in skills/writing-plans/SKILL.md skills/brainstorming/SKILL.md; do
+    expect_new "$f" 'route line with `readOnly=none` puts the job inside `../agent-invocation/SKILL.md` "No-edit check"' "$f: the reviewer loop points at the no-edit check (F2)"
+done
+expect_new skills/agent-invocation/SKILL.md 'right before the dispatch: `"$AD" tree-state [--cwd W] > <prompt-file>.tree`' 'recipe: the no-edit baseline lives in a file, so a compaction cannot lose it'
+expect_new skills/agent-invocation/SKILL.md 'A checked dispatch always writes a new prompt file' 'no-edit check: one baseline per prompt file'
+expect_new skills/agent-invocation/SKILL.md 'as soon as the job ends, whatever its status — after the `result` of a `completed` job, before any retry or switch of a `failed` or `cancelled` one' 'recipe: a failed or cancelled job is compared too'
+expect_new skills/agent-invocation/SKILL.md '`unchanged` → `: > <prompt-file>.tree.done`, go on. Anything else voids that run'"'"'s verdict and nothing is committed' 'recipe: only unchanged lets a checked verdict count (fail closed); it settles the check (.tree.done)'
+expect_new skills/agent-invocation/SKILL.md 'Then ask the user exactly one question, naming the paths — keep them or revert them' 'recipe: the no-edit check ends in one question'
 expect_new skills/agent-invocation/SKILL.md '(neither you nor a subagent reverts): `git diff-tree -p --binary <after> "$(cut -c6- <prompt-file>.tree)" | git apply`' 'recipe: the user reverts the job edits only, keeping the phase work'
-expect_new skills/agent-invocation/SKILL.md '(`route <role> --skip <skips>,<that profile and every profile before it in the chain>`, as item 7)' 'recipe: the no-edit re-run keeps the session skips'
-expect_new skills/agent-invocation/SKILL.md 'from that round'"'"'s package rebuilt in WORKTREE mode in either round' 'recipe: a final-review re-run sees kept paths and the fix wave'
+expect_new skills/agent-invocation/SKILL.md 'First `route <role> --skip <skips>,<that profile and every profile before it in the chain>`' 'recipe: the no-edit re-run keeps the session skips'
+expect_new skills/agent-invocation/SKILL.md 'that round'"'"'s package rebuilt in WORKTREE mode in either round' 'recipe: a final-review re-run sees kept paths and the fix wave'
 expect_new skills/agent-invocation/SKILL.md 'the same question also asks where the step runs again (that profile again, or one the user names) — never a second question' 'recipe: an exhausted chain folds into the one question'
-expect_new skills/agent-invocation/SKILL.md 'Any other outcome counts as `changed`: a `--since` call that exits non-zero or prints another line voids the verdict the same way' 'recipe: a failed --since call voids the verdict (fail closed)'
-expect_new skills/agent-invocation/SKILL.md 'a baseline call that fails → dispatch nothing' 'recipe: no dispatch without a baseline tree'
-expect_new skills/agent-invocation/SKILL.md 'The tree fails there, not the profile' 'recipe: a failed baseline is not a profile failure'
-expect_new skills/agent-invocation/SKILL.md '7. **Failures** — for a role item 4 checks, its `--since` check comes first (a changed tree → item 4, never a retry on that profile)' 'recipe: failures come after the no-edit check'
-expect_new skills/agent-invocation/SKILL.md 'only after item 4'"'"'s `--since` check against the `.tree` beside its prompt file' 'recipe: after a compaction a checked job is compared before its result counts'
-expect_new skills/agent-invocation/SKILL.md 'a running job whose store records no role (`codex`, `zcode`) → the same, and when the step is one item 4 checks, it then runs again on the same profile from the start item 4 names' 'recipe: an unmatched job after a compaction does not count'
-expect_new skills/agent-invocation/SKILL.md 'if the add says the path already exists, an earlier run left it — remove it the same way first' 'recipe: a leftover gate-base checkout is removed first'
+expect_new skills/agent-invocation/SKILL.md 'or no such line (a non-zero exit — a missing or empty `.tree` exits 2 — or another line)' 'recipe: a failed --since call voids the verdict (fail closed)'
+expect_new skills/agent-invocation/SKILL.md 'The call fails → dispatch nothing' 'recipe: no dispatch without a baseline tree'
+expect_new skills/agent-invocation/SKILL.md 'the tree fails there, not the profile' 'recipe: a failed baseline is not a profile failure'
+# Nested repositories: the revert command cannot reach them, the question names them apart (final review F5).
+expect_new skills/agent-invocation/SKILL.md 'it undoes that job'"'"'s edits to the tree'"'"'s own files and keeps the phase'"'"'s uncommitted work' 'recipe: the revert covers the tree'"'"'s own files (F5)'
+expect_absent skills/agent-invocation/SKILL.md 'undoes exactly that job' 'recipe: no claim that the revert is exact (F5)'
+expect_new skills/agent-invocation/SKILL.md 'A path marked `(nested repository)` is beyond that command: name it apart — the user reverts inside that repository by hand (`git -C <path> status` / `diff`, `log` if its HEAD moved) or keeps it; never suggest `checkout -- .`, `clean` or `reset --hard` there.' 'recipe: nested repositories are reverted by hand (F5)'
+expect_new skills/agent-invocation/SKILL.md 'The user reverted → item 2'"'"'s command once more against the same `.tree`; anything but `unchanged` → one status line `Not reverted: <paths> — kept.`, and those paths count as kept (no second question)' 'recipe: a revert is checked once, then kept (F5)'
+expect_new skills/agent-invocation/SKILL.md 'a submodule or nested repository first, as `<path> (nested repository)`' 'tree-state verb row: the nested-repository marker (F5)'
+expect_new skills/agent-invocation/SKILL.md '7. **Failures** — for a job item 4 checks, its `--since` check comes first (a changed tree → "## No-edit check", never a retry on that profile)' 'recipe: failures come after the no-edit check'
+# A job that ended unchecked before a compaction is checked before the step runs again (final review F11).
+expect_new skills/agent-invocation/SKILL.md '[--cwd W] | tee -a <prompt-file>.tree.since` (the record tells a later compaction this job was checked)' 'no-edit check: every check is recorded in .tree.since (F11)'
+expect_new skills/agent-invocation/SKILL.md 'the step'"'"'s newest prompt file with a `.tree` but no `.tree.done` (names only) belongs to a job whose check never finished' 'no-edit check: after a compaction an unchecked or unsettled job is found by its record (F11)'
+expect_new skills/agent-invocation/SKILL.md 'A `.tree.since` → it was checked but never settled: run item 2 against that same `.tree` once more (the same baseline, so the check repeats); that job'"'"'s verdict stays void.' 'no-edit check: a changed check whose question was never settled is repeated after a compaction'
+expect_new skills/agent-invocation/SKILL.md 'Then `: > <prompt-file>.tree.done`, and the step runs again on item 3'"'"'s profile, from:' 'no-edit check: the answer settles the check (.tree.done)'
+# The profile that edited stays skipped for its role (the no-edit marker), and a kept final-review edit is committed.
+expect_new skills/agent-invocation/SKILL.md 'append `<role> <the profile that edited> <ISO time>` to `<scratchpad>/dev-orchestrator/no-edit`: every later `route <role>` adds that role'"'"'s profiles from it to `--skip`' 'no-edit check: the profile that edited is recorded per role'
+expect_new skills/agent-invocation/SKILL.md 'plus, for this role, the profiles its lines in the `no-edit` marker name ("## No-edit check" item 4)' 'route --skip: the no-edit marker'
+expect_new "$ORCH" 'plus this role'"'"'s profiles in the `no-edit` marker (`agent-invocation` "No-edit check" item 4)' 'Routing item 2: the no-edit marker joins the skips'
+expect_new skills/agent-invocation/SKILL.md 'a kept edit is committed with the fixes at dev-orchestrator Step 5 item 7' 'no-edit check: a kept final-review edit is committed'
+expect_new "$ORCH" 'if the fixer — or an edit kept at an `agent-invocation` "No-edit check" — changed anything, auto-commit those changes' 'Step 5 item 7: a kept no-edit edit is committed'
+expect_new "$ORCH" 'the original dispatch'"'"'s preamble (the ZCode preamble for an implementer; for a reviewer or an in-session role the one `agent-invocation` "Headless preambles" names)' 'Verdict parsing: a glm re-dispatch keeps its role preamble'
+expect_new skills/agent-invocation/SKILL.md '`unchanged` → the result of a job polled to its end counts when its `job.promptFile` (`status <id> --json`) is that file; otherwise dispatch the step FRESH.' 'no-edit check: after a compaction a checked job is compared before its result counts (F11)'
+expect_new skills/agent-invocation/SKILL.md 'A step item 4 checks then goes through "## No-edit check" item 5 before any result counts or any FRESH dispatch' 'recipe: compaction recovery goes through the no-edit check (F11)'
+expect_absent skills/agent-invocation/SKILL.md 'nothing ties that job to a baseline' 'recipe: an unmatched zcode / codex job is tied to its baseline (F11)'
+expect_new "$ORCH" 'its `--since` line appended to `.tree.since` with `tee -a`, and the empty marker `: > <prompt-file>.tree.done`; `ls` of that prompt file'"'"'s directory, names only' 'Rule 2: the .tree.since record, the .tree.done marker and their listing are allowed (F11)'
+expect_new "$ORCH" '`: > <prompt-file>.tree.done` and `ls` of a checked job'"'"'s prompt-file directory (names only)' 'pre-flight gate (c): the .tree.done marker and the prompt-file listing after a compaction (F11)'
+expect_new "$ORCH" 'Not `ls` (outside the printed `"$WS"` directory and that prompt-file directory)' 'pre-flight gate: the Nothing-else line agrees with (c)'
+# The external gate's base checkout is removed before the gate and after it (final review F15).
+expect_new skills/agent-invocation/SKILL.md '`gate`: open its instructions with "Before anything else: if `<dir>/gate-base` exists or `git worktree list` names it, run `git worktree remove -f -f <dir>/gate-base`"' 'recipe: an external gate starts by removing a leftover gate-base, locked or not (F15)'
+expect_absent skills/agent-invocation/SKILL.md 'names it, run `git worktree remove --force' 'recipe: a leftover gate-base is removed with double force (a killed add leaves it locked)'
+expect_new skills/agent-invocation/SKILL.md 'After a `gate` job'"'"'s check: if `<dir>/gate-base`' 'no-edit check: a leftover gate-base is removed after the gate (F15)'
+expect_absent skills/agent-invocation/SKILL.md 'if the add says the path already exists' 'recipe: no cleanup that waits for the next add (F15)'
+expect_new "$ORCH" 'after an external gate, `git worktree remove -f -f <dir>/gate-base`' 'Rule 1: the gate-base cleanup is an allowed git operation (F15)'
+expect_new "$ORCH" 'plus that recipe'"'"'s `git worktree remove -f -f <dir>/gate-base`' 'pre-flight gate (c): the gate-base cleanup (F15)'
 expect_new skills/agent-invocation/SKILL.md 'add the line `Repository root: <absolute path>`' 'recipe: diagnosis and quickfix prompts name a repository root'
-expect_new skills/agent-invocation/SKILL.md '- Create, edit or delete only the files the instructions below tell you to write; running the project'"'"'s tests, linters and builds is fine, and the orchestrator checks the working tree afterwards.' 'recipe: the session-role preamble'
+expect_new skills/agent-invocation/SKILL.md '- Create, edit or delete only the files the instructions below tell you to write; running the project'"'"'s tests, linters and builds is fine. No git operations' 'recipe: the session-role preamble'
+expect_absent skills/agent-invocation/SKILL.md 'the orchestrator checks the working tree afterwards' 'recipe: the preamble promises no check a writer role does not get (F10)'
+# Final review F6, F7, F12, F14.
+expect_new "$ORCH" 'each a `route` call — none under `routes: default` while the `channels` marker holds no `off` line, "## Routing" item 1, where the built-in names below apply' 'Step 5 final-fix / repair: no route call under routes: default (F6)'
+expect_absent "$ORCH" 'each a `route` call; built-in profiles named' 'Step 5 final-fix / repair: no unconditional route call (F6)'
+expect_new skills/requesting-code-review/SKILL.md 'the role here is `adhoc-review`, not `control-review`' 'requesting-code-review: the reused template runs as adhoc-review (F7)'
+expect_new "$ORCH" 'a staged one included (`git commit` commits the whole index)' 'auto-commit: a staged unrelated change skips the commit (F12)'
+expect_new skills/agent-invocation/SKILL.md '`profile <p> is at maxParallel=<n> (running: <id> cwd=<root>, …)` | run the step-4 Monitor loop on the named jobs, each with `status <id> --cwd <root>`' 'Refusals: maxParallel jobs are polled in their own workspace (F14)'
 expect_new skills/agent-invocation/SKILL.md '`frontend.*`: replace the `## Use the frontend-design skill` section with the "Design quality" block below' 'recipe: frontend adaptation is external-only'
 expect_new skills/agent-invocation/SKILL.md 'every frontend dispatch except item 2'"'"'s verdict re-dispatch is FRESH' 'recipe: a frontend verdict re-dispatch resumes (item 2)'
 expect_new skills/agent-invocation/SKILL.md 'no plan file — a pure frontend task from Triage: `$dir` is `"$WS"` without an argument' 'recipe: a triage frontend task has no plan file'
 expect_new skills/agent-invocation/SKILL.md 'The Step 2.5 compaction-safe guards and admission condition (dev-orchestrator Pre-dispatch checklist item 5) are not checked for it' 'recipe: no admission condition for a frontend dispatch'
 expect_new skills/agent-invocation/SKILL.md 'A frontend sidecar'"'"'s chain is its `frontend.*` role — the one whose chain lists the sidecar'"'"'s profile, `frontend.new-ui` first — never `implementer.escalation`.' 'recipe: a frontend sidecar never escalates to implementer.escalation'
 expect_new skills/agent-invocation/SKILL.md '| `tree-state [--cwd W] [--since TREE]` |' 'agent-invocation: tree-state verb row'
-expect_new "$ORCH" '`"$AD" tree-state [--cwd W] [--since <id>]` (the no-edit check, `agent-invocation` "In-session roles on an external profile" item 4' 'Rule 2: tree-state is an allowed main-thread read'
+expect_new "$ORCH" '`"$AD" tree-state [--cwd W] [--since <id>]` (the no-edit check, `agent-invocation` "No-edit check": its baseline redirected to the `.tree` file beside the job'"'"'s prompt file' 'Rule 2: tree-state is an allowed main-thread read'
 expect_new "$ORCH" '`"$AD" tree-state [--cwd W] [--since <id>]` (where that recipe asks for it) — workspace/package/dispatch bookkeeping' 'pre-flight gate (c): tree-state, a confirmed resume included'
 expect_new "$ORCH" 'An in-session role whose route line names an external profile runs as a background job per `agent-invocation`' 'Routing item 2: pointer to the recipe'
 expect_new "$ORCH" '; where this skill names its Agent call, read that dispatch.' 'Routing item 2: an Agent call this skill names reads as the routed dispatch'
@@ -449,6 +506,52 @@ expect_new README.md 'If your tests leave files that are not in `.gitignore`, ad
 expect_new README.ru.md 'Если тесты оставляют файлы, которых нет в `.gitignore`, добавьте их туда.' 'README.ru: the .gitignore advice'
 expect_new PLUGIN_README.md 'any role — the in-session ones included — can run on any profile (`tree-state` checks that no-edit roles left the tree alone).' 'PLUGIN_README: in-session roles on any profile'
 expect_new .claude-plugin/plugin.json 'any role, the in-session ones included, can run on any of them.' 'plugin.json: in-session roles on any profile'
+# 10. Docs after the final review (fixes F1–F5, F8, F9, F14): the README pair says the same, the spec agrees.
+SPEC=docs/superpowers/specs/2026-10-20-universal-dispatchers-design.md
+# F1: a pi models.json apiKey other than $<keyVar> / ${<keyVar>} refuses the task, not only doctor.
+expect_new README.md '`task` refuses the profile (exit 2) and `doctor` FAILs `pi-auth` (with `--probe`, before any request)' 'README: pi models.json apiKey refused by task and doctor, no probe request (F1)'
+expect_absent README.md 'a literal key there would win over `keyVar` (`doctor` FAIL `pi-auth`)' 'README: no doctor-only pi models.json check (F1)'
+expect_new README.ru.md '`task` отклоняет профиль (exit 2), а `doctor` даёт FAIL `pi-auth` (с `--probe` — до всякого запроса)' 'README.ru: pi models.json apiKey refused by task and doctor, no probe request (F1)'
+expect_absent README.ru.md 'ключ, записанный там текстом, перекрыл бы `keyVar`' 'README.ru: no doctor-only pi models.json check (F1)'
+expect_new "$SPEC" 'отличный от ровно `$<keyVar>` или `${<keyVar>}`' 'spec: pi models.json apiKey check (F1)'
+# doctor --probe stops at the doctor FAIL row (exit 1) and never reaches the adapter probe: no exit 2 is promised for it.
+expect_absent README.md '`doctor --probe` refuse the profile (exit 2)' 'README: no exit 2 promised for doctor --probe (F1)'
+expect_absent README.ru.md '`doctor --probe` отклоняют профиль (exit 2)' 'README.ru: no exit 2 promised for doctor --probe (F1)'
+expect_absent "$SPEC" 'exit 2 у `task` и `--probe`' 'spec: no exit 2 promised for --probe, pi (F1)'
+expect_absent "$SPEC" '`task` и `--probe` — exit 2' 'spec: no exit 2 promised for --probe, pi and OpenCode (F1, F9)'
+expect_absent "$SPEC" '`task` файл не читает' 'spec: task reads the pi models.json (F1)'
+# F2: every read role on glm (readOnly=none) is bracketed by the no-edit check.
+expect_new README.md 'a read-only role there — these two or a reviewer (`plan-reviewer`, `spec-reviewer`, `control-review`, `adhoc-review`) — gets write access (`route` warns), and the same before/after check runs' 'README: every read role on glm gets the no-edit check (F2)'
+expect_new README.ru.md 'роль только для чтения там — эти две или ревьюер (`plan-reviewer`, `spec-reviewer`, `control-review`, `adhoc-review`) — получает право записи (`route` предупреждает) и проходит ту же проверку до и после' 'README.ru: every read role on glm gets the no-edit check (F2)'
+expect_new "$SPEC" 'а также задачу любой `read`-роли на профиле с `readOnly=none`' 'spec: every read role on readOnly=none is checked (F2)'
+expect_absent "$SPEC" 'задачу `read`-роли (`diagnosis`, `final-review`) на профиле с `readOnly=none`' 'spec: no diagnosis/final-review-only check (F2)'
+# F3: a resume runs on the current profile; auth, keyVar and authHeader are bound.
+expect_new README.md 'A resumed job runs on the profile as `config.json` has it now' 'README: a resume runs on the current profile (F3)'
+expect_new README.md '`--resume-task` refuses (`dispatch --fresh`) a record whose harness, model, endpoint, home, `bin`, `wrap`, `sandbox`, `auth`, `keyVar` or `authHeader` differ from `config.json`' 'README: resume bound fields (F3)'
+expect_new README.ru.md 'Продолжение задачи идёт на профиле в том виде, в каком он сейчас записан в `config.json`' 'README.ru: a resume runs on the current profile (F3)'
+expect_new README.ru.md '`--resume-task` отказывает (`dispatch --fresh`), если харнесс, модель, эндпоинт, каталог, `bin`, `wrap`, `sandbox`, `auth`, `keyVar` или `authHeader`' 'README.ru: resume bound fields (F3)'
+expect_new "$SPEC" 'Продолжение идёт на профиле из текущего `config.json`' 'spec: a resume runs on the current profile (F3)'
+expect_new "$SPEC" '`bin`, `wrap`, `sandbox`, `auth`, `keyVar`, `authHeader`, — exit 2' 'spec: resume bound fields (F3)'
+# F4: the scrub runs when the runner finishes the job; a dead runner leaves the session files.
+expect_absent README.md 'redacted after every run' 'README: no after-every-run scrub promise (F4)'
+expect_new README.md 'If the runner process itself dies (killed, a crash, a power loss), the job is reaped as `failed` / `crash`' 'README: a dead runner leaves pi session files (F4)'
+expect_new README.md '`~/.claude/plugins/data/superpowers-strigov-ver-agents/state/<workspace>/jobs/<id>/`' 'README: the job directory to delete (F4)'
+expect_absent README.ru.md 'после каждого запуска перезаписываются' 'README.ru: no after-every-run scrub promise (F4)'
+expect_new README.ru.md 'Если погиб сам процесс раннера (его убили, сбой, отключение питания), задача помечается `failed` / `crash`' 'README.ru: a dead runner leaves pi session files (F4)'
+expect_new README.ru.md '`~/.claude/plugins/data/superpowers-strigov-ver-agents/state/<workspace>/jobs/<id>/`' 'README.ru: the job directory to delete (F4)'
+expect_absent "$SPEC" 'после каждого запуска с ключом они перезаписываются' 'spec: no after-every-run scrub promise (F4)'
+expect_new "$SPEC" 'Если погиб сам процесс раннера (его убили, сбой, отключение питания), уборка помечает задачу `failed` / `crash`' 'spec: a dead runner leaves pi session files (F4)'
+# F5: nested repositories in tree-state and the revert.
+expect_new "$SPEC" 'печатается как `<путь> (nested repository)` и стоит раньше остальных' 'spec: tree-state marks nested repositories first (F5)'
+expect_new "$SPEC" 'иначе одна строка `Not reverted: <пути> — kept.`' 'spec: a failed revert is kept without a second question (F5)'
+# F8: a launch that never spawned a runner leaves no key handoff file.
+expect_new "$SPEC" 'Так у задачи, отменённой до старта раннера, копии ключа не остаётся.' 'spec: no handoff file after a launch without a runner (F8)'
+# F9: a provider entry in ~/.opencode refuses a keyed opencode profile.
+expect_new README.md 'OpenCode also reads `~/.opencode/opencode.json` and `opencode.jsonc` in your real home' 'README: ~/.opencode provider entry refused (F9)'
+expect_new README.ru.md 'OpenCode читает ещё и `~/.opencode/opencode.json` и `opencode.jsonc`' 'README.ru: ~/.opencode provider entry refused (F9)'
+expect_new "$SPEC" '`~/.opencode/opencode.json` и `opencode.jsonc` OpenCode читает при любой изоляции' 'spec: ~/.opencode provider entry refused (F9)'
+# F14: the maxParallel refusal names each running job with its workspace root.
+expect_new "$SPEC" '`agent-dispatch: profile <p> is at maxParallel=<n> (running: <id> cwd=<корень>, …)`' 'spec: maxParallel refusal names the workspace (F14)'
 
 echo ""
 echo "Documented route examples (bin/agent-dispatch)"
