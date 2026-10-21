@@ -31,30 +31,27 @@
     "integration-check":      ["sonnet-medium"],
     "adhoc-review":           ["astra-high"]
   },
-  "roleRuns": {
-    "plan-writer":            "session",
-    "plan-reviser":           "session",
-    "plan-reviewer":          "external",
-    "spec-reviewer":          "external",
-    "implementer":            "external",
-    "implementer.risk":       "external",
-    "implementer.escalation": "external",
-    "frontend.new-ui":        "session",
-    "frontend.tweak":         "session",
-    "gate":                   "session",
-    "phase-review":           "session",
-    "phase-review.escalated": "session",
-    "control-review":         "external",
-    "synthesis":              "session",
-    "final-review":           "session-then-external",
-    "diagnosis":              "session",
-    "quickfix":               "session",
-    "integration-check":      "session",
-    "adhoc-review":           "external"
+  "roleKinds": {
+    "plan-writer":            "write",
+    "plan-reviser":           "write",
+    "plan-reviewer":          "read",
+    "spec-reviewer":          "read",
+    "implementer":            "write",
+    "implementer.risk":       "write",
+    "implementer.escalation": "write",
+    "frontend.new-ui":        "write",
+    "frontend.tweak":         "write",
+    "gate":                   "run",
+    "phase-review":           "run",
+    "phase-review.escalated": "run",
+    "control-review":         "read",
+    "synthesis":              "write",
+    "final-review":           "read",
+    "diagnosis":              "read",
+    "quickfix":               "write",
+    "integration-check":      "run",
+    "adhoc-review":           "read"
   },
-  "reviewerRoles": [
-    "plan-reviewer", "spec-reviewer", "phase-review", "phase-review.escalated", "control-review", "final-review", "adhoc-review"
-  ],
   "presets": {
     "claude-sub": {
       "harness": "claude", "auth": "login", "model": "opus", "effort": "xhigh"

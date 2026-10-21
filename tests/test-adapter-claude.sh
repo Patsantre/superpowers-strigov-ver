@@ -324,7 +324,7 @@ EOF
     # 2b login, reviewer. Every spelling git accepts for its file-writing and program-running options is denied; the
     # safe ones (--no-ext-diff, --no-textconv) and plain reading run.
     local git_cmds='["git show --output=x HEAD","git diff --output x","git log -p --output=/tmp/x","git show --ext-diff HEAD","git log -p --textconv","git diff --no-index /etc/hosts /dev/null","git show HEAD","git diff HEAD~1 -- a.txt","git log --oneline -5","git status --short","git diff --no-ext-diff","git log -p --no-textconv"]'
-    task_on csub login-r AGENT_STUB_BG_TOKENS=1 "AGENT_STUB_BASH_PROBE=$git_cmds" -- --role phase-review
+    task_on csub login-r AGENT_STUB_BG_TOKENS=1 "AGENT_STUB_BASH_PROBE=$git_cmds" -- --role control-review
     st="$(wait_job "$ID")"
     d="$JOBS/$ID"
     sid="$(jobf "$ID" r.sessionId)"
@@ -343,7 +343,7 @@ EOF
     [[ "$got" == "$exp" ]]
     verdict "2 login reviewer: git show/diff/log with --output (= or a separate value), --ext-diff, --textconv, --no-index denied; reading runs" $? "got: $got" "exp: $exp"
     # A claude that reads `Bash(git diff:*)` as a plain text prefix would also take git difftool and git diff-tree.
-    task_on csub login-r-plain AGENT_STUB_PLAIN_PREFIX=1 'AGENT_STUB_BASH_PROBE=["git difftool -y --extcmd=touch HEAD","git diff-tree -p --output=x HEAD","git diff HEAD"]' -- --role phase-review
+    task_on csub login-r-plain AGENT_STUB_PLAIN_PREFIX=1 'AGENT_STUB_BASH_PROBE=["git difftool -y --extcmd=touch HEAD","git diff-tree -p --output=x HEAD","git diff HEAD"]' -- --role control-review
     st="$(wait_job "$ID")"
     got="$(jget "$REC.claude.json" r.bash)"
     [[ "$st" == completed && "$got" == '{"git difftool -y --extcmd=touch HEAD":"deny","git diff-tree -p --output=x HEAD":"deny","git diff HEAD":"allow"}' ]]
@@ -573,7 +573,7 @@ EOF
     user_settings="$(cat "$HOME/.claude/settings.json")"
     printf '%s\n' '{"env":{"CLAUDE_CODE_EFFORT_LEVEL":"low"},"permissions":{"allow":["Bash(npm install:*)","Bash(git diff *)","Bash(git commit:*)","Read(~/notes/**)","Edit"]}}' >"$HOME/.claude/settings.json"
     local cmds='["npm install left-pad","git commit -am x","rm -rf a.txt","git diff HEAD~1","git status","git log --oneline"]'
-    task_on csub allow-r "AGENT_STUB_BASH_PROBE=$cmds" -- --role phase-review
+    task_on csub allow-r "AGENT_STUB_BASH_PROBE=$cmds" -- --role control-review
     st="$(wait_job "$ID")"
     exp='{"npm install left-pad":"deny","git commit -am x":"deny","rm -rf a.txt":"deny","git diff HEAD~1":"allow","git status":"allow","git log --oneline":"allow"}'
     [[ "$st" == completed && "$(jget "$JOBS/$ID/settings.json" r.permissions)" == '{"deny":['"$GIT_DENY"',"Bash(npm install:*)","Bash(git commit:*)"]}' \
@@ -588,19 +588,19 @@ EOF
     [[ "$OUT" == *"WARN permissions csub: allow rules past a reviewer's read-only set (spec §3.6 A4): $HOME/.claude/settings.json allows Bash(npm install:*), Bash(git commit:*): denied for reviewers"* ]]
     verdict "7 doctor: WARN naming the user's allow rules that a reviewer gets denied" $? "$OUT"
     printf '%s\n' '{"permissions":{"allow":["Bash"]}}' >"$HOME/.claude/settings.json"
-    task_on csub allow-broad 'AGENT_STUB_BASH_PROBE=["git diff","ls"]' -- --role phase-review
+    task_on csub allow-broad 'AGENT_STUB_BASH_PROBE=["git diff","ls"]' -- --role control-review
     st="$(wait_job "$ID")"
     [[ "$st" == completed && "$(jget "$JOBS/$ID/settings.json" r.permissions)" == '{"deny":['"$GIT_DENY"',"Bash"]}' && "$(jget "$REC.claude.json" r.bash)" == '{"git diff":"deny","ls":"deny"}' ]]
     verdict "7 a bare Bash allow rule: denied for the reviewer, the git commands with it (read-only first)" $? "st=$st bash=$(jget "$REC.claude.json" r.bash)"
     printf '%s\n' '{"sandbox":{"enabled":true}}' >"$HOME/.claude/settings.json"
-    task_on csub sandbox-r 'AGENT_STUB_BASH_PROBE=["touch x","git diff"]' -- --role phase-review
+    task_on csub sandbox-r 'AGENT_STUB_BASH_PROBE=["touch x","git diff"]' -- --role control-review
     st="$(wait_job "$ID")"
     [[ "$st" == completed && "$(jget "$JOBS/$ID/settings.json" r.sandbox)" == '{"autoAllowBashIfSandboxed":false}' && "$(jget "$REC.claude.json" r.bash)" == '{"touch x":"deny","git diff":"allow"}' ]]
     verdict "7 a sandbox enabled in the user settings does not auto-allow a reviewer's Bash" $? "st=$st sandbox=$(jget "$JOBS/$ID/settings.json" r.sandbox) bash=$(jget "$REC.claude.json" r.bash)"
     printf '%s\n' "$user_settings" >"$HOME/.claude/settings.json"
     # A login profile with "home": "isolated" loads homes/<p>/claude/settings.json as its user settings: the same denial.
     printf '%s\n' '{"permissions":{"allow":["Bash(npm install:*)","Bash(git log:*)"]}}' >"$STATE/homes/ciso/claude/settings.json"
-    task_on ciso allow-iso 'AGENT_STUB_BASH_PROBE=["npm install left-pad","git log --oneline"]' -- --role phase-review
+    task_on ciso allow-iso 'AGENT_STUB_BASH_PROBE=["npm install left-pad","git log --oneline"]' -- --role control-review
     st="$(wait_job "$ID")"
     [[ "$st" == completed && "$(jget "$JOBS/$ID/settings.json" r.permissions)" == '{"deny":['"$GIT_DENY"',"Bash(npm install:*)"]}' \
         && "$(jget "$REC.claude.json" r.bash)" == '{"npm install left-pad":"deny","git log --oneline":"allow"}' \

@@ -12,6 +12,7 @@
 //   status [ID] [--cwd W] [--json] [--all]      result ID [--cwd W]      cancel ID [--cwd W]      release-stale [--cwd W]
 //   route ROLE [--skip p[:class],…] [--json]    route --all [--json]     channels [--json]
 //   doctor [--profile P] [--probe]
+//   tree-state [--cwd W] [--since TREE]
 //   key set NAME | key list | key rm NAME
 //   profile list [--json] | profile show P | profile add NAME --from PRESET [--model M] [--key K] [--set k=v]… |
 //   profile env P [-- COMMAND [ARGS…]]
@@ -439,36 +440,19 @@ export function linkedProfiles(state) {
 
 // ---------- routing (spec §3.3 route, §5.1, §5.3) ----------
 
-const roleRuns = (role) => DEFAULTS.roleRuns[role] ?? "external";
+// The kind of a role (agents-defaults.json roleKinds, spec §5.1): "write" edits files, "run" runs the project's
+// commands and edits nothing (gate, phase reviews, integration check), "read" only reads. write and run take --write.
+// Every chain runs as configured, in-session roles included (increment 6): an inproc profile is an Agent call, any
+// other runs on its harness (agent-invocation "In-session roles on an external profile").
+const roleKind = (role) => DEFAULTS.roleKinds[role];
+const kindWrites = (kind) => kind !== "read";
 
-// The chain a role runs on now (spec §5.1). Until increment 6 the in-session stage of a role stays in the session:
-// - a role executed in-session ("session") runs only on inproc profiles: external profiles in its chain are left
-//   out with one note, and with no inproc profile left it keeps the built-in chain;
-// - a role executed in-session first, then externally ("session-then-external": final-review) starts with its inproc
-//   profiles — the configured ones, else the built-in ones — and its external profiles follow as the fallback; a
-//   chain that does not start in-session gets one note.
-function effectiveChain(state, role) {
-  const configured = state.roles[role];
-  const runs = roleRuns(role);
-  if (runs === "external") return { chain: [...configured], notes: [] };
-  const isInproc = (name) => state.profiles.get(name)?.p.harness === "inproc";
-  const inproc = configured.filter(isInproc);
-  const external = configured.filter((name) => !isInproc(name));
-  if (runs === "session") {
-    if (external.length === 0) return { chain: inproc, notes: [] };
-    const chain = inproc.length > 0 ? inproc : [...DEFAULTS.roles[role]];
-    return {
-      chain,
-      notes: [`${role} still runs in-session until increment 6: external profile(s) ${external.join(", ")} are not used; it runs on ${chain[0]}`],
-    };
-  }
-  const session = inproc.length > 0 ? inproc : DEFAULTS.roles[role].filter((name) => DEFAULTS.profiles[name]?.harness === "inproc");
-  const chain = [...session, ...external];
-  if (sameList(chain, configured)) return { chain, notes: [] };
-  return {
-    chain,
-    notes: [`${role} still starts in-session until increment 6: it runs on ${chain[0]} first, then on ${external.join(", ") || "-"} as the external fallback`],
-  };
+function roleWriteWarning(role, write) {
+  const kind = roleKind(role);
+  if (write === kindWrites(kind)) return null;
+  return write
+    ? `task --role ${role}: ${role} is a read-only role; --write gives it write access`
+    : `task --role ${role}: ${role} ${kind === "run" ? "runs the project's commands" : "writes files"} and needs --write; without it the harness runs read-only`;
 }
 
 function parseSkips(values) {
@@ -490,7 +474,8 @@ function shownModel(profile) {
 }
 
 export function routeRole(state, role, skips = [], links = linkedProfiles(state)) {
-  const { chain, notes } = effectiveChain(state, role);
+  const chain = state.roles[role];
+  const kind = roleKind(role);
   // A profile named in --skip is out with its class; with auth or quota its linked profiles go too, "via" it. A
   // direct entry wins over a linked one.
   const excluded = new Map(); // profile → { cls, via }
@@ -501,7 +486,7 @@ export function routeRole(state, role, skips = [], links = linkedProfiles(state)
   }
   const remaining = chain.filter((name) => !excluded.has(name));
   const skipped = chain.filter((name) => excluded.has(name)).map((name) => ({ profile: name, class: excluded.get(name).cls, via: excluded.get(name).via }));
-  const result = { role, profile: null, harness: null, model: null, effort: null, readOnly: null, maxParallel: null, inSession: false, chain: remaining, skipped, custom: state.userRoles.has(role), notes, warnings: [] };
+  const result = { role, kind, write: kindWrites(kind), profile: null, harness: null, model: null, effort: null, readOnly: null, maxParallel: null, inSession: false, chain: remaining, skipped, custom: state.userRoles.has(role), warnings: [] };
   const name = remaining[0];
   if (!name) return result;
   const profile = state.profiles.get(name).p;
@@ -516,7 +501,7 @@ export function routeRole(state, role, skips = [], links = linkedProfiles(state)
     maxParallel: inproc ? null : profile.maxParallel,
     inSession: inproc,
   });
-  if (profile.harness === "zcode" && DEFAULTS.reviewerRoles.includes(role)) {
+  if (profile.harness === "zcode" && kind === "read") {
     result.warnings.push(`${name} has no read-only mode: the ${role} runs with write access (--mode yolo) and takes the ZCode reservation`);
   }
   return result;
@@ -531,13 +516,12 @@ export function routeLine(r) {
 }
 
 function routeAside(r) {
-  for (const note of r.notes) errOut(`${CLI_NAME}: note: route ${r.role}: ${note}\n`);
   for (const warning of r.warnings) errOut(`${CLI_NAME}: WARN route ${r.role}: ${warning}\n`);
 }
 
-// Roles whose effective chain differs from the built-in scheme (route --all).
+// Roles whose chain differs from the built-in scheme (route --all, doctor).
 function differingRoles(state) {
-  return Object.keys(DEFAULTS.roles).filter((role) => !sameList(effectiveChain(state, role).chain, DEFAULTS.roles[role]));
+  return Object.keys(DEFAULTS.roles).filter((role) => !sameList(state.roles[role], DEFAULTS.roles[role]));
 }
 
 function cmdRoute(args) {
@@ -547,10 +531,6 @@ function cmdRoute(args) {
     if (positionals.length > 0 || values.skip) throw new UsageError("route --all takes no role and no --skip");
     const links = linkedProfiles(state);
     const routes = differingRoles(state).map((role) => routeRole(state, role, [], links));
-    for (const role of Object.keys(DEFAULTS.roles)) {
-      const { notes } = effectiveChain(state, role);
-      for (const note of notes) errOut(`${CLI_NAME}: note: route ${role}: ${note}\n`);
-    }
     if (values.json) out(`${JSON.stringify({ default: routes.length === 0, routes }, null, 2)}\n`);
     else if (routes.length === 0) out("routes: default\n");
     else for (const r of routes) out(`${routeLine(r)}\n`);
@@ -845,8 +825,14 @@ async function cmdTask(args) {
   if (p.harness === "inproc") {
     throw new UsageError(`profile ${name} runs in-session (harness inproc): dispatch it with the Agent tool (model=${p.model} effort=${p.effort ?? "-"}), not with task`);
   }
-
   const pass = PASS_THROUGH[p.harness];
+  // --role records the role and checks --write against its kind: one WARN, never a refusal. zcode always writes;
+  // its own WARN covers a missing --write.
+  if (values.role !== undefined && !pass?.alwaysWrites) {
+    const warning = roleWriteWarning(values.role, write);
+    if (warning) errOut(`${CLI_NAME}: WARN ${warning}\n`);
+  }
+
   if (pass) {
     const promptFile = values["prompt-file"];
     if (!promptFile) throw new UsageError("task requires --prompt-file <file>");
@@ -888,6 +874,7 @@ function cmdStatus(args) {
   const jobs = core.listJobSummaries(values.cwd, { all: values.all === true }).map((summary) => ({
     id: summary.id,
     profile: summary.profile,
+    role: summary.role,
     harness: PREFIX_HARNESS[summary.id.slice(0, 2)] ?? null,
     status: summary.status,
     errorClass: summary.errorClass,
@@ -915,6 +902,89 @@ async function cmdJobVerb(verb, args) {
   const { values, positionals } = parse(args, { cwd: { type: "string" } }, 1, 1);
   if (verb === "result") return core.resultCommand({ cwd: values.cwd, id: positionals[0] });
   return await core.cancelCommand({ cwd: values.cwd, id: positionals[0] });
+}
+
+// ---------- tree-state (agent-invocation "In-session roles on an external profile", item 4) ----------
+
+// The content of a work tree — tracked and untracked files; ignored files and .superpowers/ (the orchestrator's
+// workspace: prompts, reports, packages; files git tracks there too) left out — as one git tree id. A submodule or a
+// nested repository counts by its HEAD and by its own content (this id, recursively), so an edit inside it changes the
+// id as a moved HEAD does. It is written through a temporary copy of the index, so the real index, HEAD, refs and the
+// files stay as they are; git only gains loose objects, as with `git stash create`. The orchestrator takes it right
+// before and right after a job that must not edit files. A tree git cannot index (a nested repository without a
+// commit, an unreadable file) is an error carrying git's whole message, the paths it names included.
+function gitOut(cwd, argv, env = process.env, input = undefined) {
+  const r = spawnSync("git", argv, { cwd, env, input, encoding: "utf8", timeout: STORE_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 });
+  if (r.error || r.status !== 0) {
+    const said = String(r.error?.message || r.stderr || `exit ${r.status}`).split("\n").filter((line) => line.trim() && !line.startsWith("hint:"));
+    throw new Error(`git ${argv[0]} failed: ${said.join("\n").trim()}`);
+  }
+  return r.stdout;
+}
+
+export function treeState(root) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agent-dispatch-tree-"));
+  try {
+    const index = path.join(tmp, "index");
+    const real = path.resolve(root, gitOut(root, ["rev-parse", "--git-path", "index"]).trim());
+    if (fs.existsSync(real)) {
+      // The copy keeps the index's mtime: git takes an entry whose file changed in the second the index was written
+      // as racy and rereads it, and a newer copy would trust its stat data and miss a same-size edit.
+      fs.copyFileSync(real, index);
+      const { atime, mtime } = fs.statSync(real);
+      fs.utimesSync(index, atime, mtime);
+    }
+    const env = { ...process.env, GIT_INDEX_FILE: index };
+    // As bin/review-package: exclude .superpowers unless the repo already ignores it (git add then refuses the named
+    // ignored path, and skips the directory anyway). A sparse checkout needs --sparse (git 2.34+), or git add refuses a
+    // path outside its cone and keeps the old content of a file written back there.
+    const ignored = spawnSync("git", ["check-ignore", "-q", "--no-index", ".superpowers"], { cwd: root }).status === 0;
+    const sparse = spawnSync("git", ["config", "--bool", "core.sparseCheckout"], { cwd: root, encoding: "utf8" }).stdout?.trim() === "true";
+    gitOut(root, ["add", "-A", ...(sparse ? ["--sparse"] : []), "--", ".", ...(ignored ? [] : [":(exclude).superpowers"])], env);
+    const workspace = [];
+    for (const entry of gitOut(root, ["ls-files", "-s", "-z"], env).split("\0")) {
+      const [, mode, name] = /^(\d+) [0-9a-f]+ \d\t(.+)$/s.exec(entry) ?? [];
+      // What git already tracks under .superpowers/ leaves the temporary index too.
+      if (name === ".superpowers" || name?.startsWith(".superpowers/")) workspace.push(name);
+      // git add records a submodule or a nested repository by its HEAD alone (a gitlink); a checked-out one gets an id
+      // of its HEAD and its content instead. One that is not checked out has nothing to edit.
+      else if (mode === "160000" && fs.existsSync(path.join(root, name, ".git"))) {
+        const dir = path.join(root, name);
+        const id = gitOut(root, ["hash-object", "--stdin"], process.env, `${gitOut(dir, ["rev-parse", "HEAD"]).trim()} ${treeState(dir)}\n`).trim();
+        gitOut(root, ["update-index", "--cacheinfo", `160000,${id},${name}`], env);
+      }
+    }
+    if (workspace.length > 0) gitOut(root, ["update-index", "--force-remove", "-z", "--stdin"], env, workspace.map((name) => `${name}\0`).join(""));
+    return gitOut(root, ["write-tree"], env).trim();
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// A changed path as one item of the one-line list: quoted when a control character, ", " or a leading quote would
+// split the line or blur the list.
+const shownPath = (name) => (/[\x00-\x1f\x7f]|, |^"/.test(name) ? JSON.stringify(name) : name);
+
+function cmdTreeState(args) {
+  const { values } = parse(args, { cwd: { type: "string" }, since: { type: "string" } }, 0);
+  const since = values.since;
+  const sinceUsage = "--since takes the tree id an earlier tree-state printed";
+  if (since !== undefined && !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(since)) throw new UsageError(sinceUsage);
+  const { root } = core.requireWorkspace(values.cwd);
+  const tree = treeState(root);
+  if (since === undefined) out(`tree ${tree}\n`);
+  else if (since === tree) out(`tree ${tree}: unchanged\n`);
+  else {
+    // Only a whole tree id of this repository: a commit id, or an abbreviation (40 hex digits in a sha256 repo), names
+    // the same content under another spelling and would read as changed with no path to name.
+    const type = spawnSync("git", ["cat-file", "-t", since], { cwd: root, encoding: "utf8", timeout: STORE_TIMEOUT_MS });
+    if (since.length !== tree.length || type.status !== 0 || type.stdout.trim() !== "tree") throw new UsageError(sinceUsage);
+    const diff = ["diff-tree", "-r", "--no-renames", "--ignore-submodules=none", "--name-only", "-z", since, tree];
+    const changed = gitOut(root, diff).split("\0").filter(Boolean);
+    const shown = changed.slice(0, 10).map(shownPath).join(", ") + (changed.length > 10 ? ` (+${changed.length - 10} more)` : "");
+    out(`tree ${tree}: changed since ${since.slice(0, 7)}: ${shown}\n`);
+  }
+  return 0;
 }
 
 function cmdReleaseStale(args) {
@@ -1467,7 +1537,7 @@ async function cmdDoctor(args) {
     report("FAIL", "env", error.message);
   }
   const names = values.profile ? [values.profile] : [...state.profiles.keys()];
-  const used = new Set(Object.keys(DEFAULTS.roles).flatMap((role) => effectiveChain(state, role).chain));
+  const used = new Set(Object.keys(DEFAULTS.roles).flatMap((role) => state.roles[role]));
   const checks = { single: Boolean(values.profile), used, codexSetup: null };
   for (const name of names) {
     // Whatever escapes one profile's checks is that profile's FAIL row: the report and its verdict always print.
@@ -1486,7 +1556,7 @@ async function cmdDoctor(args) {
 
 // ---------- main ----------
 
-const USAGE = `usage: ${CLI_NAME} <task|status|result|cancel|release-stale|route|channels|doctor|key|profile|preset> [args...]`;
+const USAGE = `usage: ${CLI_NAME} <task|status|result|cancel|release-stale|tree-state|route|channels|doctor|key|profile|preset> [args...]`;
 
 export async function main(argv) {
   const [verb, ...rest] = argv;
@@ -1501,6 +1571,8 @@ export async function main(argv) {
         return await cmdJobVerb(verb, rest);
       case "release-stale":
         return cmdReleaseStale(rest);
+      case "tree-state":
+        return cmdTreeState(rest);
       case "route":
         return cmdRoute(rest);
       case "channels":

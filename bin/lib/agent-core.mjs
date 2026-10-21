@@ -2798,6 +2798,7 @@ export function statusLine(record) {
 export const jobSummary = (record) => ({
   id: record.id,
   profile: record.profile ?? null,
+  role: record.role ?? null,
   status: record.status,
   errorClass: record.errorClass ?? null,
   write: record.write === true,

@@ -241,6 +241,19 @@ EOF
     for role in $roles; do got="$got$(ad route "$role")"$'\n'; done
     [[ "${got%$'\n'}" == "$expected" ]]
     verdict "2 route ROLE for all 19 built-in roles prints the Model split of SKILL.md in the §3.3 format" $? "$(diff <(echo "$expected") <(echo "${got%$'\n'}"))"
+    node -e '
+const d = require(process.argv[1]);
+const want = { "plan-writer": "write", "plan-reviser": "write", "plan-reviewer": "read", "spec-reviewer": "read",
+  "implementer": "write", "implementer.risk": "write", "implementer.escalation": "write", "frontend.new-ui": "write",
+  "frontend.tweak": "write", "gate": "run", "phase-review": "run", "phase-review.escalated": "run", "control-review": "read",
+  "synthesis": "write", "final-review": "read", "diagnosis": "read", "quickfix": "write", "integration-check": "run",
+  "adhoc-review": "read" };
+const roles = Object.keys(d.roles), k = d.roleKinds ?? {};
+const bad = [...new Set([...roles, ...Object.keys(want), ...Object.keys(k)])]
+  .filter((r) => !roles.includes(r) || k[r] !== want[r]).map((r) => r + "=" + k[r] + " (want " + want[r] + ")");
+if ("roleRuns" in d || "reviewerRoles" in d) bad.push("roleRuns/reviewerRoles still present");
+if (bad.length) { console.log(bad.join(" ")); process.exit(1); }' -- "$DEFAULTS_JSON"
+    verdict "2 roleKinds is exactly the spec §5.1 table: one kind (write, run, read) per built-in role, nothing else listed" $?
 
     # --- 3. the golden table: every role of the built-in scheme, every profile of its chain ---
     golden_want() { # <role:profile> → the wrapper argv (JSON), REFUSE for an in-session profile, or MISSING
@@ -275,9 +288,10 @@ EOF
                 wrapper=codex-dispatch other=zcode-dispatch line="Codex Task started in the background as task-stub-0001. Check /codex:status task-stub-0001 for progress."
             fi
             got="$(last_call "$wrapper" task)"
-            [[ "$want" != MISSING && "$RC" -eq 0 && "$got" == "$want" && "$OUT" == "$line" && "$(calls_of "$wrapper" task)" -eq 1 && "$(calls_of "$other" task)" -eq 0 ]]
+            # Empty stderr: the built-in forms carry the --write of their kind, so no kind WARN (and no zcode WARN) fires.
+            [[ "$want" != MISSING && "$RC" -eq 0 && -z "$ERR" && "$got" == "$want" && "$OUT" == "$line" && "$(calls_of "$wrapper" task)" -eq 1 && "$(calls_of "$other" task)" -eq 0 ]]
             golden_st=$? # before the label: its $(jwords …) would reset $?
-            verdict "3 golden $role → $prof: $wrapper gets $(jwords "$want" | sed "s|$prompt|F|")" "$golden_st" "rc=$RC want: $want" "got:  $got" "out: $OUT" "err: $ERR"
+            verdict "3 golden $role → $prof: $wrapper gets $(jwords "$want" | sed "s|$prompt|F|"), no WARN" "$golden_st" "rc=$RC want: $want" "got:  $got" "out: $OUT" "err: $ERR"
         done
     done
     [[ "$cases" -eq 21 ]]
@@ -334,6 +348,78 @@ EOF
         && "$RC" -eq 2 && "$ERR" == *"ct-0001 cannot resume on profile luna"*"dispatch --fresh" \
         && "$(calls_of zcode-dispatch task)" -eq 0 && "$(calls_of codex-dispatch task)" -eq 0 ]]
     verdict "3 --resume-task with another harness's id (task- on glm, zt- / ct- on luna): exit 2 '… dispatch --fresh' before any wrapper runs" $? "glm: rc=$rc1 err: $err1" "luna zt-: rc=$rc2 err: $err2" "luna ct-: rc=$RC err: $ERR"
+
+    # --- 3b. in-session roles on pass-through profiles (increment 6): the recipe's --write, the wrapper argv ---
+    SESSION_READ_ROLES=" diagnosis final-review "   # agent-invocation "In-session roles on an external profile" item 2
+    write_config <<'EOF'
+{ "version": 1, "roles": {
+  "plan-writer": ["sol"], "plan-reviser": ["sol"], "frontend.new-ui": ["sol"], "frontend.tweak": ["luna"],
+  "gate": ["astra-high"], "phase-review": ["astra-high"], "phase-review.escalated": ["astra"],
+  "synthesis": ["luna"], "final-review": ["astra"], "diagnosis": ["astra-high"],
+  "quickfix": ["luna"], "integration-check": ["astra-high"] } }
+EOF
+    local s_cases=0 s_json s_prof s_model s_effort s_w s_wv s_mirror
+    for role in plan-writer plan-reviser frontend.new-ui frontend.tweak gate phase-review phase-review.escalated \
+        synthesis final-review diagnosis quickfix integration-check; do
+        s_cases=$((s_cases + 1))
+        s_json="$(ad route "$role" --json 2>/dev/null)"
+        s_prof="$(jfield profile <<<"$s_json")" s_model="$(jfield model <<<"$s_json")" s_effort="$(jfield effort <<<"$s_json")"
+        s_w=--write s_wv=true
+        [[ "$SESSION_READ_ROLES" == *" $role "* ]] && s_w="" s_wv=false
+        [[ "$(jfield write <<<"$s_json")" == "$s_wv" && "$(jfield inSession <<<"$s_json")" == false ]]
+        s_mirror=$?
+        reset_wrappers
+        # shellcheck disable=SC2086
+        run_ad task --profile "$s_prof" --role "$role" --background $s_w --prompt-file "$prompt"
+        # shellcheck disable=SC2086
+        [[ "$s_mirror" -eq 0 && "$RC" -eq 0 && -z "$ERR" \
+            && "$(last_call codex-dispatch task)" == "$(jarr task --background $s_w --model "$s_model" --effort "$s_effort" --prompt-file "$prompt")" \
+            && "$OUT" == "Codex Task started in the background as task-stub-0001. Check /codex:status task-stub-0001 for progress." \
+            && "$(calls_of zcode-dispatch task)" -eq 0 ]]
+        verdict "3b $role → $s_prof: route says write=$s_wv as the recipe does; codex-dispatch gets the argv, no WARN" $? \
+            "route: $s_json" "rc=$RC err: $ERR" "got: $(last_call codex-dispatch task)"
+    done
+    [[ "$s_cases" -eq 12 ]]
+    verdict "3b every in-session role (12) ran on a codex profile" $? "cases=$s_cases"
+
+    write_config <<'EOF'
+{ "version": 1, "roles": { "plan-writer": ["glm"], "diagnosis": ["glm"], "phase-review": ["glm"] } }
+EOF
+    run_ad route diagnosis
+    local s_diag_err="$ERR"
+    run_ad route phase-review
+    [[ "$s_diag_err" == "agent-dispatch: WARN route diagnosis: glm has no read-only mode: the diagnosis runs with write access (--mode yolo) and takes the ZCode reservation" \
+        && "$RC" -eq 0 && -z "$ERR" ]]
+    verdict "3b route on glm: diagnosis (read) warns once; phase-review (run: write access by design) does not" $? "diagnosis: $s_diag_err" "phase-review: $ERR"
+    reset_wrappers
+    run_ad task --profile glm --role plan-writer --background --write --prompt-file "$prompt"
+    [[ "$RC" -eq 0 && -z "$ERR" && "$(last_call zcode-dispatch task)" == "$(jarr task --background --prompt-file "$prompt")" ]]
+    verdict "3b plan-writer on glm with --write: task --background --prompt-file F, no WARN" $? "rc=$RC err: $ERR"
+    reset_wrappers
+    run_ad task --profile glm --role diagnosis --background --prompt-file "$prompt"
+    [[ "$RC" -eq 0 && "$(last_call zcode-dispatch task)" == "$(jarr task --background --prompt-file "$prompt")" \
+        && "$ERR" == "agent-dispatch: WARN glm has no read-only mode: zcode-dispatch runs this task with write access (--mode yolo) and takes the ZCode reservation" ]]
+    verdict "3b diagnosis on glm without --write: the same argv, exactly the zcode WARN (a read role without --write: no kind WARN)" $? "rc=$RC err: $ERR"
+    reset_wrappers
+    run_ad task --profile glm --role phase-review --background --prompt-file "$prompt"
+    [[ "$RC" -eq 0 && "$(last_call zcode-dispatch task)" == "$(jarr task --background --prompt-file "$prompt")" \
+        && "$ERR" == "agent-dispatch: WARN glm has no read-only mode: zcode-dispatch runs this task with write access (--mode yolo) and takes the ZCode reservation" ]]
+    verdict "3b phase-review (run) on glm without --write: exactly the zcode WARN, no kind WARN (zcode always writes, the kind check is skipped)" $? "rc=$RC err: $ERR"
+    reset_wrappers
+    run_ad task --profile astra --role final-review --background --write --prompt-file "$prompt"
+    [[ "$RC" -eq 0 && "$ERR" == "agent-dispatch: WARN task --role final-review: final-review is a read-only role; --write gives it write access" ]]
+    verdict "3b a read role with --write: one kind WARN, the task still starts" $? "rc=$RC err: $ERR"
+    reset_wrappers
+    OUT="$(ad task --profile astra --role final-review --background --write --prompt-file "$prompt" 2>&1)"
+    [[ "$(head -1 <<<"$OUT")" == "agent-dispatch: WARN task --role final-review: final-review is a read-only role; --write gives it write access" \
+        && "$(tail -1 <<<"$OUT")" == "Codex Task started in the background as task-stub-0001. Check /codex:status task-stub-0001 for progress." \
+        && "$(wc -l <<<"$OUT" | tr -d ' ')" -eq 2 ]]
+    verdict "3b the kind WARN comes before the wrapper start line, so a 2>&1 reader still ends on the id" $? "$OUT"
+    reset_wrappers
+    run_ad task --profile astra-high --role gate --background --prompt-file "$prompt"
+    [[ "$RC" -eq 0 && "$ERR" == "agent-dispatch: WARN task --role gate: gate runs the project's commands and needs --write; without it the harness runs read-only" ]]
+    verdict "3b a run role without --write: one kind WARN, the task still starts" $? "rc=$RC err: $ERR"
+    no_config
 
     # --- 4. status / result / cancel route by id prefix and pass the wrappers through unchanged ---
     reset_wrappers
@@ -393,15 +479,16 @@ EOF
     expected="$(cat <<'EOF'
 route plan-writer: sonnet-high harness=inproc model=sonnet effort=high readOnly=- maxParallel=- (chain: sonnet-high)
 route implementer: glm harness=zcode model=GLM-5.3-Flash effort=max readOnly=none maxParallel=2 (chain: glm, glm-api, pi-glm, deepseek-dsh)
+route phase-review: claude-sub harness=claude model=opus effort=xhigh readOnly=tools maxParallel=2 (chain: claude-sub)
 route control-review: deepseek-claude harness=claude model=deepseek-v4-pro[1m] effort=high readOnly=tools maxParallel=2 (chain: deepseek-claude, glm-api)
 EOF
 )"
-    [[ "$RC" -eq 0 && "$OUT" == "$expected" ]]
+    [[ "$RC" -eq 0 && "$OUT" == "$expected" && -z "$ERR" ]]
     verdict "5 route --all prints only the roles that differ from the built-in scheme (user roles replace the built-in chain)" $? "rc=$RC" "$(diff <(echo "$expected") <(echo "$OUT"))"
     run_ad route --all --json
     [[ "$RC" -eq 0 && "$(jfield default <<<"$OUT")" == false \
         && "$(node -e 'const j = JSON.parse(process.argv[1]); console.log(j.routes.map((r) => `${r.role}:${r.profile}:${r.chain.join("+")}`).join(" "))' -- "$OUT")" \
-            == "plan-writer:sonnet-high:sonnet-high implementer:glm:glm+glm-api+pi-glm+deepseek-dsh control-review:deepseek-claude:deepseek-claude+glm-api" ]]
+            == "plan-writer:sonnet-high:sonnet-high implementer:glm:glm+glm-api+pi-glm+deepseek-dsh phase-review:claude-sub:claude-sub control-review:deepseek-claude:deepseek-claude+glm-api" ]]
     verdict "5 route --all --json: {\"default\": false, \"routes\": [route objects of the differing roles]}" $? "rc=$RC out: $(head -c 400 <<<"$OUT")"
     run_ad route plan-reviewer
     [[ "$RC" -eq 0 && "$OUT" == "route plan-reviewer: astra harness=codex model=gpt-6-astra effort=xhigh readOnly=os maxParallel=2 (chain: astra)" ]]
@@ -410,9 +497,9 @@ EOF
     [[ "$RC" -eq 0 && "$(jfield profile <<<"$OUT")" == sonnet-high && "$(jfield model <<<"$OUT")" == sonnet && "$(jfield effort <<<"$OUT")" == high && "$(jfield inSession <<<"$OUT")" == true ]]
     verdict "5 route plan-writer returns the user's inproc profile sonnet-high (model sonnet, effort high for the Agent tool)" $? "out: $OUT"
     run_ad route phase-review
-    [[ "$RC" -eq 0 && "$OUT" == "route phase-review: opus-high harness=inproc model=opus effort=high readOnly=- maxParallel=- (chain: opus-high)" \
-        && "$(grep -c . <<<"$ERR")" -eq 1 && "$ERR" == *"note: route phase-review:"*"increment 6"*"claude-sub"* ]]
-    verdict "5 an in-session role bound to an external profile still runs on its default profile, with one note line" $? "out: $OUT" "err: $ERR"
+    [[ "$RC" -eq 0 && "$OUT" == "route phase-review: claude-sub harness=claude model=opus effort=xhigh readOnly=tools maxParallel=2 (chain: claude-sub)" \
+        && -z "$ERR" && "$(ad route phase-review --json 2>/dev/null | jfield inSession)" == false && "$(ad route phase-review --json 2>/dev/null | jfield kind)" == run ]]
+    verdict "5 an in-session role bound to an external profile routes to it (inSession false, kind run, no note)" $? "out: $OUT" "err: $ERR"
 
     run_ad route implementer --skip glm:quota
     [[ "$RC" -eq 0 && "$OUT" == "route implementer: deepseek-dsh harness=dsh model=deepseek-v4-pro effort=high readOnly=os maxParallel=2 (chain: deepseek-dsh; skipped: glm=quota, glm-api=quota(via glm), pi-glm=quota(via glm))" ]]
@@ -454,7 +541,7 @@ EOF
         && "$(grep -c . <<<"$ERR")" -eq 1 && "$ERR" == *"WARN route control-review: glm has no read-only mode"* ]]
     verdict "5 a reviewer role on glm: the route stands, with one WARN line (no read-only mode)" $? "rc=$RC out: $OUT err: $ERR"
 
-    # final-review runs in the session first, then externally (spec §5.1): until increment 6 its chain starts in-session.
+    # every chain runs as configured (increment 6): final-review and the other in-session roles included.
     write_config <<'EOF'
 {
   "version": 1,
@@ -466,12 +553,11 @@ EOF
 }
 EOF
     run_ad route final-review
-    [[ "$RC" -eq 0 && "$OUT" == "route final-review: opus-xhigh harness=inproc model=opus effort=xhigh readOnly=- maxParallel=- (chain: opus-xhigh, csub, astra)" \
-        && "$(grep -c . <<<"$ERR")" -eq 1 && "$ERR" == "agent-dispatch: note: route final-review: final-review still starts in-session until increment 6: it runs on opus-xhigh first, then on csub, astra as the external fallback" ]]
-    verdict "5 final-review whose chain starts on an external profile still starts in-session (built-in opus-xhigh), the external profiles follow, one note" $? "rc=$RC out: $OUT" "err: $ERR"
-    run_ad route final-review --skip opus-xhigh
-    [[ "$RC" -eq 0 && "$OUT" == "route final-review: csub harness=claude model=opus effort=xhigh readOnly=tools maxParallel=2 (chain: csub, astra; skipped: opus-xhigh=down)" ]]
-    verdict "5 with the in-session stage skipped, final-review routes to the user's external fallback" $? "rc=$RC out: $OUT"
+    [[ "$RC" -eq 0 && "$OUT" == "route final-review: csub harness=claude model=opus effort=xhigh readOnly=tools maxParallel=2 (chain: csub, astra)" && -z "$ERR" ]]
+    verdict "5 final-review whose chain starts on an external profile starts there (no in-session guard, no note)" $? "rc=$RC out: $OUT" "err: $ERR"
+    run_ad route final-review --skip csub:quota
+    [[ "$RC" -eq 0 && "$OUT" == "route final-review: astra harness=codex model=gpt-6-astra effort=xhigh readOnly=os maxParallel=2 (chain: astra; skipped: csub=quota)" ]]
+    verdict "5 with csub down, final-review routes to the next profile, astra" $? "rc=$RC out: $OUT"
     run_ad route spec-reviewer
     [[ "$RC" -eq 0 && "$OUT" == "route spec-reviewer: csub harness=claude model=opus effort=xhigh readOnly=tools maxParallel=2 (chain: csub, sonnet-high)" && -z "$ERR" ]]
     verdict "5 an external role keeps its chain as written (no in-session guard)" $? "rc=$RC out: $OUT err: $ERR"
@@ -482,6 +568,23 @@ EOF
     run_ad route final-review
     [[ "$RC" -eq 0 && "$OUT" == "route final-review: sonnet-high harness=inproc model=sonnet effort=high readOnly=- maxParallel=- (chain: sonnet-high, astra)" && -z "$ERR" ]]
     verdict "5 final-review on the user's own inproc profile first: as written, no note" $? "rc=$RC out: $OUT err: $ERR"
+    write_config <<'EOF'
+{ "version": 1,
+  "profiles": { "csub": { "harness": "claude", "auth": "login", "model": "opus", "effort": "xhigh" },
+                "sonnet-high": { "harness": "inproc", "model": "sonnet", "effort": "high" } },
+  "roles": { "quickfix": ["csub", "sonnet-high"], "diagnosis": ["glm"], "gate": ["astra-high"] } }
+EOF
+    run_ad route quickfix
+    local q1="$OUT" q1e="$ERR"
+    run_ad route quickfix --skip csub:quota
+    local q2="$OUT"
+    run_ad route --all
+    [[ "$q1" == "route quickfix: csub harness=claude model=opus effort=xhigh readOnly=tools maxParallel=2 (chain: csub, sonnet-high)" && -z "$q1e" \
+        && "$q2" == "route quickfix: sonnet-high harness=inproc model=sonnet effort=high readOnly=- maxParallel=- (chain: sonnet-high; skipped: csub=quota)" \
+        && "$OUT" == "route gate: astra-high harness=codex model=gpt-6-astra effort=high readOnly=os maxParallel=2 (chain: astra-high)"$'\n'"route diagnosis: glm harness=zcode model=GLM-5.3-Flash effort=max readOnly=none maxParallel=2 (chain: glm)"$'\n'"$q1" \
+        && -z "$ERR" ]]
+    verdict "5 in-session roles on external profiles: quickfix csub → sonnet-high (a fallback that ends in the session); route --all lists gate, diagnosis, quickfix" $? \
+        "quickfix: $q1 / $q1e" "skip: $q2" "all: $OUT" "err: $ERR"
 
     # An opencode login is one login per provider: different providers are not linked (spec §3.5 "one login").
     write_config <<'EOF'
@@ -1118,6 +1221,18 @@ EOF
     [[ "$RC" -eq 0 && "$OUT" == *"WARN auth luna: codex is not logged in (not authenticated); the user logs in: codex login (no role uses this profile)"* \
         && "$OUT" != *"FAIL"* && "$(tail -1 <<<"$OUT")" == "doctor: ok" ]]
     verdict "13 with every role routed away from codex, a codex login problem of the unused built-in profiles is a WARN: doctor: ok" $? "rc=$RC" "$OUT"
+    write_config <<'EOF'
+{ "version": 1, "roles": {
+  "plan-reviewer": ["glm"], "spec-reviewer": ["glm"], "implementer": ["glm"], "implementer.risk": ["glm"],
+  "implementer.escalation": ["glm"], "control-review": ["glm"], "final-review": ["opus-xhigh"], "adhoc-review": ["glm"],
+  "gate": ["sol"] } }
+EOF
+    run_ad doctor
+    [[ "$RC" -eq 1 && "$OUT" == *"FAIL auth sol: codex is not logged in (not authenticated); the user logs in: codex login"* \
+        && "$OUT" != *"auth sol: codex is not logged in (not authenticated); the user logs in: codex login (no role uses this profile)"* \
+        && "$OUT" == *"WARN auth luna: codex is not logged in (not authenticated); the user logs in: codex login (no role uses this profile)"* \
+        && "$(tail -1 <<<"$OUT")" == "doctor: FAIL" ]]
+    verdict "13 a codex profile bound only to an in-session role (gate) is used: its login problem is a FAIL" $? "rc=$RC" "$OUT"
     rm -f "$WRAPPER_STUB_DIR"/codex-dispatch.setup.*
     write_config <<'EOF'
 {
@@ -1270,7 +1385,7 @@ EOF
         e_st="$(wait_status "$id" 'completed|failed|cancelled' 30)"
         e_json="$(ad status "$id" --json 2>/dev/null)"
         e_res="$(ad result "$id" 2>&1)"
-        [[ "$e_route" == "route $e_role: $e_prof harness=$e_harness "* && "$RC" -eq 0 && "$OUT" == "agent-dispatch: $e_prof task started in the background as $e_prefix-"* \
+        [[ "$e_route" == "route $e_role: $e_prof harness=$e_harness "* && "$RC" -eq 0 && -z "$ERR" && "$OUT" == "agent-dispatch: $e_prof task started in the background as $e_prefix-"* \
             && "$e_st" == completed && "$(jfield job.profile <<<"$e_json")" == "$e_prof" && "$(jfield job.harness <<<"$e_json")" == "$e_harness" \
             && "$(jfield job.role <<<"$e_json")" == "$e_role" && "$e_res" == "DONE"$'\n'"e2e $e_prof" ]]
         verdict "14 $e_harness ($e_prof): route $e_role → task → status polled to completed → result" $? "route: $e_route" "task rc=$RC out: $OUT err: $ERR" \
@@ -1337,7 +1452,7 @@ EOF
     mkdir -p "$TEST_ROOT/pi-broken"
     printf 'throw new Error("pi adapter: failure at import");\n' >"$TEST_ROOT/pi-broken/pi.mjs"
     OUT="$(AGENT_DISPATCH_ADAPTER_DIR="$TEST_ROOT/pi-broken" AGENT_STUB_RESPONSE="DONE"$'\n'"isolated" \
-        ad task --profile e-dsh --role implementer.risk --background --prompt-file "$prompt" 2>&1)"
+        ad task --profile e-dsh --role implementer.risk --background --write --prompt-file "$prompt" 2>&1)"
     id="${OUT##* }"
     e_st="$(wait_status "$id" 'completed|failed|cancelled' 30)"
     [[ "$id" == dt-* && "$e_st" == completed && "$(ad result "$id" 2>&1)" == "DONE"$'\n'"isolated" ]]
@@ -1400,6 +1515,359 @@ for (const [name, preset] of Object.entries(cli.DEFAULTS.presets)) {
 console.log(bad.length ? bad.join("\n") : `ok ${n}`);' 2>&1)"
     [[ "$OUT" == "ok 12" ]]
     verdict "14 every §4.2 preset (12), filled, passes checkProfile and plans on its real adapter with no env conflict" $? "$OUT"
+
+    # --- 15. in-session roles on external profiles, end to end (increment 6, spec §8 row 6) ---
+    # route → task --role with the recipe's --write → status → result on the four real adapters; the harness argv per
+    # kind; the write reservation between session-role jobs; tree-state around the no-edit jobs; a fallback that ends
+    # in the session; the documented Monitor loop run as written.
+    export AGENT_STUB_AUTH=ready
+    write_config <<EOF
+{
+  "version": 1,
+  "profiles": {
+    "e-csub": { "harness": "claude", "auth": "login", "model": "opus", "effort": "xhigh", "bin": "$TEST_ROOT/bin/claude" },
+    "e-capi": { "harness": "claude", "auth": { "key": "e2e-zai" }, "endpoint": "https://api.z.ai/api/anthropic", "model": "glm-5.3", "bin": "$TEST_ROOT/bin/claude" },
+    "e-oc": { "harness": "opencode", "auth": "login", "model": "github-copilot/gpt-6-mini", "bin": "$TEST_ROOT/bin/opencode" },
+    "e-ockey": { "harness": "opencode", "auth": { "key": "e2e-ds" }, "keyVar": "DEEPSEEK_API_KEY", "model": "deepseek/deepseek-v4-pro", "bin": "$TEST_ROOT/bin/opencode" },
+    "e-pi": { "harness": "pi", "auth": { "key": "e2e-zai" }, "keyVar": "ZAI_API_KEY", "model": "zai/glm-5.3", "effort": "high", "bin": "$TEST_ROOT/bin/pi" },
+    "e-dsh": { "harness": "dsh", "auth": { "key": "e2e-ds" }, "model": "deepseek-v4-pro", "effort": "high", "bin": "$TEST_ROOT/bin/dsh" },
+    "e-bad": { "harness": "claude", "auth": { "key": "e2e-missing" }, "endpoint": "https://api.z.ai/api/anthropic", "model": "glm-5.3", "bin": "$TEST_ROOT/bin/claude" }
+  },
+  "roles": {
+    "plan-writer": ["e-csub"], "plan-reviser": ["e-oc"], "frontend.new-ui": ["e-dsh"], "frontend.tweak": ["e-pi"],
+    "gate": ["e-oc"], "phase-review": ["e-pi"], "phase-review.escalated": ["e-csub"], "synthesis": ["e-dsh"],
+    "final-review": ["e-capi", "astra"], "diagnosis": ["e-capi"], "quickfix": ["e-bad", "sonnet-medium"],
+    "integration-check": ["e-ockey"]
+  }
+}
+EOF
+    SESSION_READ_ROLES=" diagnosis final-review "
+    mkdir -p "$TEST_ROOT/rec15"
+    local s_spec s_role s_prof s_harness s_prefix s_token s_w s_route s_rec s_argv s_t s_since s_ids="" s_last_ct=""
+    for s_spec in plan-writer:e-csub:claude:ct:docs/plans/x.md plan-reviser:e-oc:opencode:oc:F1-B1 \
+        frontend.new-ui:e-dsh:dsh:dt:DONE gate:e-oc:opencode:oc:GATE_OK phase-review:e-pi:pi:pi:REVIEW_OK \
+        phase-review.escalated:e-csub:claude:ct:REVIEW_OK synthesis:e-dsh:dsh:dt:SYNTHESIS_DONE \
+        frontend.tweak:e-pi:pi:pi:DONE integration-check:e-ockey:opencode:oc:INTEGRATION_OK \
+        final-review:e-capi:claude:ct:REVIEW_OK diagnosis:e-capi:claude:ct:CODE; do
+        IFS=: read -r s_role s_prof s_harness s_prefix s_token <<<"$s_spec"
+        s_w=--write
+        [[ "$SESSION_READ_ROLES" == *" $s_role "* ]] && s_w=""
+        run_ad route "$s_role"
+        s_route="$OUT:$ERR"
+        s_t="$(ad tree-state | cut -d' ' -f2)"
+        s_rec="$TEST_ROOT/rec15/$s_role.json"
+        export AGENT_STUB_RECORD="$s_rec" AGENT_STUB_RESPONSE="$s_token"$'\n'"e2e $s_role"
+        # shellcheck disable=SC2086
+        run_ad task --profile "$s_prof" --role "$s_role" --background $s_w --prompt-file "$prompt"
+        unset AGENT_STUB_RECORD AGENT_STUB_RESPONSE
+        id="${OUT##* }"
+        st="$(wait_status "$id" 'completed|failed|cancelled' 30)"
+        s_since="$(ad tree-state --since "$s_t")"
+        s_argv="$(jfield argv <"$s_rec")"
+        case "$s_harness:${s_w:+w}" in
+            claude:w) [[ "$s_argv" == *'"--tools","Bash,Read,Edit,Write,Glob,Grep"'* && "$s_argv" == *'"--permission-mode","bypassPermissions"'* ]] ;;
+            claude:) [[ "$s_argv" == *'"--tools","Read,Glob,Grep,Bash"'* && "$s_argv" == *'"--allowedTools","Bash(git show:*)"'* && "$s_argv" == *'"--permission-mode","dontAsk"'* ]] ;;
+            opencode:w) [[ "$s_argv" == *'"--agent","sp-implementer"'* ]] ;;
+            pi:w) [[ "$s_argv" == *'"--tools","read,bash,edit,write,grep,find,ls"'* ]] ;;
+            dsh:w) [[ "$(jfield env.DSH_PERMISSION_MODE <"$s_rec")" == danger-full-access ]] ;;
+            *) false ;;
+        esac
+        local s_argv_ok=$?
+        [[ "$s_route" == "route $s_role: $s_prof harness=$s_harness "*":" && "$RC" -eq 0 && -z "$ERR" \
+            && "$OUT" == "agent-dispatch: $s_prof task started in the background as $s_prefix-"* && "$st" == completed \
+            && "$(ad status "$id" --json 2>/dev/null | jfield job.role)" == "$s_role" \
+            && "$(ad status "$id" --json 2>/dev/null | jfield job.write)" == "$([[ -n "$s_w" ]] && echo true || echo false)" \
+            && "$(ad result "$id" 2>&1 | head -1)" == "$s_token" && "$s_argv_ok" -eq 0 && "$s_since" == "tree $s_t: unchanged" ]]
+        verdict "15 $s_role on $s_prof ($s_harness, ${s_w:-read-only}): route → task → completed → line 1 $s_token; harness argv of its kind; tree unchanged" $? \
+            "route: $s_route" "task rc=$RC out: $OUT err: $ERR" "status: $st" "argv: $(head -c 600 <<<"$s_argv")" "tree: $s_since"
+        s_ids="$s_ids $id:$s_role"
+        [[ "$id" == ct-* ]] && s_last_ct="$id"
+    done
+
+    # (a2) a kind mismatch on a core profile: the WARN goes to stderr before the start line, so a 2>&1 reader still
+    # ends on the id. The job is waited for: it holds the write reservation (b) needs.
+    OUT="$(ad task --profile e-csub --role final-review --background --write --prompt-file "$prompt" 2>&1)"
+    local s_mm_id="${OUT##* }" s_mm_st
+    s_mm_st="$(wait_status "$s_mm_id" 'completed|failed|cancelled' 30)"
+    [[ "$(head -1 <<<"$OUT")" == "agent-dispatch: WARN task --role final-review: final-review is a read-only role; --write gives it write access" \
+        && "$(wc -l <<<"$OUT" | tr -d ' ')" -eq 2 && "$s_mm_id" == ct-* && "$s_mm_st" == completed ]]
+    verdict "15 a read role with --write on a core profile: the kind WARN comes first, so the 2>&1 last word is the job id" $? "$OUT" "status: $s_mm_st"
+
+    # (b) overlap: a running session-role write job holds the tree; a read role is not blocked.
+    export AGENT_STUB_DELAY_MS=3000
+    run_ad task --profile e-oc --role gate --background --write --prompt-file "$prompt"
+    local s_gate="${OUT##* }"
+    unset AGENT_STUB_DELAY_MS
+    run_ad task --profile e-pi --role phase-review --background --write --prompt-file "$prompt"
+    local s_rc2=$RC s_err2="$ERR"
+    run_ad task --profile e-capi --role diagnosis --background --prompt-file "$prompt"
+    local s_diag="${OUT##* }" s_rc3=$RC
+    # (b2) the no-edit check catches an edit made while a no-edit job runs (the job's edit, simulated)
+    printf 'edited by the job\n' >>"$repo/a.txt"
+    wait_status "$s_gate" 'completed|failed|cancelled' 30 >/dev/null
+    wait_status "$s_diag" 'completed|failed|cancelled' 30 >/dev/null
+    s_since="$(ad tree-state --since "$s_t")"
+    git -C "$repo" checkout -q -- a.txt
+    [[ "$s_rc2" -eq 2 && "$s_err2" == *"$s_gate"*"is still running in this workspace; one write task per working tree"* && "$s_rc3" -eq 0 \
+        && "$s_since" == "tree "*": changed since ${s_t:0:7}: a.txt" ]]
+    verdict "15 a running gate (--write) refuses a second write job in the tree, not a read-only diagnosis; tree-state names the edited file" $? \
+        "phase-review: rc=$s_rc2 err: $s_err2" "diagnosis rc=$s_rc3" "tree: $s_since"
+
+    # (c) availability fallback that ends in the session
+    run_ad task --profile e-bad --role quickfix --background --write --prompt-file "$prompt"
+    local s_bad_rc=$RC s_bad_err="$ERR"
+    run_ad route quickfix --skip e-bad:auth
+    local s_fallback="$OUT"
+    run_ad task --profile sonnet-medium --role quickfix --background --write --prompt-file "$prompt"
+    [[ "$s_bad_rc" -eq 2 && "$s_bad_err" == "agent-dispatch: e-bad: key unavailable (no key e2e-missing is stored; the user stores it: agent-dispatch key set e2e-missing) errorClass=auth" \
+        && "$s_fallback" == "route quickfix: sonnet-medium harness=inproc model=sonnet effort=medium readOnly=- maxParallel=- (chain: sonnet-medium; skipped: e-bad=auth)" \
+        && "$RC" -eq 2 && "$ERR" == *"runs in-session (harness inproc): dispatch it with the Agent tool (model=sonnet effort=medium)"* ]]
+    verdict "15 quickfix on e-bad (key missing, auth) → route --skip e-bad:auth → sonnet-medium, an Agent call (task refuses it)" $? \
+        "e-bad: rc=$s_bad_rc err: $s_bad_err" "route: $s_fallback" "inproc: rc=$RC err: $ERR"
+
+    # (d) status --json --all carries every job's role; the text lines keep §14's format
+    run_ad status --json --all
+    ok=0
+    for s_spec in $s_ids; do
+        id="${s_spec%%:*}" s_role="${s_spec#*:}"
+        [[ "$(node -e 'const j = JSON.parse(process.argv[1]); const x = j.jobs.find((y) => y.id === process.argv[2]); process.stdout.write(x ? String(x.role) : "")' -- "$OUT" "$id")" == "$s_role" ]] || { ok=1; echo "    no role $s_role on $id"; }
+    done
+    run_ad status --all
+    [[ "$ok" -eq 0 && "$OUT" == *"$s_gate e-oc completed write=yes cwd=$repo"* ]]
+    verdict "15 status --json lists every session-role job with its role; the text line format is unchanged" $? "$(head -c 600 <<<"$OUT")"
+
+    # (e) routes and doctor
+    run_ad route --all
+    [[ "$RC" -eq 0 && -z "$ERR" && "$(grep -c '^route ' <<<"$OUT")" -eq 12 \
+        && "$(cut -d: -f1 <<<"$OUT" | tr '\n' ' ')" == "route plan-writer route plan-reviser route frontend.new-ui route frontend.tweak route gate route phase-review route phase-review.escalated route synthesis route final-review route diagnosis route quickfix route integration-check " ]]
+    verdict "15 route --all lists exactly the 12 rebound in-session roles, in the built-in order, no notes" $? "$OUT" "err: $ERR"
+    run_ad doctor
+    grep -qxF "ok routes: 12 role(s) differ from the built-in scheme: plan-writer, plan-reviser, frontend.new-ui, frontend.tweak, gate, phase-review, phase-review.escalated, synthesis, final-review, diagnosis, quickfix, integration-check" <<<"$OUT"
+    verdict "15 doctor counts the rebound in-session roles in its routes line" $? "$(grep 'routes' <<<"$OUT")"
+
+    # (f) the documented Monitor loop (agent-invocation step 4), run as written against a finished core job
+    if command -v python3 >/dev/null 2>&1; then
+        local mon="$TEST_ROOT/monitor.sh" mpid n
+        for s_spec in "$s_last_ct:agent task terminal: completed" "ct-9999:agent task status unreadable: agent-dispatch:"; do
+            awk '/^### 4\. Poll/{p=1; next} p && /^```bash$/{f=1; next} f && /^```$/{exit} f{print}' "$REPO_ROOT/skills/agent-invocation/SKILL.md" \
+                | sed -e "s/^ID=ct-0001\$/ID=${s_spec%%:*}/" -e 's/sleep 25/sleep 1/' >"$mon"
+            AD="$LAUNCHER" bash "$mon" >"$TEST_ROOT/monitor.out" 2>&1 &
+            mpid=$! n=0
+            while kill -0 "$mpid" 2>/dev/null && ((n < 150)); do sleep 0.2; n=$((n + 1)); done
+            kill "$mpid" 2>/dev/null
+            wait "$mpid" 2>/dev/null
+            [[ "$(cat "$TEST_ROOT/monitor.out")" == "${s_spec#*:}"* && "$(wc -l <"$TEST_ROOT/monitor.out" | tr -d ' ')" -eq 1 ]]
+            verdict "15 the agent-invocation Monitor loop on ${s_spec%%:*} prints one line: ${s_spec#*:}…" $? "$(cat "$TEST_ROOT/monitor.out")"
+        done
+    else
+        echo "  [SKIP] python3 not available: the Monitor loop test"
+    fi
+    unset AGENT_STUB_AUTH
+
+    # --- 16. tree-state: the work tree's content as one git tree id; index, HEAD and files untouched ---
+    local t0 idx0 head0 por0 t_out t_i idx1 idx2 por1
+    # git status first: it may refresh the index file itself, so the checksum is taken after it.
+    por0="$(git -C "$repo" status --porcelain=v1 --untracked-files=all)" idx0="$(cksum <"$repo/.git/index")" head0="$(git -C "$repo" rev-parse HEAD)"
+    run_ad tree-state
+    t0="${OUT#tree }"
+    [[ "$RC" -eq 0 && -z "$ERR" && "$OUT" =~ ^tree\ [0-9a-f]{40}$ && "$(cksum <"$repo/.git/index")" == "$idx0" \
+        && "$(git -C "$repo" rev-parse HEAD)" == "$head0" && "$(git -C "$repo" status --porcelain=v1 --untracked-files=all)" == "$por0" ]]
+    verdict "16 tree-state prints 'tree <id>' and leaves the index, HEAD and git status untouched" $? "rc=$RC out: $OUT err: $ERR"
+    run_ad tree-state --since "$t0"
+    [[ "$OUT" == "tree $t0: unchanged" ]]
+    verdict "16 --since the same tree: unchanged" $? "$OUT"
+    # A dirty tree, where staging into the real index would show: its checksum before and after, then git status.
+    printf 'y\n' >>"$repo/a.txt"
+    printf 'n\n' >"$repo/new.txt"
+    idx1="$(cksum <"$repo/.git/index")"
+    run_ad tree-state --since "$t0"
+    t_out="$OUT"
+    idx2="$(cksum <"$repo/.git/index")"
+    por1="$(git -C "$repo" status --porcelain=v1 --untracked-files=all)"
+    git -C "$repo" checkout -q -- a.txt
+    rm -f "$repo/new.txt"
+    [[ "$t_out" == "tree "*": changed since ${t0:0:7}: a.txt, new.txt" && "$idx2" == "$idx1" && "$por1" == $' M a.txt\n?? new.txt' ]]
+    verdict "16 a tracked edit and a new untracked file are both named; the index stays untouched (nothing staged)" $? "$t_out" "status: $por1"
+    # A file in a subdirectory, and a tracked file an ignore rule matches (it stays in through the copy of the index).
+    mkdir -p "$repo/src"
+    printf 's\n' >"$repo/src/s.txt"
+    printf 'gen.txt\n' >>"$repo/.git/info/exclude"
+    printf 'g\n' >"$repo/gen.txt"
+    git -C "$repo" add src/s.txt && git -C "$repo" add -f gen.txt && git -C "$repo" "${git_id[@]}" commit -qm c16
+    run_ad tree-state
+    t0="${OUT#tree }"
+    printf 'y\n' >>"$repo/src/s.txt"
+    printf 'h\n' >>"$repo/gen.txt"
+    run_ad tree-state --since "$t0"
+    t_out="$OUT"
+    git -C "$repo" checkout -q -- src/s.txt gen.txt
+    [[ "$t_out" == "tree "*": changed since ${t0:0:7}: gen.txt, src/s.txt" ]]
+    verdict "16 a file in a subdirectory is named by its path; a tracked file an ignore rule matches still counts" $? "$t_out"
+    for t_i in 01 02 03 04 05 06 07 08 09 10 11 12; do printf 'n\n' >"$repo/n$t_i.txt"; done
+    run_ad tree-state --since "$t0"
+    t_out="$OUT"
+    rm -f "$repo"/n??.txt
+    [[ "$t_out" == "tree "*": changed since ${t0:0:7}: n01.txt, n02.txt, n03.txt, n04.txt, n05.txt, n06.txt, n07.txt, n08.txt, n09.txt, n10.txt (+2 more)" ]]
+    verdict "16 at most 10 paths are named, then (+N more)" $? "$t_out"
+    printf 'q\n' >"$repo/$(printf 'new\nline.txt')"
+    printf 'q\n' >"$repo/x, y.txt"
+    run_ad tree-state --since "$t0"
+    t_out="$OUT"
+    rm -f "$repo/$(printf 'new\nline.txt')" "$repo/x, y.txt"
+    [[ "$(wc -l <<<"$t_out" | tr -d ' ')" -eq 1 && "$t_out" == "tree "*": changed since ${t0:0:7}: "'"new\nline.txt", "x, y.txt"' ]]
+    verdict "16 a name with a newline or a comma and space is JSON-quoted: the list stays one line" $? "$t_out"
+    printf 'junk.log\n' >>"$repo/.git/info/exclude"
+    printf 'j\n' >"$repo/junk.log"
+    mkdir -p "$repo/.superpowers/sdd/p"
+    printf 'r\n' >"$repo/.superpowers/sdd/p/report.md"
+    git -C "$repo" worktree add -q --detach "$repo/.superpowers/sdd/p/gate-base" HEAD
+    run_ad tree-state --since "$t0"
+    t_out="$OUT"
+    git -C "$repo" worktree remove --force "$repo/.superpowers/sdd/p/gate-base"
+    rm -rf "$repo/.superpowers" "$repo/junk.log"
+    [[ "$t_out" == "tree $t0: unchanged" ]]
+    verdict "16 ignored files, .superpowers/ and a gate-base checkout inside it do not count" $? "$t_out"
+    # What git tracks under .superpowers/ (a force-added file) does not count either: added, then edited.
+    mkdir -p "$repo/.superpowers/x"
+    printf 'r\n' >"$repo/.superpowers/x/r.md"
+    git -C "$repo" add -f .superpowers/x/r.md
+    run_ad tree-state --since "$t0"
+    t_out="$OUT"
+    printf 'e\n' >>"$repo/.superpowers/x/r.md"
+    run_ad tree-state --since "$t0"
+    [[ "$t_out" == "tree $t0: unchanged" && "$OUT" == "tree $t0: unchanged" ]]
+    verdict "16 a file git tracks under .superpowers/ does not count, added or edited" $? "added: $t_out" "edited: $OUT"
+    # A repo that ignores .superpowers/ itself (this one does): git add refuses an exclude pathspec naming an ignored
+    # path, so tree-state must not pass one; the tracked file under it still does not count.
+    cp "$repo/.git/info/exclude" "$TEST_ROOT/exclude.bak"
+    printf '.superpowers/\n' >>"$repo/.git/info/exclude"
+    mkdir -p "$repo/.superpowers/sdd/p"
+    printf 'r\n' >"$repo/.superpowers/sdd/p/report.md"
+    git -C "$repo" worktree add -q --detach "$repo/.superpowers/sdd/p/gate-base" HEAD
+    run_ad tree-state --since "$t0"
+    [[ "$RC" -eq 0 && -z "$ERR" && "$OUT" == "tree $t0: unchanged" ]]
+    ok=$?
+    t_out="rc=$RC out: $OUT err: $ERR"
+    printf 'f\n' >>"$repo/.superpowers/x/r.md"
+    run_ad tree-state --since "$t0"
+    [[ "$ok" -eq 0 && "$RC" -eq 0 && "$OUT" == "tree $t0: unchanged" ]]
+    ok=$?
+    t_out="$t_out / tracked file edited: rc=$RC out: $OUT err: $ERR"
+    git -C "$repo" worktree remove --force "$repo/.superpowers/sdd/p/gate-base"
+    git -C "$repo" rm -q -r -f --cached .superpowers
+    rm -rf "$repo/.superpowers"
+    mv "$TEST_ROOT/exclude.bak" "$repo/.git/info/exclude"
+    verdict "16 a repo that ignores .superpowers/ itself: tree-state works, and nothing under .superpowers/ counts, tracked files included" $ok "$t_out"
+    run_ad tree-state --cwd "$TEST_ROOT/home"
+    ok=$RC
+    run_ad tree-state --since not-a-tree
+    [[ "$ok" -eq 2 && "$RC" -eq 2 && "$ERR" == *"--since takes the tree id"* ]]
+    verdict "16 outside a git tree and a malformed --since: exit 2" $? "rc=$ok/$RC err: $ERR"
+    run_ad tree-state --since "$(git -C "$repo" rev-parse HEAD)"
+    ok=$RC t_out="$OUT$ERR"
+    run_ad tree-state --since 0000000000000000000000000000000000000000
+    [[ "$ok" -eq 2 && "$t_out" == "agent-dispatch: --since takes the tree id an earlier tree-state printed" \
+        && "$RC" -eq 2 && -z "$OUT" && "$ERR" == "$t_out" ]]
+    verdict "16 a commit id or an unknown id as --since: exit 2, the same usage error (not a change with no path)" $? "commit: rc=$ok $t_out" "unknown: rc=$RC out: $OUT err: $ERR"
+
+    # A same-size edit in the second the index was written (git: a racily clean entry) counts: the temporary copy keeps
+    # the index mtime. Made deterministic by giving the file, its index entry and the index one old mtime.
+    local t_dir="$TEST_ROOT/racy" t_r
+    git init -q -b main "$t_dir"
+    git -C "$t_dir" config core.trustctime false
+    printf 'aaaa\n' >"$t_dir/f.txt"
+    git -C "$t_dir" add f.txt && git -C "$t_dir" "${git_id[@]}" commit -qm r0
+    touch -t 202001010000.00 "$t_dir/f.txt"
+    git -C "$t_dir" update-index -q --refresh
+    touch -t 202001010000.00 "$t_dir/.git/index"
+    run_ad tree-state --cwd "$t_dir"
+    t_r="${OUT#tree }"
+    printf 'bbbb\n' >"$t_dir/f.txt"
+    touch -t 202001010000.00 "$t_dir/f.txt"
+    run_ad tree-state --cwd "$t_dir" --since "$t_r"
+    [[ "$RC" -eq 0 && "$OUT" == "tree "*": changed since ${t_r:0:7}: f.txt" ]]
+    verdict "16 a same-size edit of a racily clean file (its mtime equals the index mtime) is named" $? "rc=$RC out: $OUT err: $ERR"
+
+    # A submodule (ignore = all in .gitmodules) and an untracked nested repository count by HEAD and content.
+    t_dir="$TEST_ROOT/nested"
+    local t_m t_e t_sub=()
+    git init -q -b main "$t_dir"
+    printf 'x\n' >"$t_dir/a.txt"
+    git init -q -b main "$t_dir/sub"
+    printf 's\n' >"$t_dir/sub/s.txt"
+    git -C "$t_dir/sub" add s.txt && git -C "$t_dir/sub" "${git_id[@]}" commit -qm s0
+    git -C "$t_dir" add a.txt sub 2>/dev/null && git -C "$t_dir" "${git_id[@]}" commit -qm m0
+    printf '[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n\tignore = all\n' >"$t_dir/.gitmodules"
+    git -C "$t_dir" add .gitmodules && git -C "$t_dir" "${git_id[@]}" commit -qm m1
+    run_ad tree-state --cwd "$t_dir"
+    t_m="${OUT#tree }"
+    printf 'y\n' >>"$t_dir/sub/s.txt"
+    run_ad tree-state --cwd "$t_dir" --since "$t_m"
+    t_sub+=("$OUT")
+    git -C "$t_dir/sub" checkout -q -- s.txt
+    run_ad tree-state --cwd "$t_dir" --since "$t_m"
+    t_sub+=("$OUT")
+    printf 'u\n' >"$t_dir/sub/u.txt"
+    run_ad tree-state --cwd "$t_dir" --since "$t_m"
+    t_sub+=("$OUT")
+    rm -f "$t_dir/sub/u.txt"
+    git -C "$t_dir/sub" "${git_id[@]}" commit -q --allow-empty -m s1
+    run_ad tree-state --cwd "$t_dir" --since "$t_m"
+    t_sub+=("$OUT")
+    [[ "${t_sub[0]}" == "tree "*": changed since ${t_m:0:7}: sub" && "${t_sub[1]}" == "tree $t_m: unchanged" \
+        && "${t_sub[2]}" == "tree "*": changed since ${t_m:0:7}: sub" && "${t_sub[3]}" == "tree "*": changed since ${t_m:0:7}: sub" \
+        && "${t_sub[0]}" != "${t_sub[2]}" ]]
+    verdict "16 a submodule with ignore = all: an edit or a new file inside it, or a moved HEAD, names it; a revert gives the old id" $? "${t_sub[@]}"
+    git init -q -b main "$t_dir/emb"
+    printf 'e\n' >"$t_dir/emb/e.txt"
+    git -C "$t_dir/emb" add e.txt && git -C "$t_dir/emb" "${git_id[@]}" commit -qm e0
+    run_ad tree-state --cwd "$t_dir"
+    t_e="${OUT#tree }"
+    printf 'f\n' >>"$t_dir/emb/e.txt"
+    run_ad tree-state --cwd "$t_dir" --since "$t_e"
+    t_out="$OUT"
+    git -C "$t_dir/emb" checkout -q -- e.txt
+    run_ad tree-state --cwd "$t_dir" --since "$t_e"
+    [[ "$t_out" == "tree "*": changed since ${t_e:0:7}: emb" && "$OUT" == "tree $t_e: unchanged" ]]
+    verdict "16 an untracked nested repository: an edit inside it names it; a revert gives the old id" $? "edited: $t_out" "reverted: $OUT"
+    # A nested repository without a commit cannot be indexed: exit 1 with git's whole message (its first line is the
+    # warning about emb), so the path reaches the user.
+    git init -q -b main "$t_dir/fixtures/r"
+    printf 'x\n' >"$t_dir/fixtures/r/x.txt"
+    run_ad tree-state --cwd "$t_dir"
+    [[ "$RC" -eq 1 && -z "$OUT" && "$ERR" == "agent-dispatch: git add failed: "*"fixtures/r"* ]]
+    verdict "16 a nested repository without a commit: exit 1, and the message names it" $? "rc=$RC out: $OUT err: $ERR"
+
+    # A sparse checkout (git add --sparse, git 2.34+): a new file or a file written back outside the cone is named.
+    if [[ "$(git add -h 2>&1)" == *sparse* ]]; then # --sparse, or --[no-]sparse in newer usage text
+        t_dir="$TEST_ROOT/sparse"
+        local t_s t_sp=()
+        git init -q -b main "$t_dir"
+        mkdir -p "$t_dir/in" "$t_dir/out"
+        printf 'i\n' >"$t_dir/in/i.txt"
+        printf 'o\n' >"$t_dir/out/o.txt"
+        git -C "$t_dir" add in out && git -C "$t_dir" "${git_id[@]}" commit -qm p0
+        git -C "$t_dir" sparse-checkout set --cone in
+        run_ad tree-state --cwd "$t_dir"
+        t_s="${OUT#tree }"
+        t_sp+=("$RC:$OUT")
+        mkdir -p "$t_dir/out"
+        printf 'n\n' >"$t_dir/out/new.txt"
+        run_ad tree-state --cwd "$t_dir" --since "$t_s"
+        t_sp+=("$RC:$OUT")
+        rm -f "$t_dir/out/new.txt"
+        printf 'edited\n' >"$t_dir/out/o.txt"
+        run_ad tree-state --cwd "$t_dir" --since "$t_s"
+        t_sp+=("$RC:$OUT")
+        rm -rf "$t_dir/out"
+        run_ad tree-state --cwd "$t_dir" --since "$t_s"
+        t_sp+=("$RC:$OUT")
+        [[ "${t_sp[0]}" == "0:tree $(git -C "$t_dir" rev-parse 'HEAD^{tree}')" && "${t_sp[1]}" == "0:tree "*": changed since ${t_s:0:7}: out/new.txt" \
+            && "${t_sp[2]}" == "0:tree "*": changed since ${t_s:0:7}: out/o.txt" && "${t_sp[3]}" == "0:tree $t_s: unchanged" ]]
+        verdict "16 a sparse checkout: clean is HEAD^{tree}; a new file or a file written back outside the cone is named" $? "${t_sp[@]}"
+    else
+        echo "  [SKIP] git add has no --sparse (git older than 2.34): the sparse checkout test"
+    fi
 
     # --- leak check: nothing this run started is still running ---
     local left="" i=0

@@ -9,7 +9,7 @@
 # headless as background jobs and passes the zcode / codex profiles through to
 # the sibling wrappers zcode-dispatch and codex-dispatch.
 #
-# Usage: agent-dispatch <task|status|result|cancel|release-stale|route|channels|doctor|key|profile|preset> [args...]
+# Usage: agent-dispatch <task|status|result|cancel|release-stale|tree-state|route|channels|doctor|key|profile|preset> [args...]
 set -eu
 
 resolve_mjs() {

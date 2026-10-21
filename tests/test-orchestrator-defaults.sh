@@ -330,17 +330,24 @@ expect_new "$ORCH" 'only when `route --all` did not print `routes: default`' '"�
 expect_new "$ORCH" 'Under `routes: default` no such switch exists, as before 0.12.0.' 'no "без <profile>" switch under routes: default'
 expect_new "$ORCH" 'are skipped for the session: the Model split table' 'Routing item 1: the routes: default shortcut holds for the session'
 
-# The documented route --all example, run against the CLI (no harness runs: route only).
 echo ""
-echo "Documented route example (bin/agent-dispatch)"
+echo "Documented route examples (bin/agent-dispatch)"
 if command -v node >/dev/null 2>&1 && [[ -x "$REPO_ROOT/bin/agent-dispatch" ]]; then
     ex_dir="$(mktemp -d)"
+    # HOME in the temp dir: the launcher would prefer an installed marketplace copy under the real HOME.
+    ex_out="$(HOME="$ex_dir" AGENT_DISPATCH_STATE_DIR="$ex_dir" "$REPO_ROOT/bin/agent-dispatch" route --all 2>"$ex_dir/stderr")" && ex_rc=0 || ex_rc=$?
+    ex_err="$(cat "$ex_dir/stderr")"
+    if [[ $ex_rc -eq 0 && "$ex_out" == "routes: default" && -z "$ex_err" ]]; then
+        pass 'no config.json → route --all prints exactly routes: default (the per-dispatch route calls are skipped)'
+    else
+        fail "no config.json → route --all: rc=$ex_rc out: $ex_out err: $ex_err"
+    fi
     printf '%s\n' '{ "version": 1, "roles": { "final-review": ["astra"] } }' >"$ex_dir/config.json"
-    ex_out="$(AGENT_DISPATCH_STATE_DIR="$ex_dir" "$REPO_ROOT/bin/agent-dispatch" route --all 2>"$ex_dir/stderr")" && ex_rc=0 || ex_rc=$?
+    ex_out="$(HOME="$ex_dir" AGENT_DISPATCH_STATE_DIR="$ex_dir" "$REPO_ROOT/bin/agent-dispatch" route --all 2>"$ex_dir/stderr")" && ex_rc=0 || ex_rc=$?
     ex_err="$(cat "$ex_dir/stderr")"
     rm -rf "$ex_dir"
-    if [[ $ex_rc -eq 0 && "$ex_out" == "routes: default" && "$(grep -c . <<<"$ex_err")" -eq 1 && "$ex_err" == "agent-dispatch: note: route final-review: "* ]]; then
-        pass '"final-review": ["astra"] → route --all prints exactly routes: default plus one stderr note'
+    if [[ $ex_rc -eq 0 && "$ex_out" == 'route final-review: astra harness=codex model=gpt-6-astra effort=xhigh readOnly=os maxParallel=2 (chain: astra)' && -z "$ex_err" ]]; then
+        pass '"final-review": ["astra"] → route --all names astra: the chain runs as configured'
     else
         fail "\"final-review\": [\"astra\"] → route --all: rc=$ex_rc out: $ex_out err: $ex_err"
     fi
