@@ -220,7 +220,7 @@ agent-dispatch doctor --profile deepseek-claude --probe             # 3. про�
 
 - `[1m]` сообщает Claude Code, что у модели окно 1M; для незнакомого id он считает 200K.
 - Z.ai: на этом эндпоинте тариф определяется типом ключа (Coding Plan или Standard API) ([06 §1.3](./docs/research/universal-dispatchers/06-providers-and-plans.md)). `shares: zai-coding-plan` — для ключа Coding Plan, это квота встроенного `glm`; для ключа Standard уберите метку: `--set shares=`.
-- Kimi Platform на Tier 0 пропускает один запрос за раз: добавьте `--set maxParallel=1`.
+- Kimi Platform на Tier 0 пропускает один запрос за раз: добавьте `--set maxParallel=1`. `task` проверяет `maxParallel` у профилей claude, opencode, pi и dsh; у профиля codex или zcode его соблюдают только параллельные треки пайплайна, и не в роли профиля из `SP_IMPLEMENTER` (две отдельные сессии или ручные вызовы `task` тоже не учитываются).
 - `effort` идёт в `--effort` и в `CLAUDE_CODE_EFFORT_LEVEL`; `CLAUDE_CODE_EFFORT_LEVEL` в `env` профиля (рецепты некоторых провайдеров ставят `max`) перекрывает поле `effort`.
 - Опции: `options.tools` (набор инструментов пишущей роли, по умолчанию `Bash,Read,Edit,Write,Glob,Grep`), `options.settings` (сливается с `--settings` задачи), `options.maxTurns`.
 - Ревьюер получает Read, Glob, Grep и команды только для чтения: `git show`, `git diff`, `git log`, `git status`. Ключ не доходит до Bash модели (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`).

@@ -220,7 +220,7 @@ Endpoints and environment recipes come from the providers' own Claude Code setup
 
 - `[1m]` tells Claude Code the model has a 1M window; for an id it does not know it assumes 200K.
 - Z.ai: the key's type decides the billing on this endpoint (Coding Plan or Standard API key) ([06 §1.3](./docs/research/universal-dispatchers/06-providers-and-plans.md)). `shares: zai-coding-plan` is for a Coding Plan key, the quota of the built-in `glm`; drop it for a Standard key with `--set shares=`.
-- Kimi Platform allows one request at a time on Tier 0: add `--set maxParallel=1`.
+- Kimi Platform allows one request at a time on Tier 0: add `--set maxParallel=1`. `task` enforces `maxParallel` for claude, opencode, pi and dsh profiles; for a codex or zcode profile only the pipeline's parallel tracks respect it, and not as the `SP_IMPLEMENTER` profile (two separate sessions or manual `task` calls are not counted either).
 - `effort` goes to `--effort` and to `CLAUDE_CODE_EFFORT_LEVEL`; a `CLAUDE_CODE_EFFORT_LEVEL` in the profile's `env` (some providers' recipes set `max`) overrides the `effort` field.
 - Options: `options.tools` (a writer's tool set, by default `Bash,Read,Edit,Write,Glob,Grep`), `options.settings` (merged into the job's `--settings`), `options.maxTurns`.
 - A reviewer gets Read, Glob, Grep and the read-only `git show`, `git diff`, `git log`, `git status`. The key never reaches the model's Bash (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`).

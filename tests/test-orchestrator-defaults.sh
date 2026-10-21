@@ -599,6 +599,20 @@ expect_new "$SPEC" 'отказ вызывает поле, которое мен�
 expect_absent "$SPEC" 'Файл разбирается как обычный JSON' 'spec: comments no longer refuse a keyed opencode profile (R2-2)'
 # F14: the maxParallel refusal names each running job with its workspace root.
 expect_new "$SPEC" '`agent-dispatch: profile <p> is at maxParallel=<n> (running: <id> cwd=<корень>, …)`' 'spec: maxParallel refusal names the workspace (F14)'
+# PR #11 review (agent-dispatch.mjs:845): task counts core jobs only; the orchestrator keeps a codex / zcode
+# profile maxParallel across the two tracks for every role, and nothing is counted under routes: default.
+expect_new "$ORCH" '`"$AD" task` counts core jobs only: on a `codex` or `zcode` profile (`glm`: the `GLM concurrency` line instead) keep the route line'"'"'s `maxParallel=<n>` across the two tracks yourself, for every role' 'parallel groups: codex / zcode maxParallel kept by the orchestrator for every role'
+expect_new "$ORCH" 'count the running jobs of both tracks on it (`"$AD" status --cwd <worktree>` per track; it lists a Codex job under the first `"$AD" channels` codex profile with the same model and effort and a ZCode job under `glm`, so count those lines as jobs on this profile); at `<n>` the dispatch counts as refused with `is at maxParallel`' 'parallel groups: codex / zcode jobs counted by status for every role, matched by model and effort'
+expect_absent "$ORCH" 'per track, or their `.id` sidecars)' 'parallel groups: sidecars (implementers only) are not a counting source'
+expect_new "$ORCH" 'Never under `routes: default`: no route line there, and each built-in `codex` profile allows 2 with at most one job per track; an `SP_IMPLEMENTER` profile has no route line either, and its `maxParallel` is not checked.' 'parallel groups: no codex / zcode count under routes: default or for SP_IMPLEMENTER'
+expect_new skills/agent-invocation/SKILL.md '`task` enforces it for the core harnesses only (`claude`, `opencode`, `pi`, `dsh`), and for `codex` / `zcode` dev-orchestrator'"'"'s "## Parallel groups" rule keeps it' 'agent-invocation: route maxParallel is enforced by task for core harnesses only'
+expect_new skills/agent-invocation/SKILL.md 'and the resume, and on a core profile also its `maxParallel` and the key (see "Refusals")' 'agent-invocation: task checks maxParallel and the key on core profiles only'
+expect_absent skills/agent-invocation/SKILL.md 'the profile'"'"'s `maxParallel`, the key and the resume' 'agent-invocation: task no longer claims a maxParallel check on pass-through profiles'
+expect_absent "$SPEC" 'Перед запуском проверяются резервация и `maxParallel` (§3.9)' 'spec: task checks maxParallel and the key on core profiles only (§3.3)'
+expect_new "$SPEC" 'Перед запуском проверяются резервация (§3.9) и resume (§3.6 А12), а у профиля ядра ещё `maxParallel` (§3.9) и ключ (§3.5)' 'spec: task row names the core-only maxParallel and key checks (§3.3)'
+expect_new README.md '`task` enforces `maxParallel` for claude, opencode, pi and dsh profiles; for a codex or zcode profile only the pipeline'"'"'s parallel tracks respect it, and not as the `SP_IMPLEMENTER` profile (two separate sessions or manual `task` calls are not counted either).' 'README: maxParallel of codex / zcode profiles binds the parallel tracks only'
+expect_new README.ru.md '`task` проверяет `maxParallel` у профилей claude, opencode, pi и dsh; у профиля codex или zcode его соблюдают только параллельные треки пайплайна, и не в роли профиля из `SP_IMPLEMENTER` (две отдельные сессии или ручные вызовы `task` тоже не учитываются).' 'README.ru: maxParallel of codex / zcode profiles binds the parallel tracks only'
+expect_new "$SPEC" 'Задачи профилей `codex` и `zcode` `task` не считает: их предел из строки `route` соблюдает оркестратор между двумя параллельными треками для любой роли' 'spec: codex / zcode maxParallel kept by the orchestrator (§3.9)'
 
 echo ""
 echo "Documented route examples (bin/agent-dispatch)"
