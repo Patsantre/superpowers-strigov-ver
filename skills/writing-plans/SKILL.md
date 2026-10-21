@@ -33,6 +33,8 @@ Same writer/reviewer pair as `dev-orchestrator` Steps 1–2: **Opus xhigh writes
 Agent(subagent_type="general-purpose", model="opus", effort="xhigh", prompt=<assembled prompt>)
 ```
 
+**Routed writer.** The writer is the `plan-writer` role (Mode B revisions: `plan-reviser`). After `"$AD" route --all` printed `routes: default` (`../agent-invocation/SKILL.md` steps 1–2 — run it once, before the first writer dispatch) it is this Agent call as written, with no `route` call, and so it is when `$AD` does not run at all (say so once and keep the built-in scheme); otherwise `"$AD" route plan-writer` (`plan-reviser`) first: an `inproc` line → this Agent call at its `model` and `effort` (check 1 below compares those instead), any other → `../agent-invocation/SKILL.md` "In-session roles on an external profile" (check 1 keeps only its no-`ultrathink` part; the profile is the one the route line named).
+
 **Effort is set on the dispatch — no `ultrathink` in the prompt.** Revisions (Mode B) run at `effort="high"`. There is no task id to record — every writer dispatch is fresh; the plan file on disk and the ledger are the continuity, so revisions re-read the plan instead of resuming a thread. The subagent has no session context; the prompt must be fully self-contained and include:
 
 - The Mode A opening block from `../dev-orchestrator/opus-plan-writer-prompt.md` (research-the-repo / write-plan-file-only framing, no-git rule).

@@ -38,6 +38,14 @@ count_of() {
 
 current() { cat "$REPO_ROOT/$1"; }
 at_base() { git -C "$REPO_ROOT" show "$BASE_REV:$1" 2>/dev/null || true; }
+# fences — the lines of the fenced blocks of stdin, the fence lines included
+# (for a file whose fences do not nest, such as SKILL.md).
+fences() { awk '/^[[:space:]]*```/{f=!f; print; next} f{print}'; }
+# review_text — the same for a review template, which nests a bare ``` output-format
+# block inside its bare ``` prompt-template block (fences() would count that block
+# as outside): the fenced blocks before the `## Prompt template` heading, then
+# every line from the heading through its last fence line.
+review_text() { awk '/^## Prompt template$/{t=1} t{b=b $0 "\n"; if (/^[[:space:]]*```/) {printf "%s", b; b=""}; next} /^[[:space:]]*```/{f=!f; print; next} f{print}'; }
 
 # expect_text <file> <needle> <description> — needle present now (and at base).
 expect_text() {
@@ -303,14 +311,61 @@ expect_new README.ru.md 'Любое другое значение, как и р�
 expect_new "$ORCH" 'When the state line still shows `glm=unprobed` and the candidate — item 5'"'"'s profile, the first non-down profile of the `implementer` chain (built-in: `glm`) — is `glm`, run item 4 above now' 'ladder item 3 probes only a glm candidate'
 expect_new "$ORCH" '(only when the ladder'"'"'s candidate at item 3 is `glm` with `glm=unprobed`, or a route answers `glm` while `glm=unprobed`; a chain without `glm` never probes GLM)' 'Step 3 probe condition'
 expect_new_count "$ORCH" 'the candidate — the first non-down `implementer` profile — is `glm` (built-in: it is; a chain without `glm` never probes GLM)' 2 'Step 5 fix wave and integration repair probe only a glm candidate'
-# 6. In-session roles: in-session profiles first; route --all compares effective chains.
-expect_new "$ORCH" '`"final-review": ["astra"]` alone prints `routes: default` plus a stderr note' 'route --all compares effective chains (SKILL.md)'
-expect_new skills/agent-invocation/SKILL.md '`"final-review": ["astra"]` alone prints `routes: default` plus a stderr note' 'route --all compares effective chains (agent-invocation)'
-expect_absent skills/agent-invocation/SKILL.md 'is not filtered' 'agent-invocation: no unrestricted final-review order'
-expect_absent README.md 'its chain runs in order' 'README: no unrestricted final-review order'
-expect_absent README.ru.md 'его цепочка идёт по порядку' 'README.ru: no unrestricted final-review order'
-expect_new skills/agent-invocation/SKILL.md 'A chain whose order this changes gets one note line on stderr' 'agent-invocation: the note comes with every reordered final-review chain'
-expect_absent skills/agent-invocation/SKILL.md 'A chain that does not start in-session gets one note line' 'agent-invocation: no note promise narrower than the CLI'
+# 6. In-session roles on any profile (increment 6); route --all compares the configured chains.
+expect_new "$ORCH" 'Every configured chain counts as written, in-session roles included (`"final-review": ["astra"]` alone is a difference).' 'Routing item 1: chains as configured'
+expect_absent "$ORCH" 'alone prints `routes: default` plus a stderr note' 'SKILL.md: no in-session guard'
+expect_absent skills/agent-invocation/SKILL.md 'alone prints `routes: default` plus a stderr note' 'agent-invocation: no in-session guard'
+expect_absent skills/agent-invocation/SKILL.md 'comes in a later release' 'agent-invocation: external execution ships'
+expect_absent skills/agent-invocation/SKILL.md 'is not filtered' 'agent-invocation: no unrestricted final-review order (kept)'
+expect_new skills/agent-invocation/SKILL.md $'\n## In-session roles on an external profile\n' 'agent-invocation: the recipe heading (a line of its own, not a quoted cross-reference)'
+expect_new skills/agent-invocation/SKILL.md '`--write` for every role except `diagnosis` and `final-review` (`roleKinds` in `agents-defaults.json`;' 'recipe: the write classes (= roleKinds; mirrored by SESSION_READ_ROLES in test-agent-dispatch.sh)'
+expect_new skills/agent-invocation/SKILL.md 'the implementers and every in-session role except `diagnosis` and `final-review` ("## In-session roles on an external profile" item 2)' 'step 3: --write for every in-session role but the read kinds'
+expect_new skills/agent-invocation/SKILL.md '4. **No-edit check** — around every `gate`, `phase-review`, `phase-review.escalated` and `integration-check` job, and every `diagnosis` or `final-review` job whose route line says `readOnly=none`' 'recipe: the no-edit check covers every run-kind job and read roles on readOnly=none (F2)'
+expect_new skills/agent-invocation/SKILL.md '`"$AD" tree-state [--cwd W] > <prompt-file>.tree` right before the dispatch' 'recipe: the no-edit baseline lives in a file, so a compaction cannot lose it'
+expect_new skills/agent-invocation/SKILL.md 'as soon as the job ends, whatever its status — after the `result` of a `completed` job, before any retry or switch of a `failed` or `cancelled` one (item 7)' 'recipe: a failed or cancelled job is compared too'
+expect_new skills/agent-invocation/SKILL.md '`unchanged` → go on. `changed since …: <paths>` → that run'"'"'s verdict does not count and nothing is committed: ask the user exactly one question' 'recipe: the no-edit check ends in one question'
+expect_new skills/agent-invocation/SKILL.md '(neither you nor a subagent reverts): `git diff-tree -p --binary <after> "$(cut -c6- <prompt-file>.tree)" | git apply`' 'recipe: the user reverts the job edits only, keeping the phase work'
+expect_new skills/agent-invocation/SKILL.md '(`route <role> --skip <skips>,<that profile and every profile before it in the chain>`, as item 7)' 'recipe: the no-edit re-run keeps the session skips'
+expect_new skills/agent-invocation/SKILL.md 'from that round'"'"'s package rebuilt in WORKTREE mode in either round' 'recipe: a final-review re-run sees kept paths and the fix wave'
+expect_new skills/agent-invocation/SKILL.md 'the same question also asks where the step runs again (that profile again, or one the user names) — never a second question' 'recipe: an exhausted chain folds into the one question'
+expect_new skills/agent-invocation/SKILL.md 'Any other outcome counts as `changed`: a `--since` call that exits non-zero or prints another line voids the verdict the same way' 'recipe: a failed --since call voids the verdict (fail closed)'
+expect_new skills/agent-invocation/SKILL.md 'a baseline call that fails → dispatch nothing' 'recipe: no dispatch without a baseline tree'
+expect_new skills/agent-invocation/SKILL.md 'The tree fails there, not the profile' 'recipe: a failed baseline is not a profile failure'
+expect_new skills/agent-invocation/SKILL.md '7. **Failures** — for a role item 4 checks, its `--since` check comes first (a changed tree → item 4, never a retry on that profile)' 'recipe: failures come after the no-edit check'
+expect_new skills/agent-invocation/SKILL.md 'only after item 4'"'"'s `--since` check against the `.tree` beside its prompt file' 'recipe: after a compaction a checked job is compared before its result counts'
+expect_new skills/agent-invocation/SKILL.md 'a running job whose store records no role (`codex`, `zcode`) → the same, and when the step is one item 4 checks, it then runs again on the same profile from the start item 4 names' 'recipe: an unmatched job after a compaction does not count'
+expect_new skills/agent-invocation/SKILL.md 'if the add says the path already exists, an earlier run left it — remove it the same way first' 'recipe: a leftover gate-base checkout is removed first'
+expect_new skills/agent-invocation/SKILL.md 'add the line `Repository root: <absolute path>`' 'recipe: diagnosis and quickfix prompts name a repository root'
+expect_new skills/agent-invocation/SKILL.md '- Create, edit or delete only the files the instructions below tell you to write; running the project'"'"'s tests, linters and builds is fine, and the orchestrator checks the working tree afterwards.' 'recipe: the session-role preamble'
+expect_new skills/agent-invocation/SKILL.md '`frontend.*`: replace the `## Use the frontend-design skill` section with the "Design quality" block below' 'recipe: frontend adaptation is external-only'
+expect_new skills/agent-invocation/SKILL.md 'every frontend dispatch except item 2'"'"'s verdict re-dispatch is FRESH' 'recipe: a frontend verdict re-dispatch resumes (item 2)'
+expect_new skills/agent-invocation/SKILL.md 'no plan file — a pure frontend task from Triage: `$dir` is `"$WS"` without an argument' 'recipe: a triage frontend task has no plan file'
+expect_new skills/agent-invocation/SKILL.md 'The Step 2.5 compaction-safe guards and admission condition (dev-orchestrator Pre-dispatch checklist item 5) are not checked for it' 'recipe: no admission condition for a frontend dispatch'
+expect_new skills/agent-invocation/SKILL.md 'A frontend sidecar'"'"'s chain is its `frontend.*` role — the one whose chain lists the sidecar'"'"'s profile, `frontend.new-ui` first — never `implementer.escalation`.' 'recipe: a frontend sidecar never escalates to implementer.escalation'
+expect_new skills/agent-invocation/SKILL.md '| `tree-state [--cwd W] [--since TREE]` |' 'agent-invocation: tree-state verb row'
+expect_new "$ORCH" '`"$AD" tree-state [--cwd W] [--since <id>]` (the no-edit check, `agent-invocation` "In-session roles on an external profile" item 4' 'Rule 2: tree-state is an allowed main-thread read'
+expect_new "$ORCH" '`"$AD" tree-state [--cwd W] [--since <id>]` (where that recipe asks for it) — workspace/package/dispatch bookkeeping' 'pre-flight gate (c): tree-state, a confirmed resume included'
+expect_new "$ORCH" 'An in-session role whose route line names an external profile runs as a background job per `agent-invocation`' 'Routing item 2: pointer to the recipe'
+expect_new "$ORCH" '; where this skill names its Agent call, read that dispatch.' 'Routing item 2: an Agent call this skill names reads as the routed dispatch'
+expect_new "$ORCH" 'or a pure frontend task'"'"'s `frontend.*` dispatch (Triage), routed to an external profile' 'pre-flight gate: a triage frontend task on an external profile'
+expect_new "$ORCH" '`Write` of its prompt file to the scratchpad (no scratchpad: the directory `"$WS"` prints without an argument;' 'pre-flight gate: the prompt file without a scratchpad'
+expect_new "$ORCH" 'its `task` call on the dispatcher its route line'"'"'s `harness=` names' 'pre-flight gate: an external first dispatch (no wrapper literal)'
+expect_new "$ORCH" 'for that job (`agent-invocation` "In-session roles on an external profile"). **The `task` call disarms the gate.**' 'pre-flight gate: the external task call disarms the gate'
+expect_new "$ORCH" 'outside the confirmed-resume and external-dispatch allowances above' 'pre-flight gate: the external-dispatch writes are allowances'
+expect_new "$ORCH" 'or reviewer preamble (reviewers); an in-session role there: the preamble `agent-invocation` "In-session roles on an external profile" names' 'checklist item 5: the preamble for in-session roles'
+expect_new "$ORCH" '; an in-session role on an external profile takes `--write` as that recipe says' 'checklist item 5: --write for in-session roles'
+expect_new "$ORCH" '10. **GLM implementer dispatches only** (' 'checklist item 10: implementer scope; in-session roles on glm follow the recipe'
+expect_new "$ORCH" 'when `route final-review` names an external profile first (the user'"'"'s chain starts there, or its in-session profiles are down/off), that path is taken directly' 'Step 5: a user chain may start external'
+expect_absent "$ORCH" 'when the in-session `final-review` profiles are already skipped' 'SKILL.md: no skipped-only external final review'
+expect_new skills/dev-orchestrator/final-review-prompt.md 'or when `"$AD" route final-review` names an external profile first (the user'"'"'s `final-review` chain starts there, or its in-session profiles are down/off)' 'final-review: a user chain may start external'
+expect_absent skills/dev-orchestrator/final-review-prompt.md 'when the in-session `final-review` profiles are already skipped' 'final-review: no skipped-only external path'
+expect_new skills/dev-orchestrator/final-review-prompt.md 'it is the `integration-check` role' 'final-review: check 6 is the integration-check role'
+expect_new skills/dev-orchestrator/final-review-prompt.md 'confirm the file holds that `Check 6 was run by the orchestrator; result:` line with step 1'"'"'s token — missing → fix the file; never dispatch without it.' 'final-review: no external dispatch without the check-6 result'
+expect_new skills/writing-plans/SKILL.md 'After `"$AD" route --all` printed `routes: default` (`../agent-invocation/SKILL.md` steps 1–2 — run it once, before the first writer dispatch) it is this Agent call as written, with no `route` call, and so it is when `$AD` does not run at all (say so once and keep the built-in scheme); otherwise `"$AD" route plan-writer` (`plan-reviser`) first' 'writing-plans: no route call under routes: default or without $AD (F1)'
+expect_new_count skills/writing-plans/SKILL.md '"$AD" route plan-writer' 1 'writing-plans: route plan-writer only behind the routes: default check (F1)'
+expect_new skills/writing-plans/SKILL.md '(check 1 keeps only its no-`ultrathink` part; the profile is the one the route line named)' 'writing-plans: an external writer keeps the no-ultrathink check'
+expect_new skills/writing-plans/SKILL.md 'precisely, the profile of the `plan-reviewer` role (`"$AD" route plan-reviewer`, per `../agent-invocation/SKILL.md`); by default Astra, the same command.' 'writing-plans: the plan-reviewer route sentence unchanged'
+expect_text skills/writing-plans/SKILL.md 'Agent(subagent_type="general-purpose", model="opus", effort="xhigh", prompt=<assembled prompt>)' 'writing-plans: the Agent call as written'
 # 5. Merged status lists what the wrappers' own status lists (df96a8a ran "$DISPATCH" status and "$ZDISPATCH" status).
 expect_new skills/agent-invocation/SKILL.md 'The ZCode and Codex lines are what that wrapper'"'"'s own `status` lists (Codex: only this session'"'"'s jobs while `$CODEX_COMPANION_SESSION_ID` is set).' 'agent-invocation: merged status keeps the wrappers'"'"' session scope'
 # Under routes: default no route call and the built-in announcements, word for word.
@@ -329,6 +384,52 @@ expect_new "$ORCH" '("без GLM" is the GLM kill switch above and writes no `ch
 expect_new "$ORCH" 'only when `route --all` did not print `routes: default`' '"без <profile>" needs the user'"'"'s own routing'
 expect_new "$ORCH" 'Under `routes: default` no such switch exists, as before 0.12.0.' 'no "без <profile>" switch under routes: default'
 expect_new "$ORCH" 'are skipped for the session: the Model split table' 'Routing item 1: the routes: default shortcut holds for the session'
+# 7. The in-session dispatch text keeps its built-in wording (external adaptations live in agent-invocation).
+expect_text "$ORCH" 'Dispatch the Opus plan writer per `./opus-plan-writer-prompt.md` Mode A: `Agent(subagent_type="general-purpose", model="opus", effort="xhigh", prompt=...)`.' 'Step 1 Agent call'
+expect_text "$ORCH" 'A FRESH Opus subagent (`model: "opus"`, `effort: "high"`), using `./opus-plan-writer-prompt.md` Mode B' 'Step 2 reviser Agent call'
+expect_text "$ORCH" 'Dispatch Claude frontend implementer subagent using `./claude-frontend-implementer-prompt.md`.' 'frontend Agent call'
+expect_text "$ORCH" 'dispatch an Opus subagent to assess (`model: "opus"`, `effort: "high"`; pass BLOCKED report + plan-file path)' 'BLOCKED diagnosis'
+expect_text "$ORCH" '**How:** dispatch `Agent(subagent_type="general-purpose", model="sonnet", effort="medium")` with `./verification-gate-prompt.md`' 'gate Agent call'
+expect_text "$ORCH" 'Dispatch with `./opus-review-prompt.md` (`model: "opus"`, `effort: "high"`).' '4.1 Agent call'
+expect_text "$ORCH" 'Dispatch `Agent(subagent_type="general-purpose", model="sonnet", effort="medium")` with `./synthesize-review-prompt.md`' 'synthesis Agent call'
+expect_text "$ORCH" '**Dispatch ONE Opus subagent** per `./final-review-prompt.md` (`model: "opus"`, `effort: "xhigh"`)' 'Step 5 Agent call'
+expect_text "$ORCH" 'Dispatch `Agent(subagent_type="general-purpose", model="sonnet", effort="medium")`:' 'integration-check Agent call'
+expect_text "$ORCH" 'Do not modify any files. Report line 1 exactly `INTEGRATION_OK` or `INTEGRATION_FAIL`' 'integration-check prompt'
+expect_text "$ORCH" 'Sonnet quickfix **subagent** via `Agent(subagent_type="general-purpose", model="sonnet", effort="medium", ...)`' 'quickfix Agent call'
+expect_count "$ORCH" 'Subagent is instructed to use the `frontend-design` skill.' 2 'frontend: the design skill in the session (role list and Step 3)' exact
+expect_text "$ORCH" '`--write` ONLY on implementation dispatches — no Codex role in the plan stage writes files any more' 'checklist item 5: original --write rule kept'
+expect_text "$ORCH" '(the Claude frontend subagent has no handle; `—` before the first dispatch)' 'state line: in-session frontend has no handle'
+expect_text skills/dev-orchestrator/claude-frontend-implementer-prompt.md '## Use the frontend-design skill' 'frontend template keeps the skill (in-session)'
+expect_text skills/dev-orchestrator/verification-gate-prompt.md '`git stash` + rerun + `git stash pop`' 'gate template unchanged (in-session)'
+expect_text skills/dev-orchestrator/sonnet-quickfix-prompt.md 'If you need to clarify anything, stop and ask — do not guess.' 'quickfix template unchanged'
+expect_text skills/dev-orchestrator/final-review-prompt.md 'run check 6 as a dispatched Sonnet subagent' 'final-review check 6 default'
+if [[ $HAVE_BASE == 1 ]]; then
+    for f in opus-plan-writer-prompt.md verification-gate-prompt.md synthesize-review-prompt.md \
+             sonnet-quickfix-prompt.md claude-frontend-implementer-prompt.md; do
+        if git -C "$REPO_ROOT" diff --quiet "$BASE_REV" -- "skills/dev-orchestrator/$f"; then pass "$f unchanged since $BASE_REV"
+        else fail "$f changed since $BASE_REV — external adaptations belong in agent-invocation"; fi
+    done
+else
+    echo "  [SKIP] five templates unchanged since $BASE_REV ($BASE_REV not available)"
+fi
+# 8. Fenced blocks (Agent calls, command lines, prompt templates with their output formats) byte for byte
+#    as at the start of increment 6.
+FENCE_REV=8ca4bfb   # the commit increment 6 started from
+if git -C "$REPO_ROOT" cat-file -e "$FENCE_REV^{commit}" 2>/dev/null; then
+    for f in "$ORCH" skills/dev-orchestrator/opus-review-prompt.md skills/dev-orchestrator/final-review-prompt.md; do
+        digest=review_text; [[ $f == "$ORCH" ]] && digest=fences
+        if [[ "$($digest <"$REPO_ROOT/$f" | cksum)" == "$(git -C "$REPO_ROOT" show "$FENCE_REV:$f" | $digest | cksum)" ]]; then
+            pass "$f: fenced blocks unchanged since $FENCE_REV"
+        else
+            fail "$f: a fenced block changed since $FENCE_REV — the in-session dispatch text stays as written"
+        fi
+    done
+else
+    echo "  [SKIP] fenced-block digests ($FENCE_REV not available)"
+fi
+n=$(wc -l <"$REPO_ROOT/$ORCH" | tr -d ' ')
+if (( n <= 823 )); then pass "SKILL.md growth within budget ($n <= 823; spec §6.2: about 30 over $BASE_REV's 793)"
+else fail "SKILL.md grew to $n lines (> 823)"; fi
 
 echo ""
 echo "Documented route examples (bin/agent-dispatch)"
