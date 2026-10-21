@@ -431,6 +431,25 @@ n=$(wc -l <"$REPO_ROOT/$ORCH" | tr -d ' ')
 if (( n <= 823 )); then pass "SKILL.md growth within budget ($n <= 823; spec §6.2: about 30 over $BASE_REV's 793)"
 else fail "SKILL.md grew to $n lines (> 823)"; fi
 
+# 9. Docs: in-session roles on any profile; no stale "later releases" text.
+expect_absent README.md 'Running these roles on external harnesses comes in a later release.' 'README: external execution ships'
+expect_absent README.md 'come in the next releases' 'README: adapters ship'
+expect_absent README.md 'until that harness'"'"'s adapter ships' 'README: presets work'
+expect_absent README.md 'its chain runs in order' 'README: no unrestricted final-review order (kept)'
+expect_absent README.ru.md 'Запуск этих ролей на внешних харнессах появится' 'README.ru: external execution ships'
+expect_absent README.ru.md 'появятся в следующих выпусках' 'README.ru: adapters ship'
+expect_absent README.ru.md 'когда выйдет адаптер этого харнесса' 'README.ru: presets work'
+expect_absent README.ru.md 'его цепочка идёт по порядку' 'README.ru: no unrestricted final-review order (kept)'
+expect_absent PLUGIN_README.md 'arrive in later releases' 'PLUGIN_README: adapters ship'
+expect_absent skills/agent-invocation/SKILL.md 'no adapter for that harness yet' 'agent-invocation: all four core adapters ship'
+expect_absent .claude-plugin/plugin.json 'arrive in later releases' 'plugin.json: adapters ship'
+expect_new README.md '`route --all` lists every role whose chain differs, `"final-review": ["astra"]` included.' 'README: in-session roles on any profile'
+expect_new README.ru.md '`route --all` показывает каждую роль, чья цепочка отличается от встроенной, включая `"final-review": ["astra"]`.' 'README.ru: in-session roles on any profile'
+expect_new README.md 'If your tests leave files that are not in `.gitignore`, add them there.' 'README: the .gitignore advice'
+expect_new README.ru.md 'Если тесты оставляют файлы, которых нет в `.gitignore`, добавьте их туда.' 'README.ru: the .gitignore advice'
+expect_new PLUGIN_README.md 'any role — the in-session ones included — can run on any profile (`tree-state` checks that no-edit roles left the tree alone).' 'PLUGIN_README: in-session roles on any profile'
+expect_new .claude-plugin/plugin.json 'any role, the in-session ones included, can run on any of them.' 'plugin.json: in-session roles on any profile'
+
 echo ""
 echo "Documented route examples (bin/agent-dispatch)"
 if command -v node >/dev/null 2>&1 && [[ -x "$REPO_ROOT/bin/agent-dispatch" ]]; then

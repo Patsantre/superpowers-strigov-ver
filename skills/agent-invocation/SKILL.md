@@ -154,7 +154,7 @@ The failure rules depend on the job's harness (dev-orchestrator Step 3, "GLM inf
 | a running write task named (`<id> is still running in this workspace; one write task per working tree`, or a ZCode / Codex write job) | dev-orchestrator "## Durable Progress" item 4: poll it, never dispatch a second |
 | a message containing `release-stale` | dev-orchestrator "Stale workspace reservation", with `"$AD" release-stale` |
 | a resume refusal ending `dispatch --fresh` | the same operation FRESH on the same profile (re-brief on fix-type operations) |
-| `profile <p>: harness <h> is not available in this version` (this plugin version has no adapter for that harness yet) | the profile is `down` for the session (`channels` line, class `launch`); the next profile of the chain, announced with the quoted line |
+| `profile <p>: harness <h> is not available in this version` (its adapter file `bin/lib/adapters/<h>.mjs` is missing: a damaged or partial plugin install) | the profile is `down` for the session (`channels` line, class `launch`); the next profile of the chain, announced with the quoted line; tell the user to reinstall or update the plugin |
 | any other refusal naming the profile (an `env` conflict with a mandatory setting, a field holding the key) | the next profile of the chain, announced with the quoted line |
 | a usage error (flags, paths, missing prompt file) | fix the dispatch |
 
@@ -242,12 +242,12 @@ Ids never cross harnesses. A core id resumes only on its own profile; a refused 
 
 ## Facts from sources (not run)
 
-Each harness adapter is written against one version; `doctor` prints one line when the installed version differs ("not checked") and does not block the run.
+Each harness adapter is written against one version; `doctor` prints one line when the installed version differs ("not checked") and does not block the run. OpenCode 2, which has another CLI, is refused (`launch`).
 
 - `claude` 2.1.302 — checked by running it (`docs/research/universal-dispatchers/01-claude-code-headless.md`).
 - `opencode` 1.19.3, `pi` 1.3.0, `dsh` 0.2.1-rc.2 — not run on the owner's machine; facts from their sources and documentation (`02-opencode.md`, `03-pi.md`, `04b-deepseek-harness.md` in the same directory).
 
-The per-harness facts the orchestrator relies on are added here with each harness's adapter.
+The per-harness facts the orchestrator relies on are in "Resume and read-only, by harness" and "Failure handling" above; each adapter (`bin/lib/adapters/*.mjs`) cites its source for the rest.
 
 ## Never do
 

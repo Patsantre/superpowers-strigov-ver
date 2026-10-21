@@ -127,7 +127,10 @@ export const PATTERN_ORDER = [
   ["transient", "server"], ["launch", "launch"],
 ];
 // A resumed job keeps its profile snapshot; these fields must still match the current profile (spec §3.6 А12).
-export const RESUME_BOUND_FIELDS = ["harness", "model", "endpoint", "home"];
+// A resume runs on the recorded profile snapshot, so its binary and its sandbox (bin, wrap, sandbox) must still match
+// config.json too: a job under a sandbox may write the data dir's state/, and a record it rewrote must not let the
+// next run of its session go unsandboxed.
+export const RESUME_BOUND_FIELDS = ["harness", "model", "endpoint", "home", "bin", "wrap", "sandbox"];
 export const REDACTED = "<redacted>";
 export const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 export const PROFILE_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;

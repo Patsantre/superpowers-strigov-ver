@@ -35,6 +35,8 @@ npm install -g @openai/codex
 codex login
 ```
 
+Only the built-in scheme needs Codex. If you have no OpenAI account, skip it, and before the first pipeline run bind every role whose built-in chain names a Codex profile (`plan-reviewer`, `spec-reviewer`, `implementer`, `implementer.risk`, `implementer.escalation`, `control-review`, `final-review`, `adhoc-review`) to profiles of your own: see [Role routing](#role-routing), the example for someone without OpenAI. `agent-dispatch doctor` then reports the unused Codex profiles as WARN, not FAIL.
+
 Optional — the default implementer, **GLM-5.3-Flash via Z.ai's ZCode**: install [ZCode](https://github.com/zai-org/ZCode) — macOS: ZCode.app into `/Applications`; Linux: see [Linux: ZCode for the GLM channel](#linux-zcode-for-the-glm-channel) below; Windows is not supported yet — then store a GLM Coding Plan API key from <https://z.ai/manage-apikey/apikey-list> once: run `zcode-dispatch api-key set` in a terminal and paste the key at the hidden prompt. The key becomes a provider of ZCode's own "Z.ai Coding Plan" template in the wrapper's private config and does not expire. There is no OAuth login: the CLI's `zcode login` keeps no refresh token and lasts about an hour (details in the `zcode-invocation` skill, "One-time setup"). Without a key, `zcode-dispatch doctor` fails and the pipeline implements on Codex Luna `max` instead — announced, never silent. Behind a local proxy, export `ZCODE_HTTP_PROXY=http://<host>:<port>` if headless runs fail with a network error (the CLI ignores `HTTP(S)_PROXY` and the macOS system proxy; the wrapper passes this variable via the allowlist). The CLI receives an allowlisted environment; explicitly pass extra names with `ZCODE_ENV_PASSTHROUGH="NAME1,NAME2"`.
 
 #### Linux: ZCode for the GLM channel
@@ -134,13 +136,13 @@ Every role runs on a pinned model + effort pair. Claude subagents receive an exp
 
 `max` is reserved for the implementers GLM and Luna (or used when the user asks for it by name); `ultra` is never chosen automatically — only when the user explicitly asks for it. GLM quota: on 2026-10-14 the 1.5× ZCode quota bonus measured inconclusive (expected/measured credits = 3.02 at the standard rate, or 1.51 if the window was off-peak; details in docs/zcode-cli-findings.md).
 
-This table is the built-in scheme: with no `config.json` it is exactly what runs. Any role can be rebound to a profile of your own — see [Your own harnesses and APIs](#your-own-harnesses-and-apis).
+This table is the built-in scheme: with no `config.json` it is exactly what runs. Any role, the in-session ones included, can be rebound to a profile of your own — see [Role routing](#role-routing).
 
 ## Your own harnesses and APIs
 
 `bin/agent-dispatch` binds pipeline roles to **profiles**. A profile is a harness, a way to pay (the harness's own login or an API key), a model and an effort. A role takes a **chain** of profiles: the first is the primary, the others are fallbacks in order. Without a configuration file nothing changes.
 
-This release (0.12.0) ships the routing layer (profiles, keys, `route`, `doctor`, job status, and the pass-through to ZCode and Codex) and the adapters for `claude -p`, DeepSeek Harness (`dsh`), OpenCode and pi. You can move the in-session roles to another Claude model or effort, and the external roles to other Codex models or to a profile on any of those four harnesses.
+`agent-dispatch` ships the routing layer (profiles, keys, `route`, `doctor`, job status, the pass-through to ZCode and Codex) and adapters for `claude -p`, DeepSeek Harness (`dsh`), OpenCode and pi. Any role can run on any profile, the in-session roles included.
 
 `agent-dispatch` lives in the plugin's `bin/`. In your own terminal, call it by its absolute path; Claude can print it for you.
 
@@ -189,13 +191,99 @@ Every preset targets `claude`, `dsh`, OpenCode or pi, and 0.12.0 ships all four 
   - Linux: `["secret-tool", "lookup", "service", "deepseek"]`
   - any OS: `["op", "read", "op://…"]`
 
-A key reaches only the harness process's environment, never its argv, a settings file or the chat. pi writes what it sees into its own session files; after every run they are rewritten with the key redacted. The pipeline never runs `key set` and never asks you for a key.
+A key reaches only the harness process's environment, never its argv, a settings file or the chat. The pipeline never runs `key set` and never asks you for a key.
 
 Profiles that share a key, a harness login (an OpenCode or pi login counts per provider) or a `shares` label drop out together on `auth` or `quota`. The built-in `glm` carries `zai-coding-plan`, so a Z.ai API fallback with that label is not tried against the same exhausted quota.
 
+Each adapter is written against one harness version. Claude Code 2.1.302 itself was run during research, against local stubs ([01](./docs/research/universal-dispatchers/01-claude-code-headless.md)); OpenCode, pi and dsh were not run, and their adapters come from those harnesses' sources and documentation (`skills/agent-invocation`, "Facts from sources"). No adapter has run against a real provider: the tests run on stubs only, so `doctor --probe` on your own key is the first live check. Another version is allowed: `doctor` prints one "not checked" line and does not block the run. The exception is OpenCode 2, which has another CLI: it is refused (`launch`; see [OpenCode](#opencode)). Harness facts in depth: [docs/research/universal-dispatchers/](./docs/research/universal-dispatchers/) and the [design spec](./docs/superpowers/specs/2026-10-20-universal-dispatchers-design.md) (§2–§4).
+
+### Claude Code (`claude -p`)
+
+Install Claude Code itself (`npm install -g @anthropic-ai/claude-code`); the adapter is written against 2.1.302.
+
+| Pays with | Preset | What to know |
+|---|---|---|
+| Claude subscription (Pro/Max) | `claude-sub` (`opus`, `xhigh`) | Your own `claude` login. Its jobs spend the same subscription limits as your main session ([07 AN4](./docs/research/universal-dispatchers/07-tos-matrix.md)). If a `settings.json` in your login directory sets a key, an endpoint or an `apiKeyHelper`, the profile is refused (`doctor` FAIL `user-settings`). A second account: `"home": "isolated"`, then `agent-dispatch profile env <name> -- claude` and `/login`. |
+| API key, Anthropic-compatible endpoint | the table below | `key set <key name>`. The profile runs in its own config directory that holds no claude.ai login, with exactly one key variable. WebSearch and WebFetch are denied. |
+| Local model | `claude-local` | No key (`"auth": "none"`); see below. |
+
+Endpoints and environment recipes come from the providers' own Claude Code setups ([06 §1](./docs/research/universal-dispatchers/06-providers-and-plans.md)):
+
+| Preset | Key name | `endpoint` | Model | Preset environment |
+|---|---|---|---|---|
+| `claude-zai` | `zai` | `https://api.z.ai/api/anthropic` | `glm-5.3[1m]` | `API_TIMEOUT_MS=3000000`, `CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000`; `shares: zai-coding-plan` |
+| `claude-deepseek` | `deepseek` | `https://api.deepseek.com/anthropic` | `deepseek-v4-pro[1m]` | `CLAUDE_CODE_AUTO_COMPACT_WINDOW=786432` |
+| `claude-kimi` (Kimi Platform) | `kimi` | `https://api.moonshot.ai/anthropic` | `kimi-k3[1m]` | — |
+| `claude-minimax` | `minimax` | `https://api.minimax.io/anthropic` | `MiniMax-M3.1-Flash[1m]` | `CLAUDE_CODE_AUTO_COMPACT_WINDOW=524288` |
+| `claude-alibaba` (pay-as-you-go) | `alibaba` | `https://<WorkspaceId>.<region>.maas.aliyuncs.com/apps/anthropic`, `<region>` one of `ap-southeast-1`, `us-east-1`, `eu-central-1`, `ap-northeast-1`, `cn-beijing` | `<model>`, e.g. `qwen3.8-max` | fill the endpoint with `--set endpoint=…` |
+| `claude-openrouter` | `openrouter` | `https://openrouter.ai/api` | `<model>` | Bearer key, `ANTHROPIC_API_KEY=""` |
+
+- `[1m]` tells Claude Code the model has a 1M window; for an id it does not know it assumes 200K.
+- Z.ai: the key's type decides the billing on this endpoint (Coding Plan or Standard API key) ([06 §1.3](./docs/research/universal-dispatchers/06-providers-and-plans.md)). `shares: zai-coding-plan` is for a Coding Plan key, the quota of the built-in `glm`; drop it for a Standard key with `--set shares=`.
+- Kimi Platform allows one request at a time on Tier 0: add `--set maxParallel=1`.
+- `effort` goes to `--effort` and to `CLAUDE_CODE_EFFORT_LEVEL`; a `CLAUDE_CODE_EFFORT_LEVEL` in the profile's `env` (some providers' recipes set `max`) overrides the `effort` field.
+- Options: `options.tools` (a writer's tool set, by default `Bash,Read,Edit,Write,Glob,Grep`), `options.settings` (merged into the job's `--settings`), `options.maxTurns`.
+- A reviewer gets Read, Glob, Grep and the read-only `git show`, `git diff`, `git log`, `git status`. The key never reaches the model's Bash (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`).
+
+**Local model.** `agent-dispatch profile add local --from claude-local --set endpoint=http://127.0.0.1:<port> --model <id> --set env.CLAUDE_CODE_MAX_CONTEXT_TOKENS=<ctx>`, with the port of your server: llama-server 9931, LM Studio 1234, Ollama 11434 ([08 §3](./docs/research/universal-dispatchers/08-local-models.md)). The preset runs one job at a time (`maxParallel: 1`), raises Claude Code's stream idle timeouts for a long prefill and turns off the attribution block, which would otherwise keep the server from reusing its prompt cache across jobs.
+
+- `<ctx>` is the context the server really gives one request (leave that `--set` out to keep the preset's 131072); llama-server's `GET /props` shows `n_ctx` and the slot count. To change it later, edit the profile's `env` in `config.json`: `profile add` refuses a name that already exists.
+- Ollama's default context is 4k on a GPU with less than 24 GB, and what does not fit is dropped silently. Raise it with `OLLAMA_CONTEXT_LENGTH` (Ollama advises at least 64k for coding tools).
+- Memory: on 16 GB a local model is no implementer; on 32–48 GB it can take small, well-specified phases. Never SECURITY/DATA_LOSS phases, planning or a blocking review ([08 §9](./docs/research/universal-dispatchers/08-local-models.md)). Routing is per role, not per phase: no route sends only the small phases to one profile, and `"implementer": ["local"]` (or `SP_IMPLEMENTER=local`) hands the local model every phase, fix round and final fix wave of that role. So put it last in the `implementer` chain, as a fallback when the cloud channels are down or out of quota, or on `quickfix` (trivial single-file edits). Never first in `implementer`, and never on `implementer.risk`, `implementer.escalation`, `plan-writer`, `plan-reviser`, `gate` or a reviewer role.
+
+### OpenCode
+
+| | |
+|---|---|
+| Install | `npm i -g opencode-ai@1.19.3`, or `brew install anomalyco/tap/opencode`. Not `brew install opencode`: that is OpenCode 2, which the adapter refuses with a hint to install v1. Supported: 1.19.x |
+| Login | Preset `opencode-login` (`"auth": "login"`): `opencode auth login` → GitHub Copilot, ChatGPT Plus/Pro, OpenCode Go or GLM Coding Plan (providers `github-copilot`, `openai`, `opencode-go`, `zai-coding-plan`); the model is `--model <provider>/<model>`. A GLM Coding Plan login spends the quota of the built-in `glm`: add `--set shares=zai-coding-plan`, so the profile drops out with `glm` on `auth` or `quota` |
+| Key | Preset `opencode-key`: `--key <name> --set keyVar=<VAR>`: `ZHIPU_API_KEY` for `zai-coding-plan`, `DEEPSEEK_API_KEY` for `deepseek`, `MINIMAX_API_KEY` for `minimax`. A Coding Plan key on `zai-coding-plan` spends the same quota: add `--set shares=zai-coding-plan` as well (not for a Standard key) |
+| Model, effort | `<provider>/<model>`, the ids `opencode models <provider>` prints; `effort` → `--variant` |
+| Home | A login profile uses your own OpenCode directories. A keyed profile gets its own, `homes/<profile>/`, which must hold no saved login (`data/opencode/auth.json` would win over the key: `doctor` FAIL, the task refused). A login of its own (a second account): `"home": "isolated"`, then `agent-dispatch profile env <name> -- opencode auth login` |
+| Options | `options.permission`: extra OpenCode permission rules — all of them for a writer, only the `deny` ones for a reviewer. `options.plugins: true` loads your external OpenCode plugins (off by default: `OPENCODE_PURE=1`) |
+| Reviewer | Its own read-only agent: read, grep, glob, list and `git show/diff/log/status`. No edits, no other commands, no web, no `.env` files, nothing outside the repository but the temp directories |
+| Who sees the key | OpenCode's bash sees it (see [Sandbox](#sandbox-optional)); OpenCode's own session store keeps what its bash printed |
+
+### pi
+
+| | |
+|---|---|
+| Install | `npm i -g --ignore-scripts @earendil-works/pi-coding-agent@1.3.0` (Node ≥ 22.19). Supported: 1.3.x. pi's find and grep need `fd` and `rg` on `PATH` (the adapter keeps pi offline, so it does not download them; `doctor` checks) |
+| Key | Preset `pi-key`: `--key <name> --set keyVar=<VAR>`: `ZAI_API_KEY` for `zai`, `DEEPSEEK_API_KEY` for `deepseek`, `OPENROUTER_API_KEY` for `openrouter`. Model `<provider>/<id>`; `effort` → `--thinking`. pi's `zai` is Z.ai's Coding Plan endpoint: with a Coding Plan key add `--set shares=zai-coding-plan` (the quota of the built-in `glm`), so the profile drops out with `glm` on `auth` or `quota`; a Standard key there is billed pay-as-you-go |
+| Login | "Sign in with ChatGPT": `"auth": "login"`, then `/login` in pi's TUI (in your own pi directory, or with `"home": "isolated"` through `agent-dispatch profile env <name> -- pi`). pi's Anthropic and Copilot logins get no preset: there pi presents itself as another client |
+| Home | A keyed profile runs in `homes/<profile>/pi` (`agent-dispatch profile env <name>` prints it as `PI_CODING_AGENT_DIR`). A saved login there (`auth.json`) would win over the key, so the profile is refused |
+| Own endpoint | A `models.json` in that directory whose `apiKey` is `"$<keyVar>"`, so the key still comes from the store; a literal key there would win over `keyVar` (`doctor` FAIL `pi-auth`). Format: [03 §5.3](./docs/research/universal-dispatchers/03-pi.md) |
+| Options | `options.extensions`: one `-e` each, e.g. `["builtin:llama.cpp", "<path>"]`; pi's built-ins are `builtin:mcp`, `builtin:llama.cpp`, `builtin:codemode`, `builtin:tool-search` |
+| Reviewer | `read,grep,find,ls` — **no bash, so no git**: the review package is its only view of the diff |
+| Who sees the key | pi's bash sees it (see [Sandbox](#sandbox-optional)); pi's session files are rewritten with the key redacted after every run |
+
+A `models.json` for an endpoint of your own, with the profile's `"keyVar": "MY_KEY"` and `"model": "<provider>/<id>"`:
+
+```json
+{ "providers": { "<provider>": { "baseUrl": "<url>", "api": "openai-completions", "apiKey": "$MY_KEY", "models": [{ "id": "<id>" }] } } }
+```
+
+### DeepSeek Harness (`dsh`)
+
+| | |
+|---|---|
+| Install | `npm i -g @deepseek-ai/dsh@0.2.1-rc.2` (Node `^22.19` or `>=24`). Homebrew's `dsh` is another program, which the adapter refuses. Supported: 0.2.x |
+| Key | DeepSeek has no subscription, and dsh no login. Preset `dsh-deepseek`: `key set deepseek` (it goes to `DEEPSEEK_API_KEY`). Or `"auth": "native"`: `DEEPSEEK_API_KEY=…` in `$DSH_HOME/.env` (default `~/.dsh/.env`) — but dsh reads a `.env` in the repository first, and a key there overrides yours (`doctor` warns) |
+| Home | `"home": "user"` (default): `$DSH_HOME` or `~/.dsh`. `"isolated"`: `homes/<profile>/dsh` (`agent-dispatch profile env <name>` prints its `DSH_HOME`) |
+| Model, effort | `deepseek-v4-pro` (the preset) or `deepseek-flash` (dsh's own default); effort `off`, `low`, `high` (default) or `max` |
+| Endpoint | `endpoint` is dsh's `baseURL` (default `https://api.deepseek.com/anthropic`), e.g. your own gateway; a repository `.env` cannot change it |
+| Options | `options.sessionLog: true` turns dsh's session-log upload back on (off by default). `options.agentsHome: "user"` lets dsh read the shared `~/.agents`. `options.patch` adds rows to dsh's patch file; the key variable, `baseURL` and the permission rows stay the adapter's |
+| Reviewer | dsh's `read-only` mode, an OS sandbox: it reads and runs commands, and every write is denied. A writer runs in `danger-full-access` |
+| Who sees the key | dsh strips `*KEY*` and `*TOKEN*` variables from its tools |
+
+### ZCode and Codex
+
+- **ZCode** (`glm`): set up as in [Quick start](#1-install-the-prerequisites) and [Linux: ZCode for the GLM channel](#linux-zcode-for-the-glm-channel). The profile passes through to `zcode-dispatch` unchanged; the wrapper pins the model.
+- **Codex** (`luna`, `sol`, `astra`, `astra-high` and your own `codex` profiles): `codex login`, as in [Quick start](#1-install-the-prerequisites); the profile passes through to `codex-dispatch`. Only OpenAI models are documented here: third-party providers in Codex's own configuration are neither documented nor supported.
+
 ### Role routing
 
-| Role (name in `config.json`) | Where in the pipeline | Default | Runs |
+| Role (name in `config.json`) | Where in the pipeline | Default | Runs by default |
 |---|---|---|---|
 | `plan-writer` | plan writer | `opus-xhigh` | in the session (Agent tool) |
 | `plan-reviser` | plan revisions | `opus-high` | in the session |
@@ -238,12 +326,21 @@ An example for someone without OpenAI:
 - Risk-marked phases and escalations run on Opus through the Claude subscription.
 - Reviewers run on DeepSeek, with Copilot and the GLM API as fallbacks.
 
+Its profiles come from the presets above; `deepseek-claude` is the one from [A profile in three steps](#a-profile-in-three-steps):
+
+```bash
+agent-dispatch profile add deepseek-dsh --from dsh-deepseek   # the same key, deepseek
+agent-dispatch profile add claude-sub   --from claude-sub
+agent-dispatch profile add oc-copilot   --from opencode-login --model github-copilot/<model>   # ids: opencode models github-copilot
+agent-dispatch profile add glm-api      --from claude-zai     # key set zai
+```
+
 More about routing:
 
-- **In-session roles.** These roles can be bound to your own `inproc` profiles, that is, to another Claude model or effort. For example, on Claude Pro you can define `"sonnet-high": { "harness": "inproc", "model": "sonnet", "effort": "high" }` and set `"plan-writer": ["sonnet-high"]`. Running these roles on external harnesses comes in a later release. Until then, `route` uses only the in-session profiles of such a chain (with none left, the built-in one) and prints one note. `final-review` also starts in the session: its in-session profiles always come first (with none configured, `opus-xhigh`), and your external profiles run only after them, as fallbacks, whatever order you write. So `"final-review": ["astra"]` still starts on `opus-xhigh`, and `route --all` prints `routes: default` plus a note, because it compares the chains that will actually run.
+- **In-session roles.** These roles can be bound to any profile, like the others. An `inproc` profile runs them in the session on another Claude model or effort: on Claude Pro, for example, define `"sonnet-high": { "harness": "inproc", "model": "sonnet", "effort": "high" }` and set `"plan-writer": ["sonnet-high"]`. Any other profile runs them as a background job on its harness: the roles that write files or run the project's tests get write access (the gate, the phase reviews and the integration check must still leave the files alone — the orchestrator compares the working tree before and after, and asks you once if anything changed), while `diagnosis` and `final-review` run read-only — except on ZCode (`glm`), which has no read-only mode: there they get write access too (`route` warns), and the same before/after check runs. On a profile with the sandbox off, write access is full access, as for an implementer ([Sandbox](#sandbox-optional)), and the check sees only the working tree. If your tests leave files that are not in `.gitignore`, add them there. On an external profile `frontend.*` gets a short design brief instead of the `frontend-design` skill. The built-in chains start in the session, so without `config.json` nothing changes; `route --all` lists every role whose chain differs, `"final-review": ["astra"]` included.
 - **How the pipeline reads routes.**
   - At start and after a compaction, the orchestrator runs `agent-dispatch route --all`. The answer `routes: default` is not announced. Otherwise you get one line with your differences.
-  - Before every reviewer dispatch, at a phase's first implementer dispatch and at every switch it runs `route <role>`, so nothing has to be remembered. A phase's retries and fix rounds stay on its current profile.
+  - Before every dispatch of a reviewer or an in-session role (the plan writer, the gate, diagnosis and the rest), at a phase's first implementer dispatch and at every switch it runs `route <role>`, so nothing has to be remembered. A phase's retries and fix rounds stay on its current profile.
   - After `routes: default` these calls are skipped and the built-in scheme answers.
   - A switch to the next profile in a chain is one announced line, for example `Channel implementer: glm-api → deepseek-dsh (glm-api: quota).` Switches between built-in profiles keep their old lines, such as `GLM channel failed … falls back to Luna max`.
 - **Kill switch.**
@@ -251,6 +348,49 @@ More about routing:
   - With your own routing (`route --all` does not print `routes: default`), "без <profile>" drops any profile from every chain until the session ends; with the built-in scheme only "без GLM" and "через Luna" work, as before. With the example above, "без GLM" sends every phase, risk-marked ones included, to `deepseek-dsh`.
   - `SP_IMPLEMENTER=luna` works as before. `SP_IMPLEMENTER=<profile>`, where the profile is one you defined in `config.json` and it runs outside the session, makes that profile the implementer for every non-frontend phase and turns GLM off; when it fails, the pipeline asks you instead of moving on. `SP_IMPLEMENTER=glm` names the default and changes nothing. Any other value is ignored, as before: a built-in name such as `sol` (to make Sol the implementer, write `"implementer": ["sol"]` in `config.json`), an unknown name, an in-session profile. GLM stays on. Without profiles of your own nothing is announced; with them you get one line of notice at start.
 - **Family rule.** In the built-in scheme the writer and the reviewer of an artifact come from different model families. `agent-dispatch` does not check your routing for this. Keep each reviewer in a different family from the plan writer and the implementer.
+
+### Sandbox (optional)
+
+`sandbox` and `wrap` are fields of `claude`, `opencode`, `pi` and `dsh` profiles only; `doctor` checks both. The sandbox is off by default (`"sandbox": "off"`): a writer then runs with full access (claude `bypassPermissions`, dsh `danger-full-access`), as ZCode runs `--mode yolo`.
+
+| Harness | `"sandbox": "native"` |
+|---|---|
+| `claude` | Claude Code's sandbox for Bash; a writer runs with `acceptEdits` (edits in the repository only). Bash has no network until you add domains to `sandbox.network.allowedDomains` through `options.settings`. Needs `/usr/bin/sandbox-exec` on macOS, `bubblewrap` and `socat` on Linux |
+| `dsh` | `workspace-write`: writes only in the repository and the temp directories. In a linked git worktree (a parallel track) `git commit` may be denied, since its git metadata lies outside (not verified); if it is, keep parallel tracks off dsh |
+| `opencode`, `pi` | No sandbox of their own: `native` does nothing (`doctor` says so). Use `wrap` |
+
+`codex` and `zcode` profiles take neither field (with one, `config.json` is refused): Codex always runs in its own sandbox, `workspace-write` with `--write` and read-only without it; ZCode always runs `--mode yolo`.
+
+**`wrap`** is an argv prefix for the harness command, for example Anthropic's sandbox-runtime `srt` (`@anthropic-ai/sandbox-runtime`, a beta) or a container. Install `srt` globally (`npm i -g @anthropic-ai/sandbox-runtime`; Node ≥ 22.12, on Linux also `bwrap`, `socat`, `rg`), never inside a repository the pipeline works in: a copy there can be rewritten from inside the sandbox. A pi profile under `srt`, and a sketch of its settings ([09 §7.3](./docs/research/universal-dispatchers/09-sandboxing-and-credentials.md); not run — the full key list is in §2.3):
+
+```json
+"pi-deepseek": { "harness": "pi", "auth": { "key": "deepseek" }, "keyVar": "DEEPSEEK_API_KEY", "model": "deepseek/<id>",
+                 "wrap": ["srt", "--settings", "/Users/me/.config/srt/pi.json", "--"] }
+```
+
+```json
+{
+  "network": { "allowedDomains": ["api.deepseek.com:443"], "strictAllowlist": true, "allowLocalBinding": false },
+  "filesystem": {
+    "denyRead": ["~/.ssh", "~/.aws", "~/.config/gh", "~/.config/gcloud", "~/.azure", "~/.kube", "~/.docker",
+                 "~/.netrc", "~/.git-credentials", "~/.npmrc", "~/.pypirc", "~/.codex", "~/.zcode", "~/.pi", "~/.dsh",
+                 "~/.local/share/opencode", "~/.claude", "~/.claude.json", "~/Library/Keychains"],
+    "allowRead": ["~/.claude/plugins/data/superpowers-strigov-ver-agents/state",
+                  "~/.claude/plugins/data/superpowers-strigov-ver-agents/homes/pi-deepseek"],
+    "allowWrite": ["<repository>", "~/.claude/plugins/data/superpowers-strigov-ver-agents/state",
+                   "~/.claude/plugins/data/superpowers-strigov-ver-agents/homes/pi-deepseek"]
+  }
+}
+```
+
+`allowRead` and `allowWrite` open only two places in the plugin's data directory: `state/` (pi writes its session files to `state/<workspace>/jobs/<id>/sessions`) and this profile's home `homes/<profile>/`; `denyRead` closes the rest of `~/.claude`. Never open the whole data directory: `keys/` holds every stored key, the other profiles' homes hold their logins, and a job that can write `config.json` can drop its own `wrap` or add a `keyCmd` that runs outside the sandbox. `agent-dispatch` reads the key outside the sandbox. `--resume-task` refuses a record whose `bin`, `wrap` or `sandbox` differ from `config.json`, so a job that rewrites its own record cannot take the sandbox off the next run of its session. Narrow gaps stay: `state/` also holds the other jobs' records and, for the moment between a job's dispatch and its start, its key handoff file, so a hostile job running at the same time could read that key or rewrite a record about to start. Treat `srt` here as containment for a careless model, not as a boundary against a hostile one.
+
+- macOS cannot nest one Seatbelt sandbox in another. Under `srt`, `claude` runs only with `"sandbox": "off"`, and `dsh` only as a writer without `native` (`danger-full-access`: its reviewer mode is a sandbox too).
+- `srt` exits 0 when the harness dies of SIGINT or SIGTERM. A job's outcome comes from its own record, never from that exit code.
+- A local model under `srt` needs `"127.0.0.1:<port>"` in `allowedDomains` and an empty `NO_PROXY` inside the sandbox: `srt` sets `NO_PROXY=localhost,127.0.0.1,…`, and on macOS the sandbox reaches loopback only on `srt`'s proxy ports. For example, end `wrap` with `"env", "NO_PROXY=", "no_proxy="`. Whether the harness's HTTP client then sends a plain-`http://` request to loopback through `srt`'s proxy was not verified ([09 §6](./docs/research/universal-dispatchers/09-sandboxing-and-credentials.md), rule 4; §10, item 5).
+- On macOS keep `allowLocalBinding: false`. `true` opens every localhost port, a local proxy's included (a TUN or VPN client's), and the egress allowlist no longer holds.
+- `SANDBOX_RUNTIME=1` in the environment means `agent-dispatch` itself already runs inside `srt` (in a sandboxed Claude Code Bash, for example): a nested Seatbelt does not start.
+- Who sees the key: `claude` hides it from the model's Bash, `dsh` strips it from its tools, but OpenCode's and pi's bash see it. Under `srt`, `credentials.envVars` with `"mode": "mask"` (plus the experimental `network.tlsTerminate`) gives the harness a stand-in instead; where that still leaks: [09 §2.4](./docs/research/universal-dispatchers/09-sandboxing-and-credentials.md).
 
 ### What providers allow — for reference, as of 2026-10-20; your responsibility
 
@@ -353,6 +493,7 @@ The upstream `subagent-driven-development` skill is replaced by `dev-orchestrato
 ├── tests/test-zcode-dispatch.sh     # ZCode wrapper tests (stubbed CLI)
 ├── tests/test-agent-core.sh         # Job core tests (trivial adapter)
 ├── tests/test-agent-dispatch.sh     # agent-dispatch tests (stubbed wrappers)
+├── tests/test-adapter-*.sh          # Harness adapter tests (stubbed harnesses)
 ├── tests/test-orchestrator-defaults.sh  # Built-in roles, commands and caps unchanged
 └── vendor/codex-companion/          # Vendored OpenAI companion runtime
 ```
@@ -378,6 +519,7 @@ bash tests/test-pipeline-context.sh
 bash tests/test-zcode-dispatch.sh
 bash tests/test-agent-core.sh
 bash tests/test-agent-dispatch.sh
+for t in claude opencode pi dsh; do bash tests/test-adapter-$t.sh; done
 bash tests/test-orchestrator-defaults.sh
 ```
 

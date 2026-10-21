@@ -35,6 +35,8 @@ npm install -g @openai/codex
 codex login
 ```
 
+Codex нужен только встроенной схеме. Если аккаунта OpenAI нет, не ставьте его, но до первого запуска пайплайна назначьте свои профили всем ролям, во встроенной цепочке которых есть профиль Codex (`plan-reviewer`, `spec-reviewer`, `implementer`, `implementer.risk`, `implementer.escalation`, `control-review`, `final-review`, `adhoc-review`): см. [Маршрутизация ролей](#маршрутизация-ролей), пример для тех, у кого нет OpenAI. Тогда `agent-dispatch doctor` покажет неиспользуемые профили Codex как WARN, а не FAIL.
+
 Необязательно — имплементер по умолчанию, **GLM-5.3-Flash через ZCode от Z.ai**: установите [ZCode](https://github.com/zai-org/ZCode) — macOS: ZCode.app в `/Applications`; Linux: см. [Linux: ZCode для канала GLM](#linux-zcode-для-канала-glm) ниже; Windows пока не поддерживается — и один раз сохраните API-ключ GLM Coding Plan со страницы <https://z.ai/manage-apikey/apikey-list>: выполните в терминале `zcode-dispatch api-key set` и вставьте ключ в скрытое приглашение. Ключ станет провайдером собственного шаблона ZCode «Z.ai Coding Plan» в приватном конфиге обёртки и не истекает. OAuth-входа нет: `zcode login` в CLI не хранит refresh-токен и живёт около часа (подробности — в скилле `zcode-invocation`, раздел «One-time setup»). Без ключа `zcode-dispatch doctor` не проходит, и пайплайн реализует фазы на Codex Luna `max` — с объявлением, никогда молча. За локальным прокси экспортируйте `ZCODE_HTTP_PROXY=http://<host>:<port>`, если фоновые запуски падают с сетевой ошибкой (CLI игнорирует `HTTP(S)_PROXY` и системный прокси macOS; обёртка передаёт эту переменную через белый список). CLI получает окружение по белому списку; дополнительные переменные можно явно передать через `ZCODE_ENV_PASSTHROUGH="NAME1,NAME2"`.
 
 #### Linux: ZCode для канала GLM
@@ -134,13 +136,13 @@ Companion runtime уже вендорится. Отдельный Claude Code-п
 
 `max` зарезервирован за имплементерами GLM и Luna (или по явному запросу пользователя); `ultra` никогда не выбирается автоматически — только по явному запросу пользователя. Квота GLM: 2026-10-14 бонус 1.5× для ZCode по замеру не определён (ожидаемые/списанные кредиты = 3.02 по стандартному тарифу или 1.51, если окно пришлось на непиковые часы; подробности в docs/zcode-cli-findings.md).
 
-Эта таблица — встроенная схема: без `config.json` работает ровно она. Любую роль можно переназначить на свой профиль — см. [Свои харнессы и API](#свои-харнессы-и-api).
+Эта таблица — встроенная схема: без `config.json` работает ровно она. Любую роль, в том числе роли в сессии, можно переназначить на свой профиль — см. [Маршрутизация ролей](#маршрутизация-ролей).
 
 ## Свои харнессы и API
 
 `bin/agent-dispatch` назначает ролям пайплайна **профили**. Профиль — это харнесс, способ оплаты (собственный вход харнесса или API-ключ), модель и effort. У роли **цепочка** профилей: первый — основной, остальные — запасные, по порядку. Без файла настроек ничего не меняется.
 
-В этом выпуске (0.12.0) есть слой маршрутизации (профили, ключи, `route`, `doctor`, статус задач и сквозной вызов ZCode и Codex) и адаптеры для `claude -p`, DeepSeek Harness (`dsh`), OpenCode и pi. Роли, которые исполняются в сессии, можно перевести на другую модель или effort Claude, а внешние роли — на другие модели Codex или на профиль любого из этих четырёх харнессов.
+`agent-dispatch` — это слой маршрутизации (профили, ключи, `route`, `doctor`, статус задач, сквозной вызов ZCode и Codex) и адаптеры для `claude -p`, DeepSeek Harness (`dsh`), OpenCode и pi. Любую роль можно запустить на любом профиле, в том числе роли, которые по умолчанию исполняются в сессии.
 
 `agent-dispatch` лежит в каталоге `bin/` плагина. В своём терминале вызывайте его по абсолютному пути — Claude подскажет его.
 
@@ -189,13 +191,99 @@ agent-dispatch doctor --profile deepseek-claude --probe             # 3. про�
   - Linux: `["secret-tool", "lookup", "service", "deepseek"]`
   - любая ОС: `["op", "read", "op://…"]`
 
-Ключ попадает только в окружение процесса харнесса — не в его argv, не в файлы настроек и не в чат. pi сам записывает увиденное в свои файлы сессии; после каждого запуска они перезаписываются с вычищенным ключом. Пайплайн никогда не запускает `key set` и не просит у вас ключ.
+Ключ попадает только в окружение процесса харнесса — не в его argv, не в файлы настроек и не в чат. Пайплайн никогда не запускает `key set` и не просит у вас ключ.
 
 Профили с общим ключом, общим входом харнесса (вход OpenCode или pi считается отдельно для каждого провайдера) или общей меткой `shares` выбывают вместе при `auth` или `quota`. У встроенного `glm` метка `zai-coding-plan`, поэтому запасной профиль с API Z.ai и той же меткой не упрётся в ту же исчерпанную квоту.
 
+Каждый адаптер написан под одну версию харнесса. Сам Claude Code 2.1.302 запускался в ходе исследования, на локальных заглушках ([01](./docs/research/universal-dispatchers/01-claude-code-headless.md)); OpenCode, pi и dsh не запускались, их адаптеры написаны по исходникам и документации этих харнессов (`skills/agent-invocation`, «Facts from sources»). Ни один адаптер не запускался с настоящим провайдером: тесты идут только на заглушках, поэтому `doctor --probe` на вашем ключе — первая живая проверка. Другая версия допускается: `doctor` печатает одну строку «not checked» и запуск не блокирует. Исключение — OpenCode 2: у него другой CLI, и адаптер его отвергает (`launch`; см. [OpenCode](#opencode)). Подробно о харнессах: [docs/research/universal-dispatchers/](./docs/research/universal-dispatchers/) и [спецификация](./docs/superpowers/specs/2026-10-20-universal-dispatchers-design.md) (§2–§4).
+
+### Claude Code (`claude -p`)
+
+Установите сам Claude Code (`npm install -g @anthropic-ai/claude-code`); адаптер написан под 2.1.302.
+
+| Чем платите | Пресет | Что важно |
+|---|---|---|
+| Подписка Claude (Pro/Max) | `claude-sub` (`opus`, `xhigh`) | Ваш собственный вход `claude`. Задачи тратят те же лимиты подписки, что и ваша основная сессия ([07 AN4](./docs/research/universal-dispatchers/07-tos-matrix.md)). Если `settings.json` в каталоге входа задаёт ключ, эндпоинт или `apiKeyHelper`, профиль отвергается (`doctor` FAIL `user-settings`). Второй аккаунт: `"home": "isolated"`, затем `agent-dispatch profile env <имя> -- claude` и `/login`. |
+| API-ключ, Anthropic-совместимый эндпоинт | таблица ниже | `key set <имя ключа>`. Профиль работает в собственном каталоге конфигурации без входа claude.ai, ровно с одной переменной ключа. WebSearch и WebFetch запрещены. |
+| Локальная модель | `claude-local` | Без ключа (`"auth": "none"`); см. ниже. |
+
+Эндпоинты и рецепты окружения взяты из собственных инструкций провайдеров для Claude Code ([06 §1](./docs/research/universal-dispatchers/06-providers-and-plans.md)):
+
+| Пресет | Имя ключа | `endpoint` | Модель | Окружение пресета |
+|---|---|---|---|---|
+| `claude-zai` | `zai` | `https://api.z.ai/api/anthropic` | `glm-5.3[1m]` | `API_TIMEOUT_MS=3000000`, `CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000`; `shares: zai-coding-plan` |
+| `claude-deepseek` | `deepseek` | `https://api.deepseek.com/anthropic` | `deepseek-v4-pro[1m]` | `CLAUDE_CODE_AUTO_COMPACT_WINDOW=786432` |
+| `claude-kimi` (Kimi Platform) | `kimi` | `https://api.moonshot.ai/anthropic` | `kimi-k3[1m]` | — |
+| `claude-minimax` | `minimax` | `https://api.minimax.io/anthropic` | `MiniMax-M3.1-Flash[1m]` | `CLAUDE_CODE_AUTO_COMPACT_WINDOW=524288` |
+| `claude-alibaba` (pay-as-you-go) | `alibaba` | `https://<WorkspaceId>.<region>.maas.aliyuncs.com/apps/anthropic`, `<region>` — один из `ap-southeast-1`, `us-east-1`, `eu-central-1`, `ap-northeast-1`, `cn-beijing` | `<model>`, например `qwen3.8-max` | эндпоинт задаётся через `--set endpoint=…` |
+| `claude-openrouter` | `openrouter` | `https://openrouter.ai/api` | `<model>` | ключ Bearer, `ANTHROPIC_API_KEY=""` |
+
+- `[1m]` сообщает Claude Code, что у модели окно 1M; для незнакомого id он считает 200K.
+- Z.ai: на этом эндпоинте тариф определяется типом ключа (Coding Plan или Standard API) ([06 §1.3](./docs/research/universal-dispatchers/06-providers-and-plans.md)). `shares: zai-coding-plan` — для ключа Coding Plan, это квота встроенного `glm`; для ключа Standard уберите метку: `--set shares=`.
+- Kimi Platform на Tier 0 пропускает один запрос за раз: добавьте `--set maxParallel=1`.
+- `effort` идёт в `--effort` и в `CLAUDE_CODE_EFFORT_LEVEL`; `CLAUDE_CODE_EFFORT_LEVEL` в `env` профиля (рецепты некоторых провайдеров ставят `max`) перекрывает поле `effort`.
+- Опции: `options.tools` (набор инструментов пишущей роли, по умолчанию `Bash,Read,Edit,Write,Glob,Grep`), `options.settings` (сливается с `--settings` задачи), `options.maxTurns`.
+- Ревьюер получает Read, Glob, Grep и команды только для чтения: `git show`, `git diff`, `git log`, `git status`. Ключ не доходит до Bash модели (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`).
+
+**Локальная модель.** `agent-dispatch profile add local --from claude-local --set endpoint=http://127.0.0.1:<порт> --model <id> --set env.CLAUDE_CODE_MAX_CONTEXT_TOKENS=<ctx>`, порт вашего сервера: llama-server 9931, LM Studio 1234, Ollama 11434 ([08 §3](./docs/research/universal-dispatchers/08-local-models.md)). Пресет запускает одну задачу за раз (`maxParallel: 1`), увеличивает тайм-ауты простоя потока Claude Code, чтобы их хватало на долгий prefill, и выключает блок атрибуции, который мешает серверу переиспользовать кэш промпта между задачами.
+
+- `<ctx>` — контекст, который сервер реально даёт одному запросу (без этого `--set` остаётся значение пресета, 131072); `GET /props` у llama-server показывает `n_ctx` и число слотов. Чтобы поменять его позже, исправьте `env` профиля в `config.json`: `profile add` не перезаписывает существующее имя.
+- У Ollama контекст по умолчанию 4k, если у видеокарты меньше 24 ГБ памяти, а всё, что не влезло, отбрасывается молча. Поднимите его через `OLLAMA_CONTEXT_LENGTH` (Ollama советует не меньше 64k для инструментов программирования).
+- Память: на 16 ГБ локальная модель не годится в имплементеры; на 32–48 ГБ ей можно давать небольшие, хорошо описанные фазы. Никогда — фазы SECURITY/DATA_LOSS, планирование и блокирующее ревью ([08 §9](./docs/research/universal-dispatchers/08-local-models.md)). Маршрут задаётся ролью, а не фазой: отправить на один профиль только небольшие фазы нельзя, а `"implementer": ["local"]` (или `SP_IMPLEMENTER=local`) отдаёт локальной модели все фазы, раунды исправлений и финальную волну фиксов этой роли. Поэтому ставьте её последней в цепочке `implementer` — запасной, когда облачные каналы недоступны или исчерпали квоту, — или на `quickfix` (тривиальные правки одного файла). Никогда — первой в `implementer` и никогда — на `implementer.risk`, `implementer.escalation`, `plan-writer`, `plan-reviser`, `gate` или роль ревьюера.
+
+### OpenCode
+
+| | |
+|---|---|
+| Установка | `npm i -g opencode-ai@1.19.3` или `brew install anomalyco/tap/opencode`. Не `brew install opencode`: это OpenCode 2, адаптер его отвергает с подсказкой поставить v1. Поддерживается 1.19.x |
+| Вход | Пресет `opencode-login` (`"auth": "login"`): `opencode auth login` → GitHub Copilot, ChatGPT Plus/Pro, OpenCode Go или GLM Coding Plan (провайдеры `github-copilot`, `openai`, `opencode-go`, `zai-coding-plan`); модель — `--model <provider>/<model>`. Вход GLM Coding Plan тратит квоту встроенного `glm`: добавьте `--set shares=zai-coding-plan`, чтобы профиль выбывал вместе с `glm` при `auth` или `quota` |
+| Ключ | Пресет `opencode-key`: `--key <имя> --set keyVar=<VAR>`: `ZHIPU_API_KEY` для `zai-coding-plan`, `DEEPSEEK_API_KEY` для `deepseek`, `MINIMAX_API_KEY` для `minimax`. Ключ Coding Plan для `zai-coding-plan` тратит ту же квоту: добавьте и `--set shares=zai-coding-plan` (для ключа Standard — не нужно) |
+| Модель, effort | `<provider>/<model>`, id из вывода `opencode models <provider>`; `effort` → `--variant` |
+| Каталог | Профиль со входом использует ваши собственные каталоги OpenCode. Профиль с ключом получает свой, `homes/<профиль>/`, и в нём не должно быть сохранённого входа (`data/opencode/auth.json` перекрыл бы ключ: `doctor` FAIL, задача отвергается). Свой вход (второй аккаунт): `"home": "isolated"`, затем `agent-dispatch profile env <имя> -- opencode auth login` |
+| Опции | `options.permission`: дополнительные правила разрешений OpenCode — для пишущей роли все, для ревьюера только `deny`. `options.plugins: true` загружает ваши внешние плагины OpenCode (по умолчанию выключены: `OPENCODE_PURE=1`) |
+| Ревьюер | Собственный агент только на чтение: read, grep, glob, list и `git show/diff/log/status`. Ни правок, ни других команд, ни веба, ни файлов `.env`, ничего за пределами репозитория, кроме временных каталогов |
+| Кто видит ключ | bash OpenCode его видит (см. [Песочницу](#песочница-по-желанию)); собственное хранилище сессий OpenCode сохраняет то, что напечатал его bash |
+
+### pi
+
+| | |
+|---|---|
+| Установка | `npm i -g --ignore-scripts @earendil-works/pi-coding-agent@1.3.0` (Node ≥ 22.19). Поддерживается 1.3.x. Поиску файлов и grep в pi нужны `fd` и `rg` в `PATH` (адаптер держит pi офлайн, поэтому pi их не скачает; `doctor` проверяет) |
+| Ключ | Пресет `pi-key`: `--key <имя> --set keyVar=<VAR>`: `ZAI_API_KEY` для `zai`, `DEEPSEEK_API_KEY` для `deepseek`, `OPENROUTER_API_KEY` для `openrouter`. Модель `<provider>/<id>`; `effort` → `--thinking`. `zai` у pi — эндпоинт Coding Plan Z.ai: с ключом Coding Plan добавьте `--set shares=zai-coding-plan` (это квота встроенного `glm`), чтобы профиль выбывал вместе с `glm` при `auth` или `quota`; ключ Standard там оплачивается pay-as-you-go |
+| Вход | «Sign in with ChatGPT»: `"auth": "login"`, затем `/login` в TUI pi (в вашем собственном каталоге pi или, с `"home": "isolated"`, через `agent-dispatch profile env <имя> -- pi`). Для входов pi в Anthropic и Copilot пресетов нет: там pi представляется другим клиентом |
+| Каталог | Профиль с ключом работает в `homes/<профиль>/pi` (`agent-dispatch profile env <имя>` печатает его как `PI_CODING_AGENT_DIR`). Сохранённый там вход (`auth.json`) перекрыл бы ключ, поэтому профиль отвергается |
+| Свой эндпоинт | `models.json` в этом каталоге с `apiKey` вида `"$<keyVar>"`, чтобы ключ по-прежнему брался из хранилища; ключ, записанный там текстом, перекрыл бы `keyVar` (`doctor` FAIL `pi-auth`). Формат: [03 §5.3](./docs/research/universal-dispatchers/03-pi.md) |
+| Опции | `options.extensions`: по одному `-e` на элемент, например `["builtin:llama.cpp", "<путь>"]`; встроенные расширения pi — `builtin:mcp`, `builtin:llama.cpp`, `builtin:codemode`, `builtin:tool-search` |
+| Ревьюер | `read,grep,find,ls` — **без bash, значит, без git**: diff он видит только в пакете ревью |
+| Кто видит ключ | bash pi его видит (см. [Песочницу](#песочница-по-желанию)); файлы сессии pi после каждого запуска перезаписываются с вычищенным ключом |
+
+`models.json` для своего эндпоинта, при `"keyVar": "MY_KEY"` и `"model": "<provider>/<id>"` в профиле:
+
+```json
+{ "providers": { "<provider>": { "baseUrl": "<url>", "api": "openai-completions", "apiKey": "$MY_KEY", "models": [{ "id": "<id>" }] } } }
+```
+
+### DeepSeek Harness (`dsh`)
+
+| | |
+|---|---|
+| Установка | `npm i -g @deepseek-ai/dsh@0.2.1-rc.2` (Node `^22.19` или `>=24`). `dsh` из Homebrew — другая программа, адаптер её отвергает. Поддерживается 0.2.x |
+| Ключ | У DeepSeek нет подписки, у dsh нет входа. Пресет `dsh-deepseek`: `key set deepseek` (ключ идёт в `DEEPSEEK_API_KEY`). Либо `"auth": "native"`: `DEEPSEEK_API_KEY=…` в `$DSH_HOME/.env` (по умолчанию `~/.dsh/.env`) — но dsh сначала читает `.env` в репозитории, и ключ оттуда перекрывает ваш (`doctor` предупреждает) |
+| Каталог | `"home": "user"` (по умолчанию): `$DSH_HOME` или `~/.dsh`. `"isolated"`: `homes/<профиль>/dsh` (`agent-dispatch profile env <имя>` печатает его `DSH_HOME`) |
+| Модель, effort | `deepseek-v4-pro` (пресет) или `deepseek-flash` (умолчание самого dsh); effort `off`, `low`, `high` (по умолчанию) или `max` |
+| Эндпоинт | `endpoint` — это `baseURL` dsh (по умолчанию `https://api.deepseek.com/anthropic`), например ваш собственный шлюз; `.env` репозитория его не меняет |
+| Опции | `options.sessionLog: true` снова включает выгрузку журнала сессий dsh (по умолчанию выключена). `options.agentsHome: "user"` разрешает dsh читать общий `~/.agents`. `options.patch` добавляет строки в patch-файл dsh; переменная ключа, `baseURL` и строки разрешений остаются за адаптером |
+| Ревьюер | Режим dsh `read-only`, песочница ОС: читает и запускает команды, любая запись запрещена. Пишущая роль работает в `danger-full-access` |
+| Кто видит ключ | dsh убирает переменные `*KEY*` и `*TOKEN*` из окружения своих инструментов |
+
+### ZCode и Codex
+
+- **ZCode** (`glm`): настройка — как в [Быстром старте](#1-установите-зависимости) и [Linux: ZCode для канала GLM](#linux-zcode-для-канала-glm). Профиль без изменений передаётся в `zcode-dispatch`; модель закрепляет обёртка.
+- **Codex** (`luna`, `sol`, `astra`, `astra-high` и ваши профили `codex`): `codex login`, как в [Быстром старте](#1-установите-зависимости); профиль передаётся в `codex-dispatch`. Здесь описаны только модели OpenAI: сторонние провайдеры в собственной конфигурации Codex не описаны и не поддерживаются.
+
 ### Маршрутизация ролей
 
-| Роль (имя в `config.json`) | Где в пайплайне | По умолчанию | Исполнение |
+| Роль (имя в `config.json`) | Где в пайплайне | По умолчанию | Исполнение по умолчанию |
 |---|---|---|---|
 | `plan-writer` | автор плана | `opus-xhigh` | в сессии (Agent tool) |
 | `plan-reviser` | правки плана | `opus-high` | в сессии |
@@ -238,12 +326,21 @@ agent-dispatch doctor --profile deepseek-claude --probe             # 3. про�
 - Рисковые фазы и эскалации идут на Opus через подписку Claude.
 - Ревьюеры работают на DeepSeek, а запасные — Copilot и API GLM.
 
+Его профили создаются из пресетов выше; `deepseek-claude` — тот, что в разделе [Профиль за три шага](#профиль-за-три-шага):
+
+```bash
+agent-dispatch profile add deepseek-dsh --from dsh-deepseek   # тот же ключ deepseek
+agent-dispatch profile add claude-sub   --from claude-sub
+agent-dispatch profile add oc-copilot   --from opencode-login --model github-copilot/<model>   # id: opencode models github-copilot
+agent-dispatch profile add glm-api      --from claude-zai     # key set zai
+```
+
 Ещё о маршрутизации:
 
-- **Роли в сессии.** Их можно назначить на свои `inproc`-профили, то есть на другую модель или effort Claude. Например, на Claude Pro можно задать `"sonnet-high": { "harness": "inproc", "model": "sonnet", "effort": "high" }` и `"plan-writer": ["sonnet-high"]`. Запуск этих ролей на внешних харнессах появится в одном из следующих выпусков. До тех пор `route` берёт из такой цепочки только профили для сессии (а если их нет — встроенный профиль) и печатает одну строку-пояснение. `final-review` тоже начинается в сессии: его профили для сессии всегда идут первыми (если вы их не задали — `opus-xhigh`), а внешние профили запускаются только после них, как запасные, в каком бы порядке вы их ни записали. Поэтому `"final-review": ["astra"]` всё равно начнётся на `opus-xhigh`, а `route --all` напечатает `routes: default` и пояснение: он сравнивает цепочки, которые действительно будут работать.
+- **Роли в сессии.** Их, как и остальные роли, можно назначить на любой профиль. Профиль `inproc` запускает их в сессии на другой модели или effort Claude: например, на Claude Pro можно задать `"sonnet-high": { "harness": "inproc", "model": "sonnet", "effort": "high" }` и `"plan-writer": ["sonnet-high"]`. Любой другой профиль запускает их фоновой задачей на своём харнессе. Роли, которые пишут файлы или запускают тесты проекта, получают право записи; гейт, ревью фаз и проверка интеграции всё равно не должны менять файлы — оркестратор сравнивает рабочее дерево до и после и один раз спрашивает вас, если что-то изменилось. `diagnosis` и `final-review` работают только на чтение — кроме ZCode (`glm`), у которого нет режима только чтения: там они тоже получают право записи (`route` предупреждает) и проходят ту же проверку до и после. На профиле с выключенной песочницей право записи — это полный доступ, как у имплементера ([Песочница](#песочница-по-желанию)), а проверка видит только рабочее дерево. Если тесты оставляют файлы, которых нет в `.gitignore`, добавьте их туда. На внешнем профиле `frontend.*` получает короткий бриф по дизайну вместо скилла `frontend-design`. Встроенные цепочки начинаются в сессии, поэтому без `config.json` ничего не меняется; `route --all` показывает каждую роль, чья цепочка отличается от встроенной, включая `"final-review": ["astra"]`.
 - **Как пайплайн читает маршруты.**
   - При старте и после сжатия контекста оркестратор вызывает `agent-dispatch route --all`. Ответ `routes: default` не объявляется. Иначе вы получите одну строку с вашими отличиями.
-  - Перед каждой отправкой ревьюеру, при первой отправке фазы имплементеру и при каждой смене профиля он вызывает `route <роль>`, поэтому ничего не нужно помнить. Повторы и раунды исправлений фазы остаются на её текущем профиле.
+  - Перед каждой отправкой ревьюеру или роли в сессии (автору плана, гейту, диагностике и остальным), при первой отправке фазы имплементеру и при каждой смене профиля он вызывает `route <роль>`, поэтому ничего не нужно помнить. Повторы и раунды исправлений фазы остаются на её текущем профиле.
   - После `routes: default` эти вызовы не делаются, и отвечает встроенная схема.
   - Переход на следующий профиль цепочки объявляется одной строкой, например `Channel implementer: glm-api → deepseek-dsh (glm-api: quota).` Переходы между встроенными профилями объявляются прежними строками, например `GLM channel failed … falls back to Luna max`.
 - **Kill switch.**
@@ -251,6 +348,49 @@ agent-dispatch doctor --profile deepseek-claude --probe             # 3. про�
   - С вашей собственной маршрутизацией (`route --all` печатает не `routes: default`) фраза «без <профиль>» исключает любой профиль из всех цепочек до конца сессии; со встроенной схемой работают только «без GLM» и «через Luna», как раньше. В примере выше «без GLM» отправит все фазы, включая рисковые, на `deepseek-dsh`.
   - `SP_IMPLEMENTER=luna` работает как раньше. `SP_IMPLEMENTER=<профиль>` с профилем, который вы сами задали в `config.json` и который работает вне сессии, делает его имплементером для всех фаз, кроме фронтенда, и выключает GLM; если он упадёт, пайплайн спросит вас, а не перейдёт к другому профилю. `SP_IMPLEMENTER=glm` называет профиль по умолчанию и ничего не меняет. Любое другое значение, как и раньше, игнорируется: встроенное имя вроде `sol` (чтобы имплементером стал Sol, напишите в `config.json` `"implementer": ["sol"]`), неизвестное имя, профиль для сессии. GLM остаётся включённым. Если своих профилей у вас нет, пайплайн ничего не сообщает, а если есть — при старте выводит одну строку-предупреждение.
 - **Правило семейств.** Во встроенной схеме автор и ревьюер артефакта принадлежат разным модельным семействам. `agent-dispatch` вашу маршрутизацию на это не проверяет. Ревьюер должен быть из другого семейства моделей, чем автор плана и имплементер.
+
+### Песочница (по желанию)
+
+`sandbox` и `wrap` есть только у профилей `claude`, `opencode`, `pi` и `dsh`; `doctor` проверяет оба поля. По умолчанию песочница выключена (`"sandbox": "off"`): пишущая роль тогда работает с полным доступом (claude `bypassPermissions`, dsh `danger-full-access`), как ZCode с `--mode yolo`.
+
+| Харнесс | `"sandbox": "native"` |
+|---|---|
+| `claude` | Песочница Claude Code для Bash; пишущая роль работает с `acceptEdits` (правки только в репозитории). У Bash нет сети, пока вы не добавите домены в `sandbox.network.allowedDomains` через `options.settings`. Нужен `/usr/bin/sandbox-exec` на macOS, `bubblewrap` и `socat` на Linux |
+| `dsh` | `workspace-write`: запись только в репозитории и во временных каталогах. В связанном git worktree (параллельный трек) `git commit` может быть запрещён, так как метаданные git лежат снаружи (не проверено); если так, не назначайте параллельные треки на dsh |
+| `opencode`, `pi` | Своей песочницы нет: `native` ничего не делает (`doctor` так и пишет). Используйте `wrap` |
+
+У профилей `codex` и `zcode` нет ни одного из этих полей (с ними `config.json` отклоняется): Codex всегда работает в своей песочнице — `workspace-write` с `--write`, только чтение без него; ZCode всегда работает с `--mode yolo`.
+
+**`wrap`** — префикс argv для команды харнесса, например sandbox-runtime от Anthropic, `srt` (`@anthropic-ai/sandbox-runtime`, бета), или контейнер. Ставьте `srt` глобально (`npm i -g @anthropic-ai/sandbox-runtime`; Node ≥ 22.12, на Linux ещё `bwrap`, `socat`, `rg`) и никогда — внутрь репозитория, с которым работает пайплайн: копию там можно переписать изнутри песочницы. Профиль pi под `srt` и набросок его настроек ([09 §7.3](./docs/research/universal-dispatchers/09-sandboxing-and-credentials.md); не запускалось — полный список ключей в §2.3):
+
+```json
+"pi-deepseek": { "harness": "pi", "auth": { "key": "deepseek" }, "keyVar": "DEEPSEEK_API_KEY", "model": "deepseek/<id>",
+                 "wrap": ["srt", "--settings", "/Users/me/.config/srt/pi.json", "--"] }
+```
+
+```json
+{
+  "network": { "allowedDomains": ["api.deepseek.com:443"], "strictAllowlist": true, "allowLocalBinding": false },
+  "filesystem": {
+    "denyRead": ["~/.ssh", "~/.aws", "~/.config/gh", "~/.config/gcloud", "~/.azure", "~/.kube", "~/.docker",
+                 "~/.netrc", "~/.git-credentials", "~/.npmrc", "~/.pypirc", "~/.codex", "~/.zcode", "~/.pi", "~/.dsh",
+                 "~/.local/share/opencode", "~/.claude", "~/.claude.json", "~/Library/Keychains"],
+    "allowRead": ["~/.claude/plugins/data/superpowers-strigov-ver-agents/state",
+                  "~/.claude/plugins/data/superpowers-strigov-ver-agents/homes/pi-deepseek"],
+    "allowWrite": ["<repository>", "~/.claude/plugins/data/superpowers-strigov-ver-agents/state",
+                   "~/.claude/plugins/data/superpowers-strigov-ver-agents/homes/pi-deepseek"]
+  }
+}
+```
+
+`allowRead` и `allowWrite` открывают в каталоге данных плагина только два места: `state/` (pi пишет файлы сессий в `state/<workspace>/jobs/<id>/sessions`) и каталог этого профиля `homes/<профиль>/`; остальное в `~/.claude` закрывает `denyRead`. Весь каталог данных открывать нельзя: в `keys/` лежат все сохранённые ключи, в каталогах других профилей — их входы, а задача, которая может писать в `config.json`, снимет свой `wrap` или добавит `keyCmd`, который выполнится вне песочницы. Ключ `agent-dispatch` читает вне песочницы. `--resume-task` отказывает, если `bin`, `wrap` или `sandbox` в записи задачи не совпадают с `config.json`, поэтому задача, переписавшая свою запись, не снимет песочницу с продолжения своей сессии. Узкие щели остаются: в `state/` лежат и записи других задач, а на мгновение между постановкой задачи и её стартом — файл передачи её ключа, так что враждебная задача, работающая в то же время, может прочитать этот ключ или переписать запись ещё не стартовавшей задачи. Считайте `srt` здесь защитой от небрежной модели, а не границей против враждебной.
+
+- macOS не умеет вкладывать одну песочницу Seatbelt в другую. Под `srt` `claude` работает только с `"sandbox": "off"`, а `dsh` — только как пишущая роль без `native` (`danger-full-access`: его режим ревьюера тоже песочница).
+- `srt` завершается с кодом 0, когда харнесс убит SIGINT или SIGTERM. Итог задачи берётся из её собственной записи, а не из этого кода.
+- Локальной модели под `srt` нужны `"127.0.0.1:<порт>"` в `allowedDomains` и пустой `NO_PROXY` внутри песочницы: `srt` ставит `NO_PROXY=localhost,127.0.0.1,…`, а на macOS песочница видит loopback только на портах прокси `srt`. Например, закончите `wrap` на `"env", "NO_PROXY=", "no_proxy="`. Отправит ли после этого HTTP-клиент харнесса запрос к loopback по plain `http://` через прокси `srt`, не проверено ([09 §6](./docs/research/universal-dispatchers/09-sandboxing-and-credentials.md), правило 4; §10, пункт 5).
+- На macOS держите `allowLocalBinding: false`. `true` открывает все порты localhost, включая локальный прокси (TUN- или VPN-клиента), и белый список выхода в сеть перестаёт действовать.
+- `SANDBOX_RUNTIME=1` в окружении значит, что сам `agent-dispatch` уже работает внутри `srt` (например, в Bash Claude Code с песочницей): вложенный Seatbelt не запустится.
+- Кто видит ключ: `claude` прячет его от Bash модели, `dsh` убирает из окружения своих инструментов, а bash OpenCode и pi его видит. Под `srt` `credentials.envVars` с `"mode": "mask"` (плюс экспериментальный `network.tlsTerminate`) отдаёт харнессу подставное значение; где утечка всё же возможна — [09 §2.4](./docs/research/universal-dispatchers/09-sandboxing-and-credentials.md).
 
 ### Что разрешают провайдеры — для справки, по состоянию на 2026-10-20; ответственность ваша
 
@@ -353,6 +493,7 @@ Upstream-скилл `subagent-driven-development` заменён на `dev-orche
 ├── tests/test-zcode-dispatch.sh     # Тесты обёртки ZCode (CLI-заглушка)
 ├── tests/test-agent-core.sh         # Тесты ядра задач (тривиальный адаптер)
 ├── tests/test-agent-dispatch.sh     # Тесты agent-dispatch (заглушки обёрток)
+├── tests/test-adapter-*.sh          # Тесты адаптеров харнессов (заглушки харнессов)
 ├── tests/test-orchestrator-defaults.sh  # Встроенные роли, команды и лимиты не изменились
 └── vendor/codex-companion/          # Вендорный companion runtime OpenAI
 ```
@@ -378,6 +519,7 @@ bash tests/test-pipeline-context.sh
 bash tests/test-zcode-dispatch.sh
 bash tests/test-agent-core.sh
 bash tests/test-agent-dispatch.sh
+for t in claude opencode pi dsh; do bash tests/test-adapter-$t.sh; done
 bash tests/test-orchestrator-defaults.sh
 ```
 

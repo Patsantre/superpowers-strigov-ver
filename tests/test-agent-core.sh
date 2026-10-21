@@ -1105,6 +1105,23 @@ process.exit(a.some((x, i) => x === "--resume" && a[i + 1] === process.env.S) ? 
     expect_refusal "16 resume on another profile: exit 2" "ran on profile rp, not p1" --profile p1 --resume-task "$r1"
     expect_refusal "16 resume after the profile's model changed: exit 2" "ran with another model of profile rp" \
         --profile rp --profile-json '{"harness":"plain","model":"m2"}' --resume-task "$r1"
+    # bin, wrap and sandbox are bound too: a record rewritten from inside a sandbox cannot resume unsandboxed.
+    expect_refusal "16 resume after the profile gained a wrap: exit 2" "ran with another wrap of profile rp" \
+        --profile rp --profile-json '{"harness":"plain","model":"m1","wrap":["env"]}' --resume-task "$r1"
+    REC_FILE="$JOBS/$r1.json" node -e '
+const fs = require("node:fs");
+for (const f of [process.env.REC_FILE, `${process.env.REC_FILE}.terminal`]) {
+  if (!fs.existsSync(f)) continue;
+  const r = JSON.parse(fs.readFileSync(f, "utf8")); r.profileConfig = { ...r.profileConfig, bin: "/tmp/elsewhere", wrap: [] }; fs.writeFileSync(f, JSON.stringify(r));
+}'
+    expect_refusal "16 resume of a record whose bin and wrap were rewritten: exit 2" "ran with another bin / wrap of profile rp" \
+        --profile rp --profile-json '{"harness":"plain","model":"m1"}' --resume-task "$r1"
+    REC_FILE="$JOBS/$r1.json" node -e '
+const fs = require("node:fs");
+for (const f of [process.env.REC_FILE, `${process.env.REC_FILE}.terminal`]) {
+  if (!fs.existsSync(f)) continue;
+  const r = JSON.parse(fs.readFileSync(f, "utf8")); delete r.profileConfig.bin; delete r.profileConfig.wrap; fs.writeFileSync(f, JSON.stringify(r));
+}'
     expect_refusal "16 resume of a failed job: exit 2" "is failed / has no session; dispatch --fresh" --profile p1 --resume-task "$quota_id"
     expect_refusal "16 resume of a zt- id: exit 2" "zt- and task- ids resume through their own wrappers" --profile p1 --resume-task zt-0001
     # The adapter's meta (its config dir, recorded at the start) reaches resumeCheck: another CLAUDE_CONFIG_DIR is refused.
