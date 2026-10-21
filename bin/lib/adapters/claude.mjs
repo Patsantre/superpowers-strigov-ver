@@ -7,8 +7,9 @@
 // Auth modes (spec §3.4, §3.6 A1–A2):
 //   login — the user's config dir ($CLAUDE_CONFIG_DIR as inherited, else ~/.claude; "home": "isolated" uses
 //           homes/<p>/claude instead, where the user logs in through `agent-dispatch profile env <p> -- claude`),
-//           `--setting-sources user`, every inherited ANTHROPIC_* removed; a settings.json in that dir that would take the run off the
-//           login (a key, an apiKeyHelper, an endpoint, a cloud provider) refuses the profile (loginOverrides);
+//           `--setting-sources user`, every inherited ANTHROPIC_* removed; a settings.json in that dir, or the profile's
+//           options.settings, that would take the run off the login (a key, an apiKeyHelper, an endpoint, a cloud
+//           provider, a CLAUDE_CODE_OAUTH_TOKEN) refuses the profile (loginOverrides);
 //   key   — homes/<p>/claude, never a claude.ai login, `--setting-sources ""`, exactly one key variable: ANTHROPIC_AUTH_TOKEN
 //           (Bearer) or, with "authHeader": "x-api-key", ANTHROPIC_API_KEY; the other one is "" [01 §6, gotcha 2].
 //           ANTHROPIC_BASE_URL is the profile's endpoint (none: the Anthropic API itself);
@@ -58,10 +59,16 @@ const VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const OWNED_ENV = ["CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL", ...KEY_VARS, "CLAUDE_CODE_ENTRYPOINT", "CLAUDECODE", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"];
 const SANDBOX_OWNED = ["enabled", "failIfUnavailable", "allowUnsandboxedCommands", "autoAllowBashIfSandboxed"];
 // What takes a login profile's runs off the claude.ai login when its config dir's settings.json sets it (spec §3.6
-// A2): claude puts a cloud provider, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY and an apiKeyHelper before the login, and
-// ANTHROPIC_BASE_URL sends the login's token to another endpoint [01 §6]. `--setting-sources user` applies that file's
-// env and apiKeyHelper [01 §9, E18], past the removal of the inherited ANTHROPIC_* (planOf).
-const LOGIN_OVERRIDES = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"];
+// A2): claude puts a cloud provider, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY, an apiKeyHelper and
+// CLAUDE_CODE_OAUTH_TOKEN (a `claude setup-token` subscription token, perhaps of another account) before the /login
+// subscription, and ANTHROPIC_BASE_URL sends the login's token to another endpoint [01 §6]. `--setting-sources user`
+// applies that file's env and apiKeyHelper [01 §9, E18], past the removal of the inherited ANTHROPIC_* (planOf). The
+// profile's own options.settings, carried by the --settings overlay, is checked the same way (ownLoginConflict).
+const LOGIN_OVERRIDES = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_OAUTH_TOKEN"];
+// The cloud provider variables are switches, on for 1, true, yes or on in any case: "0", "false" or "" keep the login
+// (Claude Code's reading of boolean variables; not an experiment in [01]). Every other name counts when non-empty.
+const CLOUD_SWITCHES = new Set(["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"]);
+const SWITCH_ON = ["1", "true", "yes", "on"];
 // ANTHROPIC_CUSTOM_HEADERS adds "Name: value" lines to every request [01 §5]; an Authorization or x-api-key line is a
 // credential as well.
 const AUTH_HEADER_RE = /^\s*(authorization|x-api-key)\s*:/im;
@@ -122,29 +129,38 @@ function widensReviewer(rule) {
 }
 
 // The user settings a login profile loads with `--setting-sources user` (permissions included [01 §9, E18]); an API
-// profile loads no settings source, so {} there.
-function userSettingsOf(profile, ctx, profileName = ctx.profileName) {
-  if (authOf(profile).mode !== "login") return {};
+// profile loads no settings source, so {} there. One leading BOM (files saved by Windows editors) is dropped before
+// parsing, so such a file is checked like any other. A file that exists but is no JSON reads as {} with `unparsed`
+// set: what claude makes of it is unverified (it may still apply it), so doctor warns and the task is not refused.
+function readUserSettings(profile, ctx, profileName = ctx.profileName) {
+  if (authOf(profile).mode !== "login") return { file: null, settings: {}, unparsed: false };
+  const file = path.join(configDirOf(profile, ctx, profileName), "settings.json");
+  const raw = ctx.fs.readFile(file);
+  // A missing file, or an empty one: nothing for claude to apply.
+  if (typeof raw !== "string" || raw.trim() === "") return { file, settings: {}, unparsed: false };
   try {
-    const settings = JSON.parse(ctx.fs.readFile(path.join(configDirOf(profile, ctx, profileName), "settings.json")) ?? "null");
-    return isObject(settings) ? settings : {};
+    const settings = JSON.parse(raw.replace(/^﻿/, ""));
+    return { file, settings: isObject(settings) ? settings : {}, unparsed: false };
   } catch {
-    return {};
+    return { file, settings: {}, unparsed: true };
   }
 }
+
+const userSettingsOf = (profile, ctx, profileName = ctx.profileName) => readUserSettings(profile, ctx, profileName).settings;
 
 const allowRulesOf = (settings) => {
   const allow = isObject(settings?.permissions) ? settings.permissions.allow : null;
   return Array.isArray(allow) ? allow.filter((rule) => typeof rule === "string") : [];
 };
 
-// The entries of a login profile's user settings that would take its runs off the login (LOGIN_OVERRIDES). The
+// The entries of a login profile's user settings (or options.settings) that would take its runs off the login. The
 // profile is refused rather than the entries overridden: the user set them for their own claude, and a "login" profile
 // running on such a key would be reported and linked as the login (spec §3.5) while the key's account pays.
 function loginOverrides(settings) {
   const isSet = (value) => value !== undefined && value !== null && String(value) !== "";
+  const counts = (name, value) => (CLOUD_SWITCHES.has(name) ? isSet(value) && SWITCH_ON.includes(String(value).trim().toLowerCase()) : isSet(value));
   const env = isObject(settings.env) ? settings.env : {};
-  const keys = LOGIN_OVERRIDES.filter((name) => isSet(env[name])).map((name) => `env.${name}`);
+  const keys = LOGIN_OVERRIDES.filter((name) => counts(name, env[name])).map((name) => `env.${name}`);
   if (typeof env.ANTHROPIC_CUSTOM_HEADERS === "string" && AUTH_HEADER_RE.test(env.ANTHROPIC_CUSTOM_HEADERS)) keys.push("env.ANTHROPIC_CUSTOM_HEADERS");
   if (isSet(settings.apiKeyHelper)) keys.push("apiKeyHelper");
   return keys;
@@ -156,6 +172,27 @@ function loginConflict(profile, ctx, profileName = ctx.profileName, settings = u
   if (keys.length === 0) return null;
   const file = path.join(configDirOf(profile, ctx, profileName), "settings.json");
   return `${file} sets ${keys.join(", ")}: claude would use that key or endpoint instead of the claude.ai login (spec §3.6 A2); remove them there, or define an API profile for the key`;
+}
+
+// The same entries in a login profile's own options.settings: the overlay carries them, and --settings outranks the
+// user settings [01 §9]. Refused as well, also the ANTHROPIC_* names that group A would strip: a login profile set up
+// with a key or an endpoint is a mistake to report, not to run. null for every other profile.
+function ownLoginConflict(profile) {
+  if (authOf(profile).mode !== "login" || !isObject(profile.options?.settings)) return null;
+  const keys = loginOverrides(profile.options.settings);
+  if (keys.length === 0) return null;
+  return `options.settings sets ${keys.join(", ")}: a login profile runs on the claude.ai login, not on a key, a key helper, another endpoint or a cloud provider (spec §3.6 A2); remove them from options.settings, or define an API profile for the key`;
+}
+
+// The same names in a login profile's profile.env, which reaches claude's environment. ANTHROPIC_AUTH_TOKEN,
+// ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL are group A there (the core refuses them as mandatory conflicts), so this
+// names the others: CLAUDE_CODE_OAUTH_TOKEN, a cloud switch that is on, an auth header. null for every other profile.
+const GROUP_A_LOGIN = new Set(["env.ANTHROPIC_AUTH_TOKEN", "env.ANTHROPIC_API_KEY", "env.ANTHROPIC_BASE_URL"]);
+function envLoginConflict(profile) {
+  if (authOf(profile).mode !== "login" || !isObject(profile.env)) return null;
+  const keys = loginOverrides({ env: profile.env }).filter((key) => !GROUP_A_LOGIN.has(key));
+  if (keys.length === 0) return null;
+  return `profile.env sets ${keys.map((key) => key.slice("env.".length)).join(", ")}: a login profile runs on the claude.ai login, not on another token or a cloud provider (spec §3.6 A2); remove them from profile.env, or define an API profile for the key`;
 }
 
 // profile.env CLAUDE_CODE_EFFORT_LEVEL wins over the effort field (§3.6 A7: a copied provider recipe).
@@ -256,8 +293,8 @@ function planOf(req, ctx, { probe, refuse = true }) {
   // {} for an API profile: it loads no settings source.
   const user = userSettingsOf(profile, ctx, req.profileName);
   if (refuse && mode === "login") {
-    const conflict = loginConflict(profile, ctx, req.profileName, user);
-    if (conflict) throw new UsageError(`profile ${req.profileName ?? ctx.profileName}: ${conflict}`);
+    const conflicts = [ownLoginConflict(profile), envLoginConflict(profile), loginConflict(profile, ctx, req.profileName, user)].filter(Boolean);
+    if (conflicts.length > 0) throw new UsageError(`profile ${req.profileName ?? ctx.profileName}: ${conflicts.join("; ")}`);
   }
   const options = isObject(profile.options) ? profile.options : {};
   const writer = !probe && req.write === true;
@@ -502,13 +539,15 @@ function authChecks(profile, ctx) {
   return check("FAIL", `with ${mode === "key" ? `a placeholder in ${keyVar}` : "the local-dummy key"} claude reports loggedIn=${keyed.status.loggedIn} authMethod=${method ?? "?"} (expected oauth_token or api_key)`);
 }
 
-// options.settings entries that group A overrides: they are ignored, and the user should know.
+// options.settings entries that group A overrides: they are ignored, and the user should know. On a login profile the
+// key and endpoint names among them refuse the profile instead (ownLoginConflict).
 function ignoredSettings(profile) {
   const settings = isObject(profile.options?.settings) ? profile.options.settings : null;
   if (!settings) return [];
   const { mode } = authOf(profile);
   const env = isObject(settings.env) ? settings.env : {};
-  const ignored = OWNED_ENV.filter((name) => Object.hasOwn(env, name)).map((name) => `env.${name}`);
+  const owned = mode === "login" ? OWNED_ENV.filter((name) => !LOGIN_OVERRIDES.includes(name)) : OWNED_ENV;
+  const ignored = owned.filter((name) => Object.hasOwn(env, name)).map((name) => `env.${name}`);
   if (effortOf(profile) && Object.hasOwn(env, "CLAUDE_CODE_EFFORT_LEVEL")) ignored.push("env.CLAUDE_CODE_EFFORT_LEVEL");
   if (mode !== "login" && Object.hasOwn(settings, "apiKeyHelper")) ignored.push("apiKeyHelper");
   if (profile.sandbox === "native" && isObject(settings.sandbox)) {
@@ -602,9 +641,18 @@ export default {
       mode = null;
     }
     if (mode === "login") {
+      const own = ownLoginConflict(profile);
+      if (own) checks.push({ name: "settings", level: "FAIL", hint: `${own}; every task is refused` });
+      const fromEnv = envLoginConflict(profile);
+      if (fromEnv) checks.push({ name: "profile-env", level: "FAIL", hint: `${fromEnv}; every task is refused` });
       try {
-        const conflict = loginConflict(profile, ctx);
+        const { file, settings, unparsed } = readUserSettings(profile, ctx);
+        const conflict = loginConflict(profile, ctx, ctx.profileName, settings);
         if (conflict) checks.push({ name: "user-settings", level: "FAIL", hint: `${conflict}; every task is refused` });
+        // Not the parser's message: it may quote the file, a key included.
+        if (unparsed) {
+          checks.push({ name: "user-settings", level: "WARN", hint: `cannot parse ${file} as JSON, so it was not checked for a key, an apiKeyHelper or an endpoint (spec §3.6 A2); claude may still apply it — check it` });
+        }
       } catch (error) {
         checks.push({ name: "user-settings", level: "WARN", hint: `not checked: ${error?.message ?? error}` });
       }

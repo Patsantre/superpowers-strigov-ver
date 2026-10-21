@@ -25,9 +25,11 @@
 //   passed (spec §3.6 A6). options.extensions adds one `-e <x>` each; they load even under `-ne` [03 §9].
 // - The key goes only into the variable named by `keyVar` (spec §3.5). With a key from agent-dispatch the home is
 //   isolated (PI_CODING_AGENT_DIR = <data>/homes/<profile>/pi, the same dir `profile env` prints): pi prefers a
-//   credential stored in its own auth.json over the environment, so a key saved in the user's pi would silently win
-//   over ours [03 §6]. A keyed profile with "home": "user", or one whose isolated home holds an auth.json, is refused
-//   (exit 2). With "home": "user" (a login) the caller's PI_CODING_AGENT_DIR passes (manifest.homeEnv).
+//   credential stored in its own auth.json, then a provider apiKey in its models.json, over the environment, so a key
+//   saved in the user's pi would silently win over ours [03 §6]. A keyed profile with "home": "user", or one whose
+//   isolated home holds an auth.json, is refused (exit 2). A models.json there is a custom endpoint, its apiKey
+//   normally `$<keyVar>` [03 §5.3]: it runs, and doctor's pi auth check names one holding a key of its own. With
+//   "home": "user" (a login) the caller's PI_CODING_AGENT_DIR passes (manifest.homeEnv).
 // - pi exits 0 when the provider fails: reduce() reads the events — the last assistant `message_end` (its text,
 //   stopReason, errorMessage) and `agent_settled` (the terminal marker, `aborted`) [03 §3.1, §3.3].
 // - Cancel: SIGTERM, which pi answers by SIGKILLing the process groups of its bash tools and exiting 143; never
@@ -37,8 +39,10 @@
 // Never run: `pi auth print-api-key` / `print-bearer-token` (they print secrets) and `--api-key` (visible in ps)
 // [03 §5.1, §6].
 //
-// Pure data, as the contract asks: processes and files only through ctx.exec / ctx.fs.
+// Pure data, as the contract asks: processes and files only through ctx.exec / ctx.fs (node:fs gives scrub only its
+// O_NOFOLLOW flag).
 
+import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { UsageError, filterEnv, parseEvents } from "../agent-core.mjs";
 
@@ -53,7 +57,8 @@ export const HOME_VAR = "PI_CODING_AGENT_DIR";
 // pi's warning when --session-id names no session of this cwd in the session dir [03 §4, src/main.ts:436-448]. It is
 // printed on every fresh job as well (its id is new), so only a resumed job reads it as a lost session.
 export const LOST_SESSION_RE = /No project session found with id/;
-// The only `builtin:` names `-e` takes [03 §9]; tests/fixtures/stub-dialects/pi-jsonl.cjs loads this list.
+// The only `builtin:` names `-e` takes [03 §9]; tests/fixtures/stub-dialects/pi-jsonl.cjs keeps a copy (the suite
+// checks that the two match).
 export const BUILTIN_EXTENSIONS = ["builtin:mcp", "builtin:llama.cpp", "builtin:codemode", "builtin:tool-search"];
 
 const isObject = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -86,20 +91,26 @@ function secretEnvOf(profile) {
   return [profile.keyVar];
 }
 
-// Why a keyed profile would not run on its key, or null. pi prefers a credential it stores itself (auth.json, from
-// /login) to the key in the environment — it "owns" its provider [03 §6] — so a job would bill that credential while
-// `channels` names the key. In the user's own pi home that login is the user's business: a keyed profile runs in its
-// isolated home only (its default); there, an auth.json (a /login through `profile env`, or a login profile of the
-// same name before) refuses the run. Only its existence is checked: the adapter never reads a credential store.
+// Why a keyed profile would not run on its key, or null. pi takes a key in this order: --api-key, a credential it
+// stores itself (auth.json, from /login), a provider's apiKey in its models.json, the environment — a stored one
+// "owns" its provider [03 §6] — so a job would bill that credential while `channels` names the key. In the user's own
+// pi home those files are the user's business: a keyed profile runs in its isolated home only (its default); there,
+// an auth.json (a /login through `profile env`, or a login profile of the same name before) refuses the run. Only its
+// existence is checked: the adapter never reads a credential store. A models.json is not refused: it is how a keyed
+// profile reaches a custom endpoint (`"apiKey": "$<keyVar>"`, [03 §5.3]); one whose apiKey is a literal or a command
+// is what doctor's pi auth check reports (authCheck).
 function storedCredentialProblem(profile, ctx) {
   if (!keyed(profile)) return null;
   const keyVar = profile.keyVar || "keyVar";
   if (!isolated(profile)) {
     return `a keyed pi profile runs only in its isolated home (the default with a key): in ${agentDirOf(profile, ctx) ?? "~/.pi/agent"} a credential pi stored itself (auth.json, /login) would win over ${keyVar}; remove "home": "user"`;
   }
-  const file = path.join(agentDirOf(profile, ctx), "auth.json");
-  if (ctx?.fs?.exists?.(file) !== true) return null;
-  return `${file} exists: a credential stored there (pi /login) wins over ${keyVar}; remove that file (a keyed profile needs no login)`;
+  const agentDir = agentDirOf(profile, ctx);
+  const auth = path.join(agentDir, "auth.json");
+  if (ctx?.fs?.exists?.(auth) === true) {
+    return `${auth} exists: a credential stored there (pi /login) wins over ${keyVar}; remove that file (a keyed profile needs no login)`;
+  }
+  return null;
 }
 
 // The refusal of storedCredentialProblem, as task (exit 2) and doctor --probe give it.
@@ -222,20 +233,33 @@ function textOfFile(raw) {
   return !text.includes("\u0000") && Buffer.from(text, "utf8").equals(raw) ? text : null;
 }
 
+// Symlinks are skipped, so the scrub never reads or rewrites a file outside the session dir: the core checks only
+// that a path it writes lies under the data root as written, and a symlinked directory there (pi's bash tool can make
+// one) would take the rewrite, and the chmod of its parent, to its target. ctx.fs has stat but no lstat, so:
+// - a directory is real when its own ".." is the directory it was listed in: the kernel resolves "<dir>/.." from where
+//   <dir> really is (path.join would only drop the last segment), and a symlinked directory's ".." is its target's
+//   parent;
+// - a file is read with O_NOFOLLOW (ctx.fs.readFile hands its options to fs.readFileSync), which fails on a symlink.
+const NO_FOLLOW = { flag: fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) };
+const sameNode = (a, b) => Number.isFinite(a?.ino) && a.ino === b?.ino && a.dev === b?.dev;
+const isRealDir = (fsApi, parent, dir) => sameNode(fsApi.stat(`${dir}${path.sep}..`), fsApi.stat(parent));
+
 // Every text file under `dir` (nested dirs too) whose content `redact` changes, as the core writes it back:
 // { path, mode (its current one), content (redacted) }. Files `redact` leaves alone are not listed; a binary file is
-// never rewritten. Reads only through fsApi.
+// never rewritten; a symlink (to a file or a directory, `dir` itself included) is never followed. Reads only through
+// fsApi.
 export function scrubSessionFiles(fsApi, dir, redact, depth = 0) {
+  if (depth === 0 && !isRealDir(fsApi, path.dirname(dir), dir)) return [];
   const files = [];
   for (const name of [...(fsApi.readdir(dir) ?? [])].sort()) {
     const file = path.join(dir, name);
     const stat = fsApi.stat(file);
     if (stat?.isDirectory?.()) {
-      if (depth < MAX_SCRUB_DEPTH) files.push(...scrubSessionFiles(fsApi, file, redact, depth + 1));
+      if (depth < MAX_SCRUB_DEPTH && isRealDir(fsApi, dir, file)) files.push(...scrubSessionFiles(fsApi, file, redact, depth + 1));
       continue;
     }
     if (!stat?.isFile?.()) continue;
-    const text = textOfFile(fsApi.readFile(file, null));
+    const text = textOfFile(fsApi.readFile(file, NO_FOLLOW));
     if (text === null) continue;
     const content = redact(text);
     if (content !== text) files.push({ path: file, mode: stat.mode & 0o777, content });
@@ -311,9 +335,10 @@ function authCheck(profile, ctx) {
     if (r.status === 1) return { name: "pi-auth", level: "FAIL", hint: `pi holds no credential for ${provider} in ${where}; ${loginHint}` };
     if (r.status === 2) return { name: "pi-auth", level: "FAIL", hint: `the credential pi holds for ${provider} in ${where} is invalid${authType}; ${loginHint}` };
   } else {
-    // An isolated home without an auth.json here (storedCredentialProblem): what pi holds comes from its models.json
-    // apiKey, next in pi's order before the environment [03 §6].
-    const fix = `remove it from ${where} (the provider's apiKey in models.json)`;
+    // An isolated home without an auth.json (storedCredentialProblem refuses one): a models.json apiKey that is a
+    // literal or a command, or anything else pi holds of its own, comes before the environment [03 §6]; pi auth check
+    // names only its type.
+    const fix = `remove it from ${where}`;
     if (r.status === 0) {
       return { name: "pi-auth", level: "FAIL", hint: `pi already holds a credential for ${provider} in ${where}${authType}; pi prefers it to the key in ${profile.keyVar}, so the key from agent-dispatch is not used — ${fix}` };
     }

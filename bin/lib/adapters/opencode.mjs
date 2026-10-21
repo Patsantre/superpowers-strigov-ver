@@ -105,9 +105,12 @@ export function tempDirRules({ tmpdir = null, dataDir = null, platform = null } 
 // `git difftool` or `git diff-tree` ("git diff*" did). Each command comes alone too, in case a version lacks that
 // trailing rule. Then the arguments that make the four commands write a file (--output), run a configured program
 // (--ext-diff, --textconv) or read outside the tree (--no-index; external_directory does not check git's arguments),
-// denied after the allows: the last match wins [02 §7].
+// denied after the allows: the last match wins [02 §7]. They match anywhere in the raw text, with no space before
+// them, so a quote (`"--output=f"`), a tab or a backslash-newline in front does not slip past. Open, as rules over
+// the text cannot express them: a split-quote spelling (`--out''put=f`), and the no-index git switches to by itself
+// for a path outside the work tree (`git diff /abs/o.txt /dev/null`): a read outside the tree, never a write.
 const REVIEWER_GIT = ["git show", "git diff", "git log", "git status"];
-const REVIEWER_GIT_DENY = ["* --output*", "*--ext-diff*", "*--textconv*", "*--no-index*"];
+const REVIEWER_GIT_DENY = ["*--output*", "*--ext-diff*", "*--textconv*", "*--no-index*"];
 
 // The complete explicit rule set of a role's agent: explicit `deny` comes back to the model as a tool error and the
 // loop goes on; only an `ask` left over ends the run (blocked) [02 §7]. `temp` is tempDirRules()'s input.
@@ -137,12 +140,15 @@ export function basePermission(write, temp = {}) {
 
 // options.permission merged into a rule set (spec §3.6 Б): an action replaces the key; an object of patterns is
 // merged into the key's patterns (a plain action there becomes its "*" pattern). Key order is kept, new keys and
-// patterns go last: OpenCode flattens the rules in order and the last match wins [02 §7].
+// patterns go last: OpenCode flattens the rules in order and the last match wins [02 §7]. An object whose patterns
+// all deny, "*" among them, is the action "deny" and replaces the key too: merged, that "*" would keep the first place
+// of the key's patterns and the allows after it (the reviewer's git commands) would still win.
 export function mergePermission(base, extra) {
   const merged = structuredClone(base);
   for (const [name, value] of Object.entries(extra ?? {})) {
     const current = merged[name];
-    merged[name] = isObject(value) && current !== undefined ? { ...(isObject(current) ? current : { "*": current }), ...value } : structuredClone(value);
+    const denyAll = isObject(value) && value["*"] === "deny" && Object.values(value).every((action) => action === "deny");
+    merged[name] = denyAll ? "deny" : isObject(value) && current !== undefined ? { ...(isObject(current) ? current : { "*": current }), ...value } : structuredClone(value);
   }
   return merged;
 }
@@ -219,6 +225,9 @@ export function dataDirOf(profile, ctx) {
 // The provider of profile.model ("deepseek" of deepseek/deepseek-v4-pro), or null.
 const providerOf = (profile) => (typeof profile?.model === "string" && profile.model.includes("/") ? profile.model.split("/")[0] : null);
 
+// The credential store `opencode auth login` writes in the isolated home [02 §5].
+const authFileOf = (ctx) => path.join(xdgOf(isolatedHome(ctx)).XDG_DATA_HOME, "opencode", "auth.json");
+
 // Why a keyed profile would not run on its key, or null. A credential stored by `opencode auth login` for the
 // provider wins over keyVar [02 §5]: the job would bill that login while `channels` names the key. The user's own data
 // dir may hold one at any time, so a keyed profile runs in its isolated home only (spec §3.4); there, an auth.json
@@ -230,7 +239,7 @@ function storedLoginProblem(profile, ctx) {
   if (profile.home !== "isolated") {
     return `a keyed opencode profile runs in its isolated home (the default): in your own home a stored ${providerOf(profile) ?? "provider"} login would win over ${keyVar}`;
   }
-  const file = path.join(xdgOf(isolatedHome(ctx)).XDG_DATA_HOME, "opencode", "auth.json");
+  const file = authFileOf(ctx);
   if (ctx?.fs?.exists?.(file) !== true) return null;
   return `${file} exists: a login stored there by opencode auth login wins over ${keyVar}; remove that file (a keyed profile needs no login)`;
 }
@@ -552,7 +561,8 @@ async function doctorChecks(profile, ctx) {
     const { bin, r, names } = await storedLogins(profile, ctx);
     const keyVar = profile.keyVar ?? "keyVar";
     if (!names) add("login", "WARN", `cannot run ${bin} auth list (${r.error?.code ?? `exit ${r.status}`}); a stored ${provider} login in the isolated home was not checked`);
-    else if (lists(names)) add("login", "FAIL", `opencode auth list in the isolated home names ${provider}: that stored login wins over ${keyVar}; remove it: agent-dispatch profile env ${ctx.profileName} -- opencode auth logout`);
+    // Not `opencode auth logout`: it rewrites auth.json to {}, and the run refuses the file whatever it holds.
+    else if (lists(names)) add("login", "FAIL", `opencode auth list in the isolated home names ${provider}: that stored login wins over ${keyVar}; remove ${authFileOf(ctx)}: a keyed profile needs no login (opencode auth logout leaves the file, which the run still refuses)`);
     else add("login", "ok", `no stored ${provider} login in the isolated home; the key goes in through ${keyVar}`);
   }
   if (profile?.auth === "login" && provider) {

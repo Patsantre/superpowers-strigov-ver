@@ -1251,6 +1251,21 @@ const oneLine = (text, limit = 160) => {
   return line.length > limit ? `${line.slice(0, limit - 1)}…` : line;
 };
 
+// Whether an adapter's FAIL check rows name all of a refusal's text (without its "profile P: "): each part of it is
+// a row's hint, or a hint up to one of its "; " (claude adds "; every task is refused"), so a refusal that joins two
+// causes is named by the two rows that report them. A WARN row does not count, nor does a row that cannot be read.
+function namedByFailRows(rows, refusal) {
+  try {
+    const hints = (Array.isArray(rows) ? rows : []).filter((row) => row?.level === "FAIL" && typeof row.hint === "string").map((row) => row.hint);
+    const stems = hints.flatMap((hint) => [hint, ...[...hint.matchAll(/; /g)].map((match) => hint.slice(0, match.index))]).filter(Boolean);
+    let rest = refusal;
+    for (const stem of stems.sort((a, b) => b.length - a.length)) rest = rest.split(stem).join("\0");
+    return rest.includes("\0") && /^[\0;\s]*$/.test(rest);
+  } catch {
+    return false;
+  }
+}
+
 // `codex-dispatch setup --json`, once per doctor run: the companion runs `codex --version` and asks its app-server
 // for the login (no model call; its review-gate flags are never passed, so it changes nothing). { report } or
 // { error }.
@@ -1349,21 +1364,34 @@ async function doctorProfile(state, name, report, checks) {
   } catch (error) {
     report("FAIL", `harness ${name}`, error.message);
   }
+  // The env check plans a run, so it also meets the adapter refusing the profile (a UsageError of invocation():
+  // claude's login settings, opencode's stored login). When the adapter's own FAIL rows name that refusal, they are
+  // its one report and there is no env row; any other refusal or error is the env row's FAIL.
+  let envRow;
+  let refusal = null;
   try {
     const owned = await core.mandatorySettings(adapter, p, ctx);
     const conflicts = core.envConflicts(p.env, owned);
-    if (conflicts.length > 0) report("FAIL", `env ${name}`, `profile env ${conflicts.join(", ")} conflicts with a mandatory setting of the ${p.harness} adapter (spec §3.6 A)`);
-    else report("ok", `env ${name}`, `no conflict with the mandatory settings (${owned.names.length} names)`);
+    if (conflicts.length > 0) envRow = ["FAIL", `env ${name}`, `profile env ${conflicts.join(", ")} conflicts with a mandatory setting of the ${p.harness} adapter (spec §3.6 A)`];
+    else envRow = ["ok", `env ${name}`, `no conflict with the mandatory settings (${owned.names.length} names)`];
   } catch (error) {
-    report("FAIL", `env ${name}`, error.message);
+    envRow = ["FAIL", `env ${name}`, error.message];
+    const prefix = `profile ${name}: `;
+    if (error instanceof UsageError) refusal = error.message.startsWith(prefix) ? error.message.slice(prefix.length) : error.message;
   }
+  let rows = [];
+  let failed = null;
+  if (typeof adapter.doctorChecks === "function") {
+    try {
+      rows = await adapter.doctorChecks(p, ctx);
+    } catch (error) {
+      failed = { error };
+    }
+  }
+  if (!(refusal && namedByFailRows(rows, refusal))) report(...envRow);
   checkSandbox(name, p, report);
-  if (typeof adapter.doctorChecks !== "function") return;
-  let rows;
-  try {
-    rows = await adapter.doctorChecks(p, ctx);
-  } catch (error) {
-    report("FAIL", `checks ${name}`, `the ${p.harness} adapter's checks failed: ${oneLine(error?.message ?? error, 300)}`);
+  if (failed) {
+    report("FAIL", `checks ${name}`, `the ${p.harness} adapter's checks failed: ${oneLine(failed.error?.message ?? failed.error, 300)}`);
     return;
   }
   for (const check of Array.isArray(rows) ? rows : []) {

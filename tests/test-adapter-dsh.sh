@@ -1071,7 +1071,17 @@ for (const [label, text, want, re] of [
     head + "- id: sandbox-policy\n  config:\n    mode: ${{ env.DSH_PERMISSION_MODE ?? \"workspace-write\" }}\n- id: approval-policy\n  config:\n    policy: ${{ env.DSH_PERMISSION_MODE === \"danger-full-access\" ? \"never\" : \"ask\" }}\n",
     "ok", /sandbox-policy follows DSH_PERMISSION_MODE, approval-policy follows DSH_PERMISSION_MODE/],
   ["a flow row pinning workspace-write", head + "- id: \"sandbox\"\n  config: {\"mode\": \"workspace-write\", \"workspaceRoot\": \"/repo\"}\n", "FAIL", /NOT read-only: .*shows sandbox workspace-write .*overrides DSH_PERMISSION_MODE: reviewer jobs run workspace-write;/],
-  ["a row pinning danger-full-access", head + "- id: permission-presets\n  config:\n    preset: danger-full-access\n", "FAIL", /permission-presets danger-full-access/],
+  // [04b §7] names permission presets, not the shape of a row that lists them: a literal outside the mode / policy of a
+  // sandbox or approval row is not graded (WARN, not verified), whichever mode it names.
+  ["a permission-presets row naming danger-full-access", head + "- id: permission-presets\n  config:\n    preset: danger-full-access\n", "WARN",
+    /reviewer read-only \(DSH_PERMISSION_MODE\) not verified: .*shows permission-presets danger-full-access outside the mode \/ policy of a sandbox or approval row/],
+  ["a presets row listing every mode beside read-only sandbox / approval rows",
+    head + "- id: sandbox-policy\n  config:\n    mode: \"read-only\"\n- id: approval-policy\n  config:\n    policy: \"ask\"\n- id: permission-presets\n  config:\n    presets: [\"read-only\", \"workspace-write\", \"danger-full-access\"]\n",
+    "WARN", /not verified: .*shows permission-presets read-only, permission-presets workspace-write, permission-presets danger-full-access outside .*; the sandbox \/ approval rows show sandbox-policy read-only;/],
+  ["a mode literal under another key of a sandbox row (an unknown shape)", head + "- id: sandbox-policy\n  config: {\"mode\": \"read-only\", \"escalation\": \"danger-full-access\"}\n", "WARN",
+    /not verified: .*shows sandbox-policy danger-full-access outside the mode \/ policy .*; the sandbox \/ approval rows show sandbox-policy read-only;/],
+  ["a sandbox row widening beside a presets row (graded first)", head + "- id: sandbox-policy\n  config:\n    mode: \"danger-full-access\"\n- id: permission-presets\n  config:\n    preset: read-only\n", "FAIL",
+    /NOT read-only: .*shows sandbox-policy danger-full-access — /],
   ["approval never while the mode follows the variable", head + "- id: sandbox-policy\n  config:\n    mode: \"read-only\"\n- id: approval-policy\n  config:\n    policy: \"never\"\n", "FAIL", /reviewer read-only overridden: .*shows approval-policy never — .*no longer follow it/],
   ["no permission row", head + "- id: tool-web\n  config: {}\n", "WARN", /not verified/],
   ["a permission row with no mode (a path is no mode)", head + "- id: sandbox-policy\n  config:\n    workspaceRoot: \"/w/read-only/danger-full-access-repo\"\n", "WARN", /not verified/],
@@ -1080,6 +1090,9 @@ for (const [label, text, want, re] of [
   check(`dsh-permissions on a dump with ${label} → ${want}`, level === want && re.test(text2), [level, text2]);
 }
 check("permissionRows: ids and values of the matching rows only", typeof mod.permissionRows === "function" && JSON.stringify(mod.permissionRows(head + "- id: sandbox-policy\n  config: {\"mode\": \"read-only\"}\n- id: tool-web\n  config: {\"mode\": \"danger-full-access\"}\n")) === JSON.stringify([{ id: "sandbox-policy", value: "read-only" }]));
+const marked = mod.permissionRows(head + "- id: permission-presets\n  config:\n    preset: never\n- id: sandbox-policy\n  config: {\"mode\": \"read-only\", \"escalation\": \"never\"}\n- id: approval-policy\n  config:\n    policy: never\n");
+check("permissionRows: only the mode / policy of a sandbox or approval row is graded; any other literal is marked unverified",
+  JSON.stringify(marked) === JSON.stringify([{ id: "permission-presets", value: "never", unverified: true }, { id: "sandbox-policy", value: "read-only" }, { id: "sandbox-policy", value: "never", unverified: true }, { id: "approval-policy", value: "never" }]), marked);
 
 env.AGENT_STUB_MODE = "dump-fail";
 checks = await dsh.doctorChecks(base, ctxOf(base));

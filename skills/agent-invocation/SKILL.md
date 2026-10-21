@@ -134,7 +134,7 @@ The failure rules depend on the job's harness (dev-orchestrator Step 3, "GLM inf
 | `rate-limit` | 429 without signs of an exhausted limit, 529; dsh `RATE_LIMIT` | the same |
 | `server` | 5xx, `ECONNREFUSED`; dsh `TRANSPORT`, `SERVER`, `TIMEOUT`, `HTTP_5xx`, `EMPTY_RESPONSE`, `MALFORMED_RESPONSE`, `STREAM_CLOSED` | the same |
 | `auth` | claude `api_error_status` 401/403; dsh `AUTH`, `MISSING_CREDENTIAL`, `INVALID_CREDENTIAL`; pi `No API key found for`; no login; a key that did not resolve | the profile and every profile linked to it are `down`; the next profile |
-| `quota` | claude 402, or 429 with a limit or balance text; dsh `QUOTA`; OpenCode 402 or `Insufficient Balance`, and a 429 only with `insufficient_quota`, `usage_not_included`, `GoUsageLimitError` or `FreeUsageLimitError` in the body | the same |
+| `quota` | claude 402, or 429 with a limit or balance text; dsh `QUOTA`; OpenCode: an error of any status with `insufficient_quota`, `usage_not_included`, `GoUsageLimitError` or `FreeUsageLimitError` (in its name or body), and 402 or `Insufficient Balance`; an OpenCode 429 without them is `rate-limit`, its "Quota exceeded…" after five retries included | the same |
 | `model-not-selected` | 404 on the model; claude "There's an issue with the selected model"; dsh `INVALID_REQUEST`, `MODEL_UNSUPPORTED`, `UNSUPPORTED_REASONING_EFFORT`; OpenCode `Model not found:`; pi `Model "…" not found`, `Unknown provider` | the profile is `down`; the next profile |
 | `context` | `prompt_too_long`; dsh `CONTEXT_WINDOW_EXCEEDED`; a context overflow in pi | the next profile for this job |
 | `blocked` | OpenCode's remaining `ask` (`auto-rejecting` on stderr); a permission refusal without a result | the next profile |

@@ -338,6 +338,14 @@ console.log(a?.id, a?.idPrefix);")"
     [[ "$ok" -eq 2 && "$got" == "agent-dispatch: profile pi-key: $STATE/homes/pi-key/pi/auth.json exists: a credential stored there (pi /login) wins over ZAI_API_KEY; remove that file (a keyed profile needs no login)" \
         && "$line" == "$n" && "$st" == completed/ ]]
     verdict "2 auth key + an auth.json in the isolated home (a /login there): refused (exit 2, no job) until the file is gone" $? "rc=$ok err: $got" "after rm: $st"
+    # A models.json in the isolated home is how a keyed profile reaches a custom endpoint ("apiKey": "$ZAI_API_KEY",
+    # [03 §5.3]): the task runs on the key; one whose apiKey is a literal is doctor's pi auth check's to report.
+    printf '{}\n' >"$STATE/homes/pi-key/pi/models.json"
+    start AGENT_STUB_RECORD="$TEST_ROOT/rec/key-models.json" -- --profile pi-key --prompt-file "$prompt"
+    st="$(outcome "$ID")"
+    rm -f "$STATE/homes/pi-key/pi/models.json"
+    [[ "$st" == completed/ && "$(env_names "$TEST_ROOT/rec/key-models.json" '^ZAI_API_KEY$')" == "ZAI_API_KEY" ]]
+    verdict "2 auth key + a models.json in the isolated home (a custom endpoint): runs on the key" $? "status: $st"
     start -u PI_CODING_AGENT_DIR AGENT_STUB_RECORD="$TEST_ROOT/rec/login-unset.json" -- --profile pi-login --prompt-file "$prompt"
     st="$(outcome "$ID")"
     [[ "$st" == completed/ && "$(env_names "$TEST_ROOT/rec/login-unset.json" '^PI_CODING_AGENT_DIR$')" == "" && ! -d "$STATE/homes/pi-login" ]]
@@ -645,11 +653,19 @@ const h = JSON.parse(lines[0]); h.cwd = "/somewhere/else"; lines[0] = JSON.strin
         && "$RC" -eq 1 && "$OUT" == *"FAIL pi-auth pi-key: $STATE/homes/pi-key/pi/auth.json exists: a credential stored there (pi /login) wins over ZAI_API_KEY; remove that file (a keyed profile needs no login); task refuses the profile (exit 2)"* \
         && ! -s "$TEST_ROOT/auth.log" ]]
     verdict "8 doctor FAILs a keyed profile that task refuses — home user, an auth.json in its isolated home — without running pi" $? "home user rc=$ok: $(grep -E 'pi-auth|env' <<<"$got")" "auth.json rc=$RC: $(grep pi-auth <<<"$OUT")"
+    # A models.json there is not refused: pi auth check decides — not ready (its apiKey is `$ZAI_API_KEY`, absent from
+    # doctor's env) is ok, ready (a literal key of its own) is the FAIL below.
+    printf '{}\n' >"$STATE/homes/pi-key/pi/models.json"
+    : >"$TEST_ROOT/auth.log"
+    run_env AGENT_STUB_AUTH=not_ready AGENT_STUB_AUTH_LOG="$TEST_ROOT/auth.log" -- doctor --profile pi-key
+    rm -f "$STATE/homes/pi-key/pi/models.json"
+    [[ "$OUT" == *"ok pi-auth pi-key: pi holds no credential of its own for zai"* && "$OUT" != *"models.json exists"* && -s "$TEST_ROOT/auth.log" ]]
+    verdict "8 doctor on a keyed profile whose isolated home holds a models.json: pi auth check runs and decides (not ready → ok)" $? "rc=$RC: $(grep pi-auth <<<"$OUT")"
     run_env AGENT_STUB_AUTH=ready -- doctor --profile pi-key
     ok=$RC
     got="$OUT"
     run_env AGENT_STUB_AUTH=invalid -- doctor --profile pi-key
-    [[ "$ok" -eq 1 && "$got" == *"FAIL pi-auth pi-key: pi already holds a credential for zai in $STATE/homes/pi-key/pi (api_key); pi prefers it to the key in ZAI_API_KEY, so the key from agent-dispatch is not used — remove it from $STATE/homes/pi-key/pi (the provider's apiKey in models.json)"* \
+    [[ "$ok" -eq 1 && "$got" == *"FAIL pi-auth pi-key: pi already holds a credential for zai in $STATE/homes/pi-key/pi (api_key); pi prefers it to the key in ZAI_API_KEY, so the key from agent-dispatch is not used — remove it from $STATE/homes/pi-key/pi"$'\n'* \
         && "$RC" -eq 1 && "$OUT" == *"FAIL pi-auth pi-key: pi holds an invalid credential for zai"* ]]
     verdict "8 a credential pi reports for a keyed profile (auth check ready or invalid) overrides our key: FAIL" $? "ready rc=$ok: $(grep pi-auth <<<"$got")" "invalid rc=$RC: $(grep pi-auth <<<"$OUT")"
     run_env AGENT_STUB_AUTH=ready -- doctor --profile pi-login
@@ -827,6 +843,43 @@ console.log(JSON.stringify([plan.map((e) => [path.relative(dir, e.path), e.mode.
     [[ "$got" == "$want" ]]
     verdict "9 scrub: every text file of the session dir holding a key (raw or JSON-escaped, nested too) comes back redacted with its mode; clean and binary files untouched; still valid JSONL that resumes; nothing left on a second pass or without a redactor" $? "got:  $got" "want: $want"
 
+    # A symlink in the session dir (pi's bash tool can make one) is never followed: the core checks only that a path lies
+    # under the data root as written, so a symlinked directory would take the rewrite (and the chmod of its parent) to
+    # its target. Symlinked directories (nested too, the session dir itself, a loop) and files are skipped; real files
+    # beside them are still scrubbed.
+    got="$(pi_js 'const fs = await import("node:fs");
+const path = await import("node:path");
+const base = fs.mkdtempSync(path.join(process.argv[1], "scrub-link-"));
+const env = { AGENT_DISPATCH_STATE_DIR: path.join(base, "data") };
+const key = "zai-key-value-424242";
+const outside = path.join(base, "outside");
+fs.mkdirSync(path.join(outside, "deeper"), { recursive: true });
+fs.chmodSync(outside, 0o755);
+fs.writeFileSync(path.join(outside, "notes.txt"), `user file ${key}\n`, { mode: 0o644 });
+fs.writeFileSync(path.join(outside, "deeper", "x.jsonl"), `${key}\n`, { mode: 0o644 });
+const jobDir = path.join(env.AGENT_DISPATCH_STATE_DIR, "jobs", "pi-0001");
+const dir = path.join(jobDir, "sessions");
+fs.mkdirSync(path.join(dir, "nested"), { recursive: true });
+fs.writeFileSync(path.join(dir, "s_pi-0001.jsonl"), `${key}\n`);
+fs.writeFileSync(path.join(dir, "nested", "n.txt"), `${key}\n`);
+const links = { linkdir: outside, "link.txt": path.join(outside, "notes.txt"), "nested/inner": outside, "nested/inner.jsonl": path.join(outside, "deeper", "x.jsonl"), loop: dir };
+for (const [name, target] of Object.entries(links)) fs.symlinkSync(target, path.join(dir, name));
+const job2 = path.join(env.AGENT_DISPATCH_STATE_DIR, "jobs", "pi-0002");
+fs.mkdirSync(job2, { recursive: true });
+fs.symlinkSync(outside, path.join(job2, "sessions"));
+const ctx = { fs: core.makeCtx({ env }).fs, redact: core.redactor([key]) };
+const plan = pi.scrub({ dir: jobDir, record: { meta: { sessionDir: dir } } }, ctx);
+const plan2 = pi.scrub({ dir: job2, record: { meta: { sessionDir: path.join(job2, "sessions") } } }, ctx);
+core.writeAdapterFiles({ files: [...plan, ...plan2] }, env);
+const holds = (f) => fs.readFileSync(f, "utf8").includes(key);
+const isLink = (f) => fs.lstatSync(f).isSymbolicLink();
+console.log(JSON.stringify([plan.map((e) => path.relative(dir, e.path)), plan2.length, holds(path.join(outside, "notes.txt")) && holds(path.join(outside, "deeper", "x.jsonl")),
+  (fs.statSync(outside).mode & 0o777).toString(8), Object.keys(links).every((name) => isLink(path.join(dir, name))) && isLink(path.join(job2, "sessions")),
+  holds(path.join(dir, "s_pi-0001.jsonl")) || holds(path.join(dir, "nested", "n.txt"))]));' "$TEST_ROOT")"
+    want='[["nested/n.txt","s_pi-0001.jsonl"],0,true,"755",true,false]'
+    [[ "$got" == "$want" ]]
+    verdict "9 scrub never follows a symlink: a symlinked dir (nested too, the session dir itself, a loop) or file is skipped — the files outside keep their content, their dir its mode, the links stay links; real files beside them are still redacted" $? "got:  $got" "want: $want"
+
     got="$(pi_js 'const files = {
   "/d": ["2026-10-21T00-00-00-000Z_pi-0001.jsonl", "other.jsonl", "notes.txt"],
   "/d/2026-10-21T00-00-00-000Z_pi-0001.jsonl": JSON.stringify({ type: "session", version: 3, id: "pi-0001", cwd: "/w" }) + "\n{}\n",
@@ -903,6 +956,33 @@ console.log(JSON.stringify([
     want='["UsageError: profile p: a keyed pi profile runs only in its isolated home (the default with a key): in /user-pi a credential pi stored itself (auth.json, /login) would win over ZAI_API_KEY; remove \"home\": \"user\"","UsageError: profile p: /data/homes/p/pi/auth.json exists: a credential stored there (pi /login) wins over ZAI_API_KEY; remove that file (a keyed profile needs no login)","UsageError: profile p: a keyed pi profile runs only in its isolated home (the default with a key): in /user-pi a credential pi stored itself (auth.json, /login) would win over ZAI_API_KEY; remove \"home\": \"user\"",null,null,{"sessionDir":"/data/jobs/pi-0001/sessions","agentDir":"/user-pi","sessionFilesBefore":["2026-10-21T00-00-00-000Z_pi-0001.jsonl"]},{"sessionDir":"/data/jobs/pi-0002/sessions","agentDir":"/user-pi"}]'
     [[ "$got" == "$want" ]]
     verdict "9 a keyed profile on a stored credential: invocation and probe refuse it (UsageError) — home user, an auth.json in its isolated home — not doctor's job-less request nor a login profile; a resume's meta lists its id's session files" $? "got:  $got" "want: $want"
+
+    # A models.json in a keyed profile's isolated home is a custom endpoint (its apiKey `$<keyVar>`, [03 §5.3]):
+    # invocation and probe take it, never reading it; an auth.json beside it is still refused.
+    got="$(pi_js 'const reads = [];
+const present = new Set(["/data/homes/p/pi/models.json"]);
+const ctx = { profileName: "p", env: { PATH: "" }, paths: { homes: "/data/homes" },
+  fs: { exists: (f) => present.has(f), readFile: (f) => { reads.push(f); return null; }, readdir: () => null, stat: () => null },
+  exec: () => { throw new Error("pi was run"); } };
+const keyed = { harness: "pi", auth: { key: "zai" }, keyVar: "ZAI_API_KEY", model: "zai/glm-5.3", home: "isolated" };
+const req = (profile) => ({ profile, profileName: "p", write: false, job: { id: "pi-0002", dir: "/data/jobs/pi-0002", cwd: "/w" }, prompt: { path: "/w/p.md" }, sessionId: "pi-0002", resume: null, harness: null });
+const err = (fn) => { try { fn(); return null; } catch (error) { return `${error instanceof core.UsageError ? "UsageError" : "Error"}: ${error.message}`; } };
+const models = [err(() => pi.invocation(req(keyed), ctx)), err(() => pi.probe(req(keyed), ctx))];
+present.add("/data/homes/p/pi/auth.json");
+console.log(JSON.stringify([...models, err(() => pi.invocation(req(keyed), ctx)), reads]));')"
+    want='[null,null,"UsageError: profile p: /data/homes/p/pi/auth.json exists: a credential stored there (pi /login) wins over ZAI_API_KEY; remove that file (a keyed profile needs no login)",[]]'
+    [[ "$got" == "$want" ]]
+    verdict "9 a models.json in a keyed profile's isolated home (a custom endpoint): invocation and probe take it without reading it; an auth.json beside it is refused" $? "got:  $got" "want: $want"
+
+    # The stub keeps a copy of the adapter's built-in extensions instead of require()-ing the ES module adapter (Node
+    # 20.19+ / 22.12+ only): the two lists match, and a run naming one works where require() cannot load ES modules.
+    got="$(pi_js 'const { createRequire } = await import("node:module");
+const stub = createRequire(process.argv[1])(process.argv[1]);
+console.log(JSON.stringify([stub.BUILTIN_EXTENSIONS, mod.BUILTIN_EXTENSIONS]));' "$SCRIPT_DIR/fixtures/stub-dialects/pi-jsonl.cjs")"
+    line="$(cd "$TEST_ROOT" && printf 'hi\n' | NODE_OPTIONS=--no-experimental-require-module AGENT_STUB_RESPONSE=PONG "$PI" --mode json --no-session -nt -e builtin:llama.cpp 2>&1; echo "rc=$?")"
+    [[ "$got" == '[["builtin:mcp","builtin:llama.cpp","builtin:codemode","builtin:tool-search"],["builtin:mcp","builtin:llama.cpp","builtin:codemode","builtin:tool-search"]]' \
+        && "$line" == *'"type":"agent_settled"'* && "$line" == *'PONG'* && "$line" == *$'\nrc=0' ]]
+    verdict "9 the stub's BUILTIN_EXTENSIONS equal the adapter's; with require(esm) off a run with -e builtin:llama.cpp still answers" $? "lists: $got" "run: $(tail -3 <<<"$line")"
 
     # "home": "user" with PI_CODING_AGENT_DIR in profile.env (allowed: not mandatory there): pi runs in that dir, so the
     # auth check, its hints and meta.agentDir name it; null removes it (pi's default ~/.pi/agent).

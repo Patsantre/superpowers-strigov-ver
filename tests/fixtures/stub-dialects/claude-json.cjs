@@ -19,9 +19,11 @@
 //   (<cwd>/.claude/settings.json under "project", also the default when the flag is absent) and of --settings, in that
 //   order, applied over the process environment [01 §9, E9, E18].
 // - Credentials by claude's precedence [01 §6]: ANTHROPIC_AUTH_TOKEN (Bearer; with ANTHROPIC_API_KEY also set, both
-//   headers [E3]) › ANTHROPIC_API_KEY (x-api-key) › apiKeyHelper (both headers) › a claude.ai login. The login is the marker file stub-login.json in the config dir
-//   ($CLAUDE_CONFIG_DIR, else ~/.claude): the stub never reads a real credential store. No credential: result
-//   "Not logged in · Please run /login", api_error_status null, exit 1, no request [01 E5].
+//   headers [E3]) › ANTHROPIC_API_KEY (x-api-key) › apiKeyHelper (both headers) › CLAUDE_CODE_OAUTH_TOKEN (Bearer;
+//   authMethod oauth_token, apiKeySource CLAUDE_CODE_OAUTH_TOKEN: a guess, not recorded in [01]) › a claude.ai login.
+//   The login is the marker file stub-login.json in the config dir ($CLAUDE_CONFIG_DIR, else ~/.claude): the stub
+//   never reads a real credential store. No credential: result "Not logged in · Please run /login", api_error_status
+//   null, exit 1, no request [01 E5].
 // - Model: --model, else ANTHROPIC_MODEL, else the opus alias; an alias (opus, sonnet, haiku, fable) resolves through
 //   ANTHROPIC_DEFAULT_<ALIAS>_MODEL, else to claude-<alias>-stub [01 §5, E17]. A model id that does not start with
 //   "claude-" prints "[claude-code:unrecognized_model] {…}" on stderr on every run [01 §3].
@@ -226,6 +228,7 @@ function credentialOf(env, { helper, dir }) {
   if (env.ANTHROPIC_AUTH_TOKEN) return { method: "oauth_token", source: "ANTHROPIC_AUTH_TOKEN", headers: ["authorization"] };
   if (env.ANTHROPIC_API_KEY) return { method: "api_key", source: "ANTHROPIC_API_KEY", headers: ["x-api-key"] };
   if (helper) return { method: "api_key_helper", source: "apiKeyHelper", headers: ["authorization", "x-api-key"] };
+  if (env.CLAUDE_CODE_OAUTH_TOKEN) return { method: "oauth_token", source: "CLAUDE_CODE_OAUTH_TOKEN", headers: ["authorization"] };
   if (fs.existsSync(path.join(dir, LOGIN_MARKER))) return { method: "claude.ai", source: "none", headers: ["authorization"] };
   return null;
 }

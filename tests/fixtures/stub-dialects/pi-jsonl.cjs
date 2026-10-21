@@ -17,8 +17,8 @@
 // - Sessions: `--session-dir D --session-id X` resumes the file in D whose header has id X and cwd = this cwd;
 //   otherwise it warns "No project session found with id 'X'; creating a new session with that id." on stderr and
 //   creates D/<time>_X.jsonl at the first message. `--no-session` keeps nothing.
-// - `-e <x>`: one of the adapter's BUILTIN_EXTENSIONS (bin/lib/adapters/pi.mjs, [03 §9]; loaded from there, so the
-//   stub and doctor's check cannot drift) or an existing file; else "Failed to load extension".
+// - `-e <x>`: one of pi's built-in extensions (BUILTIN_EXTENSIONS, a copy of the adapter's [03 §9]; the suite checks
+//   that the stub and doctor's check do not drift) or an existing file; else "Failed to load extension".
 // - `auth check --provider P --json`: AGENT_STUB_AUTH = ready | not_ready | invalid (default not_ready) → exit 0 / 1 /
 //   2 with {"provider","status","authType"} (pi's JSON shape beyond authType is not documented: a guess). Every `auth`
 //   call is appended to AGENT_STUB_AUTH_LOG as {argv, agentDir, keyVars}; `auth print-*` is refused (exit 3).
@@ -69,9 +69,9 @@ const OPTIONS = {
   "--tools": 1, "-t": 1, "--exclude-tools": 1, "-xt": 1, "-nbt": 0, "-nt": 0, "-e": 1, "--skill": 1, "--prompt-template": 1,
   "--system-prompt": 1, "--append-system-prompt": 1, "--offline": 0, "--api-key": 1, "--list-models": 0,
 };
-// The adapter's list of built-in extensions, read only when a run names one (require() of an ES module: Node 20.19+ /
-// 22.12+).
-const builtinExtensions = () => require(path.join(__dirname, "..", "..", "..", "bin", "lib", "adapters", "pi.mjs")).BUILTIN_EXTENSIONS;
+// pi's built-in extensions [03 §9]: a copy of the adapter's BUILTIN_EXTENSIONS (bin/lib/adapters/pi.mjs), not a
+// require() of that ES module, which needs Node 20.19+ / 22.12+; tests/test-adapter-pi.sh checks that the two match.
+const BUILTIN_EXTENSIONS = ["builtin:mcp", "builtin:llama.cpp", "builtin:codemode", "builtin:tool-search"];
 // The --help lines; AGENT_STUB_HELP_DROP removes some by their flag.
 const HELP = [
   ["--mode", "--mode <mode>", "Output mode: text (default), json or rpc"],
@@ -201,7 +201,7 @@ function prepareRun(argv) {
   state.json = values["--mode"] === "json";
   state.tools = !(values["-nt"] || values["--tools"] === ""); // -nt: no tools, so the model answers without a tool turn
   for (const extension of extensions) {
-    const ok = extension.startsWith("builtin:") ? builtinExtensions().includes(extension) : fs.existsSync(extension);
+    const ok = extension.startsWith("builtin:") ? BUILTIN_EXTENSIONS.includes(extension) : fs.existsSync(extension);
     if (!ok) fail(`Failed to load extension "${extension}": ${extension.startsWith("builtin:") ? "unknown built-in extension" : "ENOENT: no such file or directory"}\nHint: check the path, or start pi with -ne to skip extensions`);
   }
   const model = values["--model"];
@@ -397,6 +397,7 @@ module.exports = {
   name: "pi-jsonl",
   version: VERSION,
   flags: FLAGS,
+  BUILTIN_EXTENSIONS,
   help(flags) {
     const shown = HELP.filter(([flag]) => flags.includes(flag));
     return `pi - a minimal coding agent (agent-stub, pi-jsonl dialect)\n\nUsage: pi [options] [messages...]\n\nOptions:\n${shown.map(([, form, text]) => `  ${form.padEnd(28)}${text}`).join("\n")}\n  --version                   Print the version\n  --help                      Show this help\n\nCommands:\n  pi auth check --provider <name> [--json]\n`;

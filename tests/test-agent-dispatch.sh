@@ -1154,15 +1154,30 @@ EOF
     printf 'throw new Error("pi adapter: failure at import");\n' >"$broken/pi.mjs"
     printf 'export default { id: "pie" };\n' >"$broken/opencode.mjs"
     printf 'export default { id: "dsh", ) };\n' >"$broken/dsh.mjs"
+    # The stand-in also refuses two models in invocation() (a UsageError, as the real adapters refuse a profile), with
+    # check rows that name the refusal: two FAIL rows for a refusal that joins two causes, a WARN row only for the other.
+    local CORE_URL
+    CORE_URL="$(node -e 'process.stdout.write(require("node:url").pathToFileURL(process.argv[1]).href)' -- "$REPO_ROOT/bin/lib/agent-core.mjs")"
     cat >"$broken/claude.mjs" <<EOF
 import plain from "$FIX_URL/adapters/plain.mjs";
+import { UsageError } from "$CORE_URL";
+const REFUSED = {
+  "refused-two": { cause: "cause A (x); fix A; cause B", rows: [{ name: "cause-a", level: "FAIL", hint: "cause A (x); fix A; every task is refused" }, { name: "cause-b", level: "FAIL", hint: "cause B; every task is refused" }] },
+  "refused-warn": { cause: "cause C", rows: [{ name: "cause-c", level: "WARN", hint: "cause C" }] },
+};
 export default {
   ...plain,
   id: "claude",
   idPrefix: "ct",
+  invocation(req, ctx) {
+    const refused = REFUSED[req.profile.model];
+    if (refused) throw new UsageError("profile " + req.profileName + ": " + refused.cause);
+    return plain.invocation(req, ctx);
+  },
   doctorChecks(profile) {
     if (profile.model === "checks-throw") throw new Error("stand-in checks: boom");
     if (profile.model === "row-throws") return [{ get level() { throw new Error("stand-in row: unreadable"); } }];
+    if (REFUSED[profile.model]) return REFUSED[profile.model].rows;
     return [{ name: "stand-in", level: "ok", hint: "fine" }];
   },
 };
@@ -1176,12 +1191,14 @@ EOF
     "b-dsh": { "harness": "dsh", "auth": { "key": "absent-dkey" }, "model": "deepseek-v4-pro" },
     "b-checks": { "harness": "claude", "auth": "login", "model": "checks-throw" },
     "b-row": { "harness": "claude", "auth": "login", "model": "row-throws" },
-    "b-ok": { "harness": "claude", "auth": "login" }
+    "b-ok": { "harness": "claude", "auth": "login" },
+    "b-two": { "harness": "claude", "auth": "login", "model": "refused-two" },
+    "b-warn": { "harness": "claude", "auth": "login", "model": "refused-warn" }
   }
 }
 EOF
     AGENT_DISPATCH_ADAPTER_DIR="$broken" run_ad doctor
-    [[ "$RC" -eq 1 && "$(head -1 <<<"$OUT")" == "ok config: $CONFIG: 6 profile(s), 0 role(s)" && "$(tail -1 <<<"$OUT")" == "doctor: FAIL" \
+    [[ "$RC" -eq 1 && "$(head -1 <<<"$OUT")" == "ok config: $CONFIG: 8 profile(s), 0 role(s)" && "$(tail -1 <<<"$OUT")" == "doctor: FAIL" \
         && "$OUT" == *"FAIL profile b-pi: adapter pi failed to load: $broken/pi.mjs: pi adapter: failure at import"* \
         && "$OUT" == *"ok auth b-pi: login: the pi login of provider zai"* \
         && "$OUT" == *"FAIL profile b-oc: adapter opencode failed to load: $broken/opencode.mjs: its id is \"pie\", not \"opencode\""* \
@@ -1195,6 +1212,16 @@ EOF
     [[ "$RC" -eq 1 && "$OUT" == *"FAIL profile b-pi: adapter pi failed to load: $broken/pi.mjs: pi adapter: failure at import"* \
         && "$OUT" == *"ok auth b-pi: login"* && "$(tail -1 <<<"$OUT")" == "doctor: FAIL" ]]
     verdict "13 doctor --profile on a profile whose adapter fails to load: its FAIL row, its auth row, 'doctor: FAIL' (exit 1)" $? "rc=$RC" "$OUT" "err: $ERR"
+    AGENT_DISPATCH_ADAPTER_DIR="$broken" run_ad doctor --profile b-two
+    ok=$RC
+    local two="$OUT"
+    AGENT_DISPATCH_ADAPTER_DIR="$broken" run_ad doctor --profile b-warn
+    [[ "$ok" -eq 1 && "$(grep '^FAIL ' <<<"$two")" == "FAIL cause-a b-two: cause A (x); fix A; every task is refused"$'\n'"FAIL cause-b b-two: cause B; every task is refused" \
+        && "$two" != *"env b-two"* && "$(tail -1 <<<"$two")" == "doctor: FAIL" \
+        && "$RC" -eq 1 && "$(grep '^FAIL ' <<<"$OUT")" == "FAIL env b-warn: profile b-warn: cause C" && "$OUT" == *"WARN cause-c b-warn: cause C"* \
+        && "$(tail -1 <<<"$OUT")" == "doctor: FAIL" ]]
+    verdict "13 doctor --profile on a refused profile: FAIL check rows naming every cause of the refusal replace its env row; a WARN row does not, the env row stays FAIL (exit 1 both)" $? \
+        "two causes: rc=$ok" "$two" "warn only: rc=$RC" "$OUT" "err: $ERR"
 
     run_ad no-such-verb
     [[ "$RC" -eq 2 && "$ERR" == *"usage: agent-dispatch"* ]]
@@ -1315,6 +1342,34 @@ EOF
     e_st="$(wait_status "$id" 'completed|failed|cancelled' 30)"
     [[ "$id" == dt-* && "$e_st" == completed && "$(ad result "$id" 2>&1)" == "DONE"$'\n'"isolated" ]]
     verdict "14 a dsh job completes while \$AGENT_DISPATCH_ADAPTER_DIR holds a pi adapter that fails at import" $? "task: $OUT" "status: $e_st" "$(ad result "$id" 2>&1 | head -5)"
+
+    # A profile the adapter refuses (a UsageError of its invocation(), which doctor's env check plans) is one FAIL row:
+    # the adapter's own check row names it (claude's login settings: user-settings; opencode's keyed profile in the
+    # user's home: home), with no second 'FAIL env' row. A refusal no check row names (an opencode model without its
+    # provider) stays the env row's FAIL. doctor exits 1 on each.
+    mkdir -p "$STATE/homes/r-cl/claude"
+    printf '{"env":{"ANTHROPIC_BASE_URL":"https://gw.example"}}\n' >"$STATE/homes/r-cl/claude/settings.json"
+    printf '{}\n' >"$STATE/homes/r-cl/claude/stub-login.json"
+    write_config <<EOF
+{
+  "version": 1,
+  "profiles": {
+    "r-cl": { "harness": "claude", "auth": "login", "home": "isolated", "bin": "$TEST_ROOT/bin/claude" },
+    "r-ock": { "harness": "opencode", "auth": { "key": "e2e-ds" }, "keyVar": "DEEPSEEK_API_KEY", "model": "deepseek/deepseek-v4-pro", "home": "user", "bin": "$TEST_ROOT/bin/opencode" },
+    "r-ocm": { "harness": "opencode", "auth": "login", "model": "gpt-6-mini", "bin": "$TEST_ROOT/bin/opencode" }
+  }
+}
+EOF
+    local e_row e_want e_fails
+    for spec in "r-cl:user-settings:sets env.ANTHROPIC_BASE_URL: claude would use that key or endpoint instead of the claude.ai login" \
+        "r-ock:home:a keyed opencode profile runs in its isolated home (the default)" \
+        'r-ocm:env:profile r-ocm: an opencode profile needs "model": "<provider>/<model>"'; do
+        IFS=: read -r e_prof e_row e_want <<<"$spec"
+        run_ad doctor --profile "$e_prof"
+        e_fails="$(grep '^FAIL ' <<<"$OUT")"
+        [[ "$RC" -eq 1 && "$(grep -c '^FAIL ' <<<"$OUT")" -eq 1 && "$e_fails" == "FAIL $e_row $e_prof: "*"$e_want"* && "$(tail -1 <<<"$OUT")" == "doctor: FAIL" ]]
+        verdict "14 doctor --profile $e_prof, refused by its adapter: one FAIL row ($e_row) names the refusal; doctor: FAIL (exit 1)" $? "rc=$RC" "$OUT" "err: $ERR"
+    done
     unset AGENT_STUB_AUTH
 
     # Every preset of spec §4.2, its placeholders filled, is a valid profile whose real adapter plans a run, and whose

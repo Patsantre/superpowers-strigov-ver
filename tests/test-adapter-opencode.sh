@@ -9,10 +9,10 @@
 #
 # Covered (spec §8 row 4 and the adapter contract): golden argv / env / stdin for each auth mode and role; the sp-
 # agents in OPENCODE_CONFIG_CONTENT, the role's set in OPENCODE_PERMISSION, the reviewer's git rules as OpenCode decides
-# them (bypasses denied), options.permission (never widening the reviewer) / options.plugins; the project's
-# instructions; home isolated for a key and user for a login, with git still reading the caller's config; a key refused
-# in the user's home or beside a stored auth.json; profile.env overriding the defaults and its own TMPDIR in
-# external_directory; sandbox native changes nothing; stdin closed after the prompt (stdin-wait); exit 1 with a valid
+# them (bypasses denied), options.permission (never widening the reviewer; a whole-key deny replacing its patterns) /
+# options.plugins; the project's instructions; home isolated for a key and user for a login, with git still reading
+# the caller's config; a key refused in the user's home or beside a stored auth.json; profile.env overriding the
+# defaults and its own TMPDIR in external_directory; sandbox native changes nothing; stdin closed after the prompt (stdin-wait); exit 1 with a valid
 # answer is success; the answer of the last message, only once its step finished (a narration before a crash or a kill
 # is none); the export fallback, only for a finished message of this run; a surviving ask → blocked; "agent … not
 # found" → launch; quota only with markers in the body or a 402; the error classes; resume with the same --dir and data
@@ -282,8 +282,9 @@ EOF
     }
     impl_set() { canon "{\"*\":\"allow\",\"read\":$READ,\"external_directory\":$(ext_rules "$1"),\"doom_loop\":\"deny\",\"question\":\"deny\",\"webfetch\":\"deny\",\"websearch\":\"deny\"}"; }
     # The reviewer's bash: each git command alone and with arguments ("git diff *", not "git diff*", which also
-    # matches difftool), then the arguments that write, run or read outside the tree, denied last (the last match wins).
-    local REV_BASH='{"*":"deny","git show":"allow","git show *":"allow","git diff":"allow","git diff *":"allow","git log":"allow","git log *":"allow","git status":"allow","git status *":"allow","* --output*":"deny","*--ext-diff*":"deny","*--textconv*":"deny","*--no-index*":"deny"}'
+    # matches difftool), then the arguments that write, run or read outside the tree, denied last (the last match wins),
+    # anywhere in the text (no leading space: a quote, a tab or a line continuation may come before them).
+    local REV_BASH='{"*":"deny","git show":"allow","git show *":"allow","git diff":"allow","git diff *":"allow","git log":"allow","git log *":"allow","git status":"allow","git status *":"allow","*--output*":"deny","*--ext-diff*":"deny","*--textconv*":"deny","*--no-index*":"deny"}'
     rev_set() { canon "{\"*\":\"deny\",\"read\":$READ,\"grep\":\"allow\",\"glob\":\"allow\",\"list\":\"allow\",\"edit\":\"deny\",\"task\":\"deny\",\"bash\":$REV_BASH,\"external_directory\":$(ext_rules "$1"),\"webfetch\":\"deny\",\"websearch\":\"deny\"}"; }
     local IMPL REV
     IMPL="$(impl_set "$STATE/homes/oc-key/data")"
@@ -751,8 +752,10 @@ process.stdout.write(JSON.stringify(impl));' -- "$(impl_set "$HOME/.local/share"
     printf '{"deepseek":{"type":"api"}}\n' >"$STATE/homes/oc-key/data/opencode/stub-auth.json"
     run_ad doctor --profile oc-key
     rm -f "$STATE/homes/oc-key/data/opencode/stub-auth.json"
-    [[ "$RC" -eq 1 && "$OUT" == *"FAIL login oc-key: opencode auth list in the isolated home names deepseek: that stored login wins over DEEPSEEK_API_KEY; remove it: agent-dispatch profile env oc-key -- opencode auth logout"* ]]
-    verdict "15 doctor: a deepseek login stored in the key's isolated home → FAIL with the logout command" $? "rc=$RC" "$OUT"
+    # The remedy is removing auth.json: `opencode auth logout` rewrites it to {}, and the run refuses the file as such.
+    [[ "$RC" -eq 1 && "$OUT" == *"FAIL login oc-key: opencode auth list in the isolated home names deepseek: that stored login wins over DEEPSEEK_API_KEY; remove $STATE/homes/oc-key/data/opencode/auth.json: a keyed profile needs no login"* \
+        && "$OUT" != *"-- opencode auth logout"* ]]
+    verdict "15 doctor: a deepseek login stored in the key's isolated home → FAIL naming the auth.json to remove (not auth logout, which leaves it)" $? "rc=$RC" "$OUT"
     printf '{}\n' >"$STATE/homes/oc-key/data/opencode/auth.json"
     run_ad doctor --profile oc-key
     rm -f "$STATE/homes/oc-key/data/opencode/auth.json"
@@ -821,13 +824,14 @@ const reviewerSet = mod.agentConfig({ write: false, temp }).permission;
 const BYPASS = [
   "git difftool -y -x 'touch PWNED;' HEAD~1", "git difftool --extcmd=sh HEAD~1", "git diff --output=src/index.js HEAD~1",
   "git diff --output src/index.js", "git log -1 --format=ARBITRARY --output=README.md", "git show --output=/Users/me/.zshrc HEAD",
+  'git diff HEAD~1 "--output=src/index.js"', "git log -1 '--output=README.md'", "git log --oneline\t--output=src/a.js", "git diff HEAD~1 \\\n--output=src/a.js",
   "git diff --ext-diff HEAD~1", "git log -p --textconv", "git show --textconv HEAD:a.js", "git diff --no-index /etc/passwd a.txt",
   "git diff-tree -p HEAD", "git show-branch --all", "GIT_EXTERNAL_DIFF=sh git diff", "git -c diff.external=sh diff", "git push origin main", "rm -rf src",
 ];
 const ORDINARY = ["git diff", "git diff --stat HEAD~1 -- src", "git show HEAD:a.js", "git show", "git log --oneline -20", "git log", "git status --short", "git status"];
 // The commands of a list whose decision is not `want`, each with what it got.
 const otherThan = (set, list, want) => list.map((cmd) => [decide(set, "bash", cmd), cmd]).filter(([got]) => got !== want).map(([got, cmd]) => `${got}: ${cmd}`);
-check("reviewer rules: difftool -x / --extcmd, --output (diff, log, show), --ext-diff, --textconv, --no-index, diff-tree, show-branch, an env prefix, -c → deny", otherThan(reviewerSet, BYPASS, "deny").length === 0, otherThan(reviewerSet, BYPASS, "deny").join(" | "));
+check("reviewer rules: difftool -x / --extcmd, --output (diff, log, show; quoted, after a tab or a line continuation), --ext-diff, --textconv, --no-index, diff-tree, show-branch, an env prefix, -c → deny", otherThan(reviewerSet, BYPASS, "deny").length === 0, otherThan(reviewerSet, BYPASS, "deny").join(" | "));
 check("reviewer rules: git diff / show / log / status, bare and with ordinary arguments → allow", otherThan(reviewerSet, ORDINARY, "allow").length === 0, otherThan(reviewerSet, ORDINARY, "allow").join(" | "));
 check("reviewer rules: the same set is agent sp-reviewer's", eq(mod.agentConfig({ write: false, temp }).agent["sp-reviewer"].permission, reviewerSet));
 // options.permission: in full for the writer, only its deny rules for the reviewer (spec §3.6 А4)
@@ -840,6 +844,14 @@ check("options.permission read: a reviewer takes the deny pattern (secret/*), no
 check("options.permission: the agent sp-reviewer of a writer's job has the same narrowed set", eq(mod.agentConfig({ write: true, temp, options: { permission: widening } }).agent["sp-reviewer"].permission, widened.permission));
 const writerSet = mod.agentConfig({ write: true, temp, options: { permission: widening } }).permission;
 check("options.permission: a writer takes all of it (edit, bash, task allow; read *.env allow; secret/* deny)", decide(writerSet, "edit", "src/a.js") === "allow" && decide(writerSet, "bash", "rm -rf src") === "allow" && decide(writerSet, "read", ".env") === "allow" && decide(writerSet, "read", "secret/k.txt") === "deny" && decide(writerSet, "external_directory", "/etc/passwd") === "allow");
+// A deny of a whole key the reviewer holds as patterns (bash: "deny", or its "*" pattern with nothing but denies)
+// replaces those patterns: merged as the key's "*", it would keep the first place and the git allows after it win.
+for (const bash of ["deny", { "*": "deny" }, { "*": "deny", "rm *": "deny", "git push*": "allow" }]) {
+  const set = mod.agentConfig({ write: false, temp, options: { permission: { bash } } }).permission;
+  check(`options.permission bash ${JSON.stringify(bash)}: the reviewer's bash is "deny" — git diff / show / log / status too`, set.bash === "deny" && otherThan(set, ORDINARY, "deny").length === 0, `bash: ${JSON.stringify(set.bash)}; ${otherThan(set, ORDINARY, "deny").join(" | ")}`);
+}
+m = mod.mergePermission(base, { read: { "*": "deny", "src/*": "allow" } });
+check("merge: patterns that deny * and nothing else replace a key held as patterns with deny; a * deny beside an allow keeps the allow", mod.mergePermission(base, { read: { "*": "deny", "src/*": "deny" } }).read === "deny" && decide(m, "read", "src/a.js") === "allow" && decide(m, "read", "b.js") === "deny", JSON.stringify(m.read));
 
 // classifyError: OpenCode error objects → classes (spec §3.8, [02 §11])
 const api = (statusCode, message, responseBody) => ({ name: "APIError", data: { message, statusCode, isRetryable: false, ...(responseBody ? { responseBody } : {}) } });
@@ -1069,6 +1081,8 @@ let got = await levels(keyedProfile(), dctx2([], { status: 0, stdout: listing2([
 check("doctorChecks: a key whose isolated home does not exist yet → no check, no auth list", eq(got, []) && dexecs.length === 0, JSON.stringify(got));
 got = await levels(keyedProfile(), dctx2([isoHome], { status: 0, stdout: listing2(["DeepSeek"]) }));
 check("doctorChecks: a key in its isolated home → auth list there (its XDG_DATA_HOME); the provider listed → login FAIL", eq(got, ["login:FAIL"]) && eq(dexecs.at(-1), ["opencode", "auth", "list", path.join(isoHome, "data")]), `${JSON.stringify(got)} ${JSON.stringify(dexecs)}`);
+const loginHint = (await oc.doctorChecks(keyedProfile(), dctx2([isoHome], { status: 0, stdout: listing2(["DeepSeek"]) }))).find((c) => c.name === "login")?.hint ?? "";
+check("doctorChecks: … its hint names the auth.json to remove, not `opencode auth logout` (which rewrites the file to {}, still refused)", loginHint.includes(`remove ${authFile}: a keyed profile needs no login`) && !loginHint.includes("-- opencode auth logout"), loginHint);
 got = await levels(keyedProfile(), dctx2([isoHome], { status: 0, stdout: listing2(["GitHub Copilot"]) }));
 check("doctorChecks: … another provider listed → login ok", eq(got, ["login:ok"]), JSON.stringify(got));
 got = await levels(keyedProfile(), dctx2([isoHome], { status: 1, stdout: "" }));

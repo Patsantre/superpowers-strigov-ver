@@ -85,6 +85,11 @@ const PERMISSION_ROW_RE = /sandbox|approval|permission/;
 // A mode or approval-policy literal in such a row [04b §7]; `ask` goes with every mode but danger-full-access, so it
 // says nothing. Not part of a path or a longer word.
 const MODE_LITERAL_RE = /(?<![\w./-])(read-only|workspace-write|danger-full-access|never)(?![\w./-])/g;
+// What doctor grades: the `mode` / `policy` key of a sandbox or approval row (`sandbox-policy.mode`,
+// `approval-policy.policy` [04b §7]). A literal anywhere else — a permission-presets row [04b §7], another key — is a
+// shape the dump was not seen in (its format is unverified), so it is reported as not verified, never graded.
+const GRADED_ROW_RE = /sandbox|approval/;
+const GRADED_LITERAL_RE = /(?<![\w-])["']?(?:mode|policy)["']?\s*:\s*["']?(read-only|workspace-write|danger-full-access|never)(?![\w./-])/g;
 // The layers of $DSH_HOME that outrank the bundle's rows, in dsh's order (the home layer outranks the profile's) [04b §2].
 const HOME_LAYERS = [["profiles", "headless", "cordis.patch.yml"], ["cordis.patch.yml"]];
 // The row that loads AGENTS.md / CLAUDE.md [04b §9]: it must not be disabled (spec §3.6 A6).
@@ -338,27 +343,39 @@ function dumpSection(dump, id) {
 }
 
 // What the permission rows of a dump say (spec §3.6 A4): [{ id, value }], value a mode or policy literal of the row
-// itself, or "DSH_PERMISSION_MODE" for a line that names the variable — the bundle row is `DSH_PERMISSION_MODE ??
-// 'workspace-write'` [04b §7], and whether the dump prints it resolved or as written is unverified, so the fallback
-// literal of such a line is not the row's. Empty when no row matches PERMISSION_ROW_RE or none names a mode.
+// itself, or "DSH_PERMISSION_MODE" for a line of a sandbox / approval row that names the variable — the bundle row is
+// `DSH_PERMISSION_MODE ?? 'workspace-write'` [04b §7], and whether the dump prints it resolved or as written is
+// unverified, so the fallback literal of such a line is not the row's. A literal outside the mode / policy key of a
+// sandbox or approval row (GRADED_LITERAL_RE) comes as { id, value, unverified: true }. Empty when no row matches
+// PERMISSION_ROW_RE or none names a mode.
 export function permissionRows(dump) {
   const ids = [...String(dump ?? "").matchAll(/^\s*-\s+id:\s*["']?([A-Za-z0-9._:/-]+)["']?\s*$/gm)].map((m) => m[1]);
   const found = [];
   for (const id of new Set(ids.filter((name) => PERMISSION_ROW_RE.test(name)))) {
+    const graded = GRADED_ROW_RE.test(id);
     for (const line of (dumpSection(dump, id) ?? "").split("\n")) {
-      if (/\bDSH_PERMISSION_MODE\b/.test(line)) found.push({ id, value: "DSH_PERMISSION_MODE" });
-      else for (const m of line.matchAll(MODE_LITERAL_RE)) found.push({ id, value: m[1] });
+      if (graded && /\bDSH_PERMISSION_MODE\b/.test(line)) {
+        found.push({ id, value: "DSH_PERMISSION_MODE" });
+        continue;
+      }
+      // Where the literal of each `mode:` / `policy:` key of this line starts.
+      const keyed = new Set(graded ? [...line.matchAll(GRADED_LITERAL_RE)].map((m) => m.index + m[0].length - m[1].length) : []);
+      for (const m of line.matchAll(MODE_LITERAL_RE)) found.push(keyed.has(m.index) ? { id, value: m[1] } : { id, value: m[1], unverified: true });
     }
   }
   return found;
 }
 
-// The dsh-permissions row from a dump doctor ran as a reviewer (DSH_PERMISSION_MODE=read-only): ok when the
-// permission rows show read-only or follow the variable; FAIL when one shows another mode or approval never (the
-// danger-full-access preset [04b §7]), i.e. a layer replaced the bundle's row; WARN when the dump shows none of them.
-// The home layers are only stat'ed, never read: the hint names those that exist.
+// The dsh-permissions row from a dump doctor ran as a reviewer (DSH_PERMISSION_MODE=read-only): ok when the mode /
+// policy of the sandbox and approval rows show read-only or follow the variable; FAIL when one shows another mode or
+// approval never (the danger-full-access preset [04b §7]), i.e. a layer replaced the bundle's row; WARN (not verified)
+// when a mode literal sits anywhere else — a presets row, another key: the real dump format is unverified, so such a
+// row is neither proof nor breach — or when the dump shows none of them. The home layers are only stat'ed, never
+// read: the hint names those that exist.
 function permissionCheck(dump, writer, dshHome, ctx) {
-  const found = permissionRows(dump);
+  const rows = permissionRows(dump);
+  const found = rows.filter((row) => !row.unverified);
+  const unverified = rows.filter((row) => row.unverified);
   const shown = (list) => [...new Set(list.map(({ id, value }) => (value === "DSH_PERMISSION_MODE" ? `${id} follows DSH_PERMISSION_MODE` : `${id} ${value}`)))].join(", ");
   const wider = found.filter(({ value }) => value !== "read-only" && value !== "DSH_PERMISSION_MODE");
   if (wider.length > 0) {
@@ -368,6 +385,13 @@ function permissionCheck(dump, writer, dshHome, ctx) {
     return {
       level: "FAIL",
       hint: `writer ${writer}, reviewer ${modes.length > 0 ? "NOT read-only" : "read-only overridden"}: --dump-config with DSH_PERMISSION_MODE=read-only shows ${shown(wider)} — a row of $DSH_HOME/cordis.patch.yml (or profiles/headless/cordis.patch.yml) overrides DSH_PERMISSION_MODE: ${effect}; ${layers.length > 0 ? `check ${layers.join(", ")} (not read here)` : `no such file in ${dshHome}: check the bundle's rows`}`,
+    };
+  }
+  if (unverified.length > 0) {
+    const graded = found.length > 0 ? `; the sandbox / approval rows show ${shown(found)}` : "";
+    return {
+      level: "WARN",
+      hint: `writer ${writer}, reviewer read-only (DSH_PERMISSION_MODE) not verified: --dump-config with DSH_PERMISSION_MODE=read-only shows ${shown(unverified)} outside the mode / policy of a sandbox or approval row, a shape not graded here${graded}; check the dump by hand`,
     };
   }
   if (found.length > 0) {

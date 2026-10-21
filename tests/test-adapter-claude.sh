@@ -220,6 +220,10 @@ main() {
     "cant":  { "harness": "claude", "auth": { "keyEnv": "TEST_KEY_VAR" }, "authHeader": "x-api-key", "model": "claude-sonnet-5", "bin": "$BIN" },
     "cantb": { "harness": "claude", "auth": { "keyEnv": "TEST_KEY_VAR" }, "model": "claude-sonnet-5", "bin": "$BIN" },
     "cloc":  { "harness": "claude", "auth": "none", "endpoint": "http://127.0.0.1:9931", "model": "qwen3-coder", "bin": "$BIN", "maxParallel": 1 },
+    "coll":  { "harness": "claude", "auth": "none", "endpoint": "http://127.0.0.1:11434", "model": "qwen3-coder", "bin": "$BIN",
+               "env": { "ANTHROPIC_AUTH_TOKEN": "ollama", "ANTHROPIC_API_KEY": "" } },
+    "cslopt": { "harness": "claude", "auth": "login", "model": "opus", "bin": "$BIN", "options": { "settings": {
+                 "apiKeyHelper": "/bin/echo k", "env": { "CLAUDE_CODE_USE_VERTEX": "1", "ANTHROPIC_BASE_URL": "https://gateway.example.test", "FOO_SETTING": "bar" } } } },
     "ceff":  { "harness": "claude", "auth": { "keyEnv": "TEST_KEY_VAR" }, "endpoint": "https://api.deepseek.com/anthropic",
                "model": "deepseek-v4-pro", "effort": "high", "bin": "$BIN", "env": { "CLAUDE_CODE_EFFORT_LEVEL": "max" } },
     "copt":  { "harness": "claude", "auth": { "keyEnv": "TEST_KEY_VAR" }, "endpoint": "https://api.example.test/anthropic", "model": "m-o",
@@ -416,6 +420,14 @@ EOF
         && "$(jget "$REC" 'r.argv[r.argv.indexOf("--setting-sources") + 1]')" == "" && "$(jobf "$ID" r.hasSecret)" == false \
         && "$(jget "$d/settings.json" r.permissions.deny)" == '["WebSearch","WebFetch"]' && "$(jget "$REC" r.env.ANTHROPIC_DEFAULT_FABLE_MODEL)" == qwen3-coder ]]
     verdict "2 none: ANTHROPIC_API_KEY=local-dummy, no AUTH_TOKEN, the endpoint, an isolated dir, no key handed over" $? "st=$st env=$(jget "$REC" 'JSON.stringify(Object.fromEntries(Object.entries(r.env).filter(([k]) => k.startsWith("ANTHROPIC_"))))')"
+    # The Ollama recipe in profile.env (ANTHROPIC_AUTH_TOKEN=ollama, ANTHROPIC_API_KEY="" [08]) replaces the dummy.
+    task_on coll none-ollama -- --write
+    st="$(wait_job "$ID")"
+    [[ "$RC" -eq 0 && "$st" == completed && "$(jget "$REC" r.env.ANTHROPIC_AUTH_TOKEN)" == ollama && "$(jget "$REC" 'JSON.stringify(r.env.ANTHROPIC_API_KEY)')" == '""' \
+        && "$(jget "$REC" r.env.ANTHROPIC_BASE_URL)" == http://127.0.0.1:11434 && "$(jget "$REC.claude.json" r.headers)" == '["authorization"]' \
+        && "$(jget "$REC.claude.json" r.credential)" == oauth_token && "$(jobf "$ID" r.hasSecret)" == false ]]
+    verdict "2 none with the Ollama recipe in profile.env: runs, ANTHROPIC_AUTH_TOKEN=ollama and ANTHROPIC_API_KEY=\"\" reach claude as given (one Bearer header)" $? \
+        "rc=$RC err=$ERR st=$st env=$(jget "$REC" 'JSON.stringify(Object.fromEntries(Object.entries(r.env).filter(([k]) => k.startsWith("ANTHROPIC_"))))')" "headers: $(jget "$REC.claude.json" r.headers)"
     task_on czai badname "ANTHROPIC_A.B=1"
     st="$(wait_job "$ID")"
     [[ "$RC" -eq 0 && "$st" == completed && "$(jget "$REC" '"ANTHROPIC_A.B" in r.env')" == false ]]
@@ -586,6 +598,19 @@ EOF
     [[ "$st" == completed && "$(jget "$JOBS/$ID/settings.json" r.sandbox)" == '{"autoAllowBashIfSandboxed":false}' && "$(jget "$REC.claude.json" r.bash)" == '{"touch x":"deny","git diff":"allow"}' ]]
     verdict "7 a sandbox enabled in the user settings does not auto-allow a reviewer's Bash" $? "st=$st sandbox=$(jget "$JOBS/$ID/settings.json" r.sandbox) bash=$(jget "$REC.claude.json" r.bash)"
     printf '%s\n' "$user_settings" >"$HOME/.claude/settings.json"
+    # A login profile with "home": "isolated" loads homes/<p>/claude/settings.json as its user settings: the same denial.
+    printf '%s\n' '{"permissions":{"allow":["Bash(npm install:*)","Bash(git log:*)"]}}' >"$STATE/homes/ciso/claude/settings.json"
+    task_on ciso allow-iso 'AGENT_STUB_BASH_PROBE=["npm install left-pad","git log --oneline"]' -- --role phase-review
+    st="$(wait_job "$ID")"
+    [[ "$st" == completed && "$(jget "$JOBS/$ID/settings.json" r.permissions)" == '{"deny":['"$GIT_DENY"',"Bash(npm install:*)"]}' \
+        && "$(jget "$REC.claude.json" r.bash)" == '{"npm install left-pad":"deny","git log --oneline":"allow"}' \
+        && "$(jget "$REC.claude.json" r.configDir)" == "$STATE/homes/ciso/claude" && "$(jget "$REC.claude.json" 'r.permissions.allow.includes("Bash(npm install:*)")')" == true ]]
+    verdict "7 login + home isolated reviewer: an allow rule past the git commands in homes/ciso/claude/settings.json is denied in the overlay" $? \
+        "st=$st permissions=$(jget "$JOBS/$ID/settings.json" r.permissions)" "bash: $(jget "$REC.claude.json" r.bash) configDir: $(jget "$REC.claude.json" r.configDir)"
+    run_ad doctor --profile ciso
+    [[ "$OUT" == *"WARN permissions ciso: allow rules past a reviewer's read-only set (spec §3.6 A4): $STATE/homes/ciso/claude/settings.json allows Bash(npm install:*): denied for reviewers"* ]]
+    verdict "7 doctor: WARN naming the isolated home's allow rule" $? "$OUT"
+    rm -f "$STATE/homes/ciso/claude/settings.json"
 
     # --- 8. signals: outside SIGINT / SIGTERM, cancel ladder, timeout ---
     task_on cerr sigint AGENT_STUB_MODE=wait "AGENT_STUB_SIGNALS=$TEST_ROOT/sig-int.txt"
@@ -822,6 +847,16 @@ check("the unrecognized_model notice alone matches no pattern → crash", v.erro
 check("denials with a result: completed, remark appended, tools deduplicated", v.status === "completed" && r.response.startsWith("DONE\nreport\n\n---\nagent-dispatch: permission_denials: the permission mode refused 2 tool call(s) (Bash)") && r.meta.permissionDenials === 2, r);
 ({ r, v } = verdictOf(line({ result: "   ", permission_denials: [{ tool_name: "Edit" }] })));
 check("denials with a blank result → blocked", v.errorClass === "blocked", r);
+// A result line cut off by a SIGTERM (exit 143, or the signal itself): no result, whatever the text before the cut.
+const whole = line({ result: "DONE\nall good" }).trimEnd();
+for (const [label, stdout, exit] of [
+  ["cut before its closing brace", whole.slice(0, -1), { code: 143, signal: null }],
+  ["cut inside the result text", whole.slice(0, whole.indexOf("all good") + 3), { code: 143, signal: null }],
+  ["cut, the signal reported", whole.slice(0, -1), { code: null, signal: "SIGTERM" }],
+]) {
+  ({ r, v } = verdictOf(stdout, { exit }));
+  check(`a result line ${label} (SIGTERM) → not success: failed/crash`, r.ok === false && r.response === null && v.status === "failed" && v.errorClass === "crash" && r.errorText.startsWith("claude printed no result"), { r, v });
+}
 // The class comes from api_error_status alone: provider texts that no pattern matches (unclassified, they would be crash).
 for (const [status, text, want] of [
   [401, "API Error: 401 Unauthorized", "auth"], [403, "API Error: 403 Access denied", "auth"], [402, "API Error: 402 Payment Required", "quota"],
@@ -878,6 +913,11 @@ for (const [settings, keys] of [
   [{ env: { CLAUDE_CODE_USE_VERTEX: "1" } }, "env.CLAUDE_CODE_USE_VERTEX"], [{ env: { CLAUDE_CODE_USE_FOUNDRY: 1 } }, "env.CLAUDE_CODE_USE_FOUNDRY"],
   [{ env: { ANTHROPIC_CUSTOM_HEADERS: "Authorization: Bearer x" } }, "env.ANTHROPIC_CUSTOM_HEADERS"],
   [{ apiKeyHelper: "h", env: { ANTHROPIC_BASE_URL: "https://g.test", ANTHROPIC_AUTH_TOKEN: "t" } }, "env.ANTHROPIC_AUTH_TOKEN, env.ANTHROPIC_BASE_URL, apiKeyHelper"],
+  // [01 §6] ranks CLAUDE_CODE_OAUTH_TOKEN above the /login subscription.
+  [{ env: { CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-other" } }, "env.CLAUDE_CODE_OAUTH_TOKEN"],
+  // The cloud provider switches count when on: 1, true, yes, on in any case.
+  [{ env: { CLAUDE_CODE_USE_BEDROCK: "TRUE", CLAUDE_CODE_USE_VERTEX: "Yes", CLAUDE_CODE_USE_FOUNDRY: true } }, "env.CLAUDE_CODE_USE_BEDROCK, env.CLAUDE_CODE_USE_VERTEX, env.CLAUDE_CODE_USE_FOUNDRY"],
+  [{ env: { CLAUDE_CODE_USE_BEDROCK: " on " } }, "env.CLAUDE_CODE_USE_BEDROCK"],
 ]) {
   const sctx = withSettings(settings, "/home/u/.claude/settings.json");
   const errors = ["review", "write", "probe"].map((how) => refusalOf(login, sctx, how));
@@ -891,6 +931,80 @@ const isoError = refusalOf(isoLogin, withSettings({ apiKeyHelper: "h" }, isoFile
 check("login + home isolated: its own settings.json is checked", isoError instanceof core.UsageError && isoError.message === `profile p1: ${isoFile} sets apiKeyHelper: ${tail}`, isoError?.message);
 const clean = refusalOf(login, withSettings({ apiKeyHelper: "", env: { ANTHROPIC_API_KEY: "", ANTHROPIC_BASE_URL: null, ANTHROPIC_MODEL: "m", ANTHROPIC_CUSTOM_HEADERS: "X-Route: a" } }, "/home/u/.claude/settings.json"), "review");
 check("login settings with an empty key, no endpoint, a model and a header that is no credential: not refused", clean === null, clean?.message);
+for (const off of ["0", "false", "", "no", "off", "FALSE", 0, false]) {
+  const e = refusalOf(login, withSettings({ env: { CLAUDE_CODE_USE_BEDROCK: off, CLAUDE_CODE_USE_VERTEX: off, CLAUDE_CODE_USE_FOUNDRY: off } }, "/home/u/.claude/settings.json"), "review");
+  check(`login settings CLAUDE_CODE_USE_BEDROCK/_VERTEX/_FOUNDRY = ${JSON.stringify(off)}: the switches are off, not refused`, e === null, e?.message);
+}
+// The own options.settings of a login profile: the overlay carries it, so the same entries refuse the profile; the
+// ANTHROPIC_* key and endpoint names too, though group A would strip them.
+const ownTail = "a login profile runs on the claude.ai login, not on a key, a key helper, another endpoint or a cloud provider (spec §3.6 A2); remove them from options.settings, or define an API profile for the key";
+const noUserFile = withSettings({}, "/nowhere/settings.json");
+for (const [settings, keys] of [
+  [{ apiKeyHelper: "/bin/echo k" }, "apiKeyHelper"],
+  [{ env: { CLAUDE_CODE_USE_BEDROCK: "true" } }, "env.CLAUDE_CODE_USE_BEDROCK"],
+  [{ env: { CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-other" } }, "env.CLAUDE_CODE_OAUTH_TOKEN"],
+  [{ env: { ANTHROPIC_CUSTOM_HEADERS: "X-Route: a\nx-api-key: k" } }, "env.ANTHROPIC_CUSTOM_HEADERS"],
+  [{ env: { ANTHROPIC_BASE_URL: "https://g.test", ANTHROPIC_API_KEY: "k", ANTHROPIC_AUTH_TOKEN: "t" } }, "env.ANTHROPIC_AUTH_TOKEN, env.ANTHROPIC_API_KEY, env.ANTHROPIC_BASE_URL"],
+]) {
+  const errors = ["review", "write", "probe"].map((how) => refusalOf({ ...login, options: { settings } }, noUserFile, how));
+  check(`login options.settings ${keys}: refused for reviewer, writer and probe`, errors.every((e) => e instanceof core.UsageError && e.message === `profile p1: options.settings sets ${keys}: ${ownTail}`), errors.map((e) => e?.message ?? null));
+}
+const bothSources = refusalOf({ ...login, options: { settings: { apiKeyHelper: "h" } } }, withSettings({ env: { ANTHROPIC_API_KEY: "k" } }, "/home/u/.claude/settings.json"), "write");
+check("login options.settings and user settings both leaving the login: one refusal names both", bothSources?.message === `profile p1: options.settings sets apiKeyHelper: ${ownTail}; /home/u/.claude/settings.json sets env.ANTHROPIC_API_KEY: ${tail}`, bothSources?.message);
+const ownClean = refusalOf({ ...login, options: { settings: { apiKeyHelper: "", env: { CLAUDE_CODE_USE_VERTEX: "0", ANTHROPIC_API_KEY: "", ANTHROPIC_MODEL: "m", FOO: "1" }, permissions: { allow: ["Bash(npm test:*)"] } } } }, noUserFile, "write");
+check("login options.settings without a key, helper, endpoint or provider switched on: not refused", ownClean === null, ownClean?.message);
+const apiOwn = refusalOf({ harness: "claude", auth: { keyEnv: "K" }, endpoint: "https://e.test", model: "m", options: { settings: { apiKeyHelper: "h" } } }, noUserFile, "write");
+check("API profile with an apiKeyHelper in options.settings: not refused (group A drops it)", apiOwn === null, apiOwn?.message);
+// doctor rows (auth status cannot run here: a WARN of its own).
+const doctorCtx = (files) => core.makeCtx({ env: { HOME: "/home/u", PATH: "/bin" }, profileName: "p1", exec: () => ({ error: { code: "ENOENT" } }), fs: { readFile: (f) => files[f] ?? null, exists: () => false, stat: () => null, readdir: () => null } });
+const ownRows = adapter.doctorChecks({ ...login, options: { settings: { apiKeyHelper: "h", env: { ANTHROPIC_BASE_URL: "https://g.test", CLAUDE_CONFIG_DIR: "/x" } } } }, doctorCtx({}));
+const rowsNamed = (rows, name) => JSON.stringify(rows.filter((row) => row.name === name));
+check("doctor: options.settings of a login profile leaving the login is FAIL settings; its key and endpoint names are not also listed as ignored",
+  rowsNamed(ownRows, "settings") === JSON.stringify([
+    { name: "settings", level: "FAIL", hint: `options.settings sets env.ANTHROPIC_BASE_URL, apiKeyHelper: ${ownTail}; every task is refused` },
+    { name: "settings", level: "WARN", hint: "options.settings env.CLAUDE_CONFIG_DIR: set by the adapter (spec §3.6 A), ignored" },
+  ]) && rowsNamed(ownRows, "user-settings") === "[]", ownRows);
+// A user settings.json that exists but does not parse: doctor WARN user-settings (no parser text: it may quote a key),
+// the task is not refused; an empty file is no file.
+const SECRET = "sk-unit-broken-0123";
+const parseWarn = "cannot parse /home/u/.claude/settings.json as JSON, so it was not checked for a key, an apiKeyHelper or an endpoint (spec §3.6 A2); claude may still apply it — check it";
+for (const [label, raw, rows] of [
+  ["a bare word for a value", `{"env":{"ANTHROPIC_API_KEY":${SECRET}}}`, [{ name: "user-settings", level: "WARN", hint: parseWarn }]],
+  ["only whitespace", " \n", []],
+]) {
+  const files = { "/home/u/.claude/settings.json": raw };
+  const got = adapter.doctorChecks(login, doctorCtx(files));
+  const refused = ["review", "write"].map((how) => refusalOf(login, doctorCtx(files), how));
+  check(`user settings.json with ${label}: doctor ${rows.length > 0 ? "WARN user-settings, the text of the file not quoted" : "no user-settings row"}; the task is not refused`,
+    rowsNamed(got, "user-settings") === JSON.stringify(rows) && !JSON.stringify(got).includes(SECRET) && refused.every((e) => e === null), { got, refused: refused.map((e) => e?.message ?? null) });
+}
+// A BOM before the JSON (a Windows editor) is dropped, so the file is checked like any other: a key there refuses.
+{
+  const files = { "/home/u/.claude/settings.json": `﻿${JSON.stringify({ env: { ANTHROPIC_API_KEY: SECRET } })}` };
+  const got = adapter.doctorChecks(login, doctorCtx(files));
+  const refused = ["review", "write"].map((how) => refusalOf(login, doctorCtx(files), how));
+  const why = `/home/u/.claude/settings.json sets env.ANTHROPIC_API_KEY: ${tail}`;
+  check("user settings.json with a BOM before the JSON: checked like any other — a key there is FAIL user-settings and refuses the task, the key not quoted",
+    rowsNamed(got, "user-settings") === JSON.stringify([{ name: "user-settings", level: "FAIL", hint: `${why}; every task is refused` }]) && !JSON.stringify(got).includes(SECRET)
+      && refused.every((e) => e instanceof core.UsageError && e.message === `profile p1: ${why}`), { got, refused: refused.map((e) => e?.message ?? null) });
+}
+// profile.env of a login profile reaches the environment of claude: another token, a cloud switch that is on or an auth
+// header there refuses the profile (its ANTHROPIC_* key and endpoint names are group A, a mandatory conflict of the core).
+const envTail = "a login profile runs on the claude.ai login, not on another token or a cloud provider (spec §3.6 A2); remove them from profile.env, or define an API profile for the key";
+for (const [env, names] of [
+  [{ CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-other" }, "CLAUDE_CODE_OAUTH_TOKEN"],
+  [{ CLAUDE_CODE_USE_BEDROCK: "1", AWS_PROFILE: "work" }, "CLAUDE_CODE_USE_BEDROCK"],
+  [{ ANTHROPIC_CUSTOM_HEADERS: "Authorization: Bearer t" }, "ANTHROPIC_CUSTOM_HEADERS"],
+]) {
+  const errors = ["review", "write", "probe"].map((how) => refusalOf({ ...login, env }, noUserFile, how));
+  const rows = adapter.doctorChecks({ ...login, env }, doctorCtx({}));
+  check(`login profile.env ${names}: refused for reviewer, writer and probe; doctor FAIL profile-env`,
+    errors.every((e) => e instanceof core.UsageError && e.message === `profile p1: profile.env sets ${names}: ${envTail}`)
+      && rowsNamed(rows, "profile-env") === JSON.stringify([{ name: "profile-env", level: "FAIL", hint: `profile.env sets ${names}: ${envTail}; every task is refused` }]),
+    { errors: errors.map((e) => e?.message ?? null), rows });
+}
+const envClean = refusalOf({ ...login, env: { CLAUDE_CODE_USE_VERTEX: "0", CLAUDE_CODE_OAUTH_TOKEN: null, ANTHROPIC_MODEL: "m" } }, noUserFile, "write");
+check("login profile.env with a switch off, a removed token and a model: not refused", envClean === null, envClean?.message);
 check("no loginEnv: profile env exports the env of prepareHome, the isolated CLAUDE_CONFIG_DIR", !("loginEnv" in adapter) && JSON.stringify(adapter.prepareHome(isoLogin, userCtx).env) === JSON.stringify({ CLAUDE_CONFIG_DIR: path.join(userCtx.paths.homes, "p1", "claude") }), adapter.prepareHome(isoLogin, userCtx));
 const boxed = { harness: "claude", auth: { keyEnv: "K" }, endpoint: "https://e.test", model: "m", options: { settings: { sandbox: { enabled: true } } } };
 check("options.settings sandbox without native: no auto-allow for a reviewer, untouched for a writer", JSON.stringify(overlay(plan(boxed, false)).sandbox) === "{\"enabled\":true,\"autoAllowBashIfSandboxed\":false}" && JSON.stringify(overlay(plan(boxed, true)).sandbox) === "{\"enabled\":true}", [overlay(plan(boxed, false)).sandbox, overlay(plan(boxed, true)).sandbox]);
@@ -912,8 +1026,9 @@ for (const l of lines) console.log(l);
 
     # --- 15. a login profile's settings.json that leaves the login (spec §3.6 A2) ---
     # `--setting-sources user` applies its env and apiKeyHelper [01 E18], past the removal of the inherited ANTHROPIC_*:
-    # a key, a key helper, an endpoint, a cloud provider or a credential header there refuses the profile before launch
-    # (exit 2, no job), and doctor FAILs it; auth status shows which credential claude would take instead.
+    # a key, a key helper, an endpoint, a cloud provider switched on, a CLAUDE_CODE_OAUTH_TOKEN or a credential header
+    # there refuses the profile before launch (exit 2, no job), and doctor FAILs it; auth status shows which credential
+    # claude would take instead.
     user_settings="$(cat "$HOME/.claude/settings.json")"
     local refusal_tail="claude would use that key or endpoint instead of the claude.ai login (spec §3.6 A2); remove them there, or define an API profile for the key"
     local entry keys json auth_row
@@ -924,6 +1039,7 @@ for (const l of lines) console.log(l);
         'apiKeyHelper|{"apiKeyHelper":"/bin/echo k"}|FAIL auth-status csub: claude takes a key in '"$HOME"'/.claude, not the claude.ai login (authMethod api_key_helper, apiKeySource apiKeyHelper)'
         'env.CLAUDE_CODE_USE_BEDROCK|{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}|auth-status csub'
         'env.ANTHROPIC_CUSTOM_HEADERS|{"env":{"ANTHROPIC_CUSTOM_HEADERS":"X-Route: a\nx-api-key: k"}}|auth-status csub'
+        'env.CLAUDE_CODE_OAUTH_TOKEN|{"env":{"CLAUDE_CODE_OAUTH_TOKEN":"sk-ant-oat01-other-account"}}|WARN auth-status csub: claude takes a token variable in '"$HOME"'/.claude, not the claude.ai login (authMethod oauth_token, apiKeySource CLAUDE_CODE_OAUTH_TOKEN)'
     )
     n="$(count_records "$JOBS")"
     for entry in "${offending[@]}"; do
@@ -951,15 +1067,47 @@ for (const l of lines) console.log(l);
     [[ "$RC" -eq 2 && "$ERR" == "agent-dispatch: profile ciso: $STATE/homes/ciso/claude/settings.json sets apiKeyHelper: $refusal_tail" && ! -e "$REC" ]]
     verdict "15 login + home isolated: the profile's own settings.json is checked the same way" $? "rc=$RC err=$ERR"
     rm -f "$STATE/homes/ciso/claude/settings.json"
-    # Entries that keep the login: an empty key variable, a model, a header that is no credential.
-    printf '%s\n' '{"env":{"ANTHROPIC_API_KEY":"","ANTHROPIC_MODEL":"opus","ANTHROPIC_CUSTOM_HEADERS":"X-Route: team-a","CLAUDE_CODE_EFFORT_LEVEL":"low"}}' >"$HOME/.claude/settings.json"
+    # Entries that keep the login: an empty key variable, a model, a header that is no credential, provider switches off.
+    printf '%s\n' '{"env":{"ANTHROPIC_API_KEY":"","ANTHROPIC_MODEL":"opus","ANTHROPIC_CUSTOM_HEADERS":"X-Route: team-a","CLAUDE_CODE_EFFORT_LEVEL":"low","CLAUDE_CODE_USE_BEDROCK":"0","CLAUDE_CODE_USE_VERTEX":"false"}}' >"$HOME/.claude/settings.json"
     task_on csub leave-clean -- --write
     st="$(wait_job "$ID")"
     [[ "$RC" -eq 0 && "$st" == completed && "$(jget "$REC.claude.json" r.credential)" == claude.ai ]]
-    verdict "15 user settings without a key, helper or endpoint: the login profile runs on the login" $? "rc=$RC err=$ERR st=$st credential=$(jget "$REC.claude.json" r.credential)"
+    verdict "15 user settings without a key, helper, endpoint or provider switched on (0, false): the login profile runs on the login" $? "rc=$RC err=$ERR st=$st credential=$(jget "$REC.claude.json" r.credential)"
     run_ad doctor --profile csub
     [[ "$OUT" != *"user-settings csub"* && "$OUT" == *"ok auth-status csub: logged in (authMethod claude.ai) in $HOME/.claude"* ]]
     verdict "15 doctor: no user-settings row, ok auth-status" $? "$OUT"
+    # The profile's own options.settings (cslopt: an apiKeyHelper, Vertex switched on, an endpoint) refuses it the same way.
+    local own_tail="a login profile runs on the claude.ai login, not on a key, a key helper, another endpoint or a cloud provider (spec §3.6 A2); remove them from options.settings, or define an API profile for the key"
+    task_on cslopt leave-own -- --write
+    [[ "$RC" -eq 2 && "$ERR" == "agent-dispatch: profile cslopt: options.settings sets env.ANTHROPIC_BASE_URL, env.CLAUDE_CODE_USE_VERTEX, apiKeyHelper: $own_tail" && -z "$ID" && ! -e "$REC" ]]
+    verdict "15 a login profile whose options.settings leaves the login: refused (exit 2, nothing runs), naming options.settings" $? "rc=$RC err=$ERR"
+    run_ad doctor --profile cslopt
+    [[ "$RC" -ne 0 && "$OUT" == *"FAIL settings cslopt: options.settings sets env.ANTHROPIC_BASE_URL, env.CLAUDE_CODE_USE_VERTEX, apiKeyHelper: $own_tail; every task is refused"* \
+        && "$OUT" != *"WARN settings cslopt"* && "$OUT" != *"FAIL env cslopt"* ]]
+    verdict "15 doctor: FAIL settings for such options.settings (the endpoint not also listed as ignored), no second FAIL env row" $? "$OUT"
+    # Both sources at once: one refusal names both, and doctor reports it as the two adapter rows, without an env row.
+    printf '%s\n' '{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example.test"}}' >"$HOME/.claude/settings.json"
+    task_on cslopt leave-both -- --write
+    [[ "$RC" -eq 2 && "$ERR" == "agent-dispatch: profile cslopt: options.settings sets env.ANTHROPIC_BASE_URL, env.CLAUDE_CODE_USE_VERTEX, apiKeyHelper: $own_tail; $HOME/.claude/settings.json sets env.ANTHROPIC_BASE_URL: $refusal_tail" \
+        && -z "$ID" && ! -e "$REC" ]]
+    verdict "15 options.settings and the user settings.json both leave the login: one refusal names both (exit 2, nothing runs)" $? "rc=$RC err=$ERR"
+    run_ad doctor --profile cslopt
+    [[ "$RC" -ne 0 && "$OUT" == *"FAIL settings cslopt: options.settings sets env.ANTHROPIC_BASE_URL, env.CLAUDE_CODE_USE_VERTEX, apiKeyHelper: $own_tail; every task is refused"* \
+        && "$OUT" == *"FAIL user-settings cslopt: $HOME/.claude/settings.json sets env.ANTHROPIC_BASE_URL: $refusal_tail; every task is refused"* \
+        && "$OUT" != *"FAIL env cslopt"* ]]
+    verdict "15 doctor: both causes as FAIL settings and FAIL user-settings, no FAIL env row for the joined refusal" $? "$OUT"
+    printf '%s\n' "$user_settings" >"$HOME/.claude/settings.json"
+    # A settings.json that exists but does not parse: claude's own reading of it is unverified, so doctor warns (without
+    # quoting the file) and the task runs.
+    printf '%s\n' '{"env":{"ANTHROPIC_API_KEY":sk-broken-123}}' >"$HOME/.claude/settings.json"
+    task_on csub broken-settings -- --write
+    st="$(wait_job "$ID")"
+    [[ "$RC" -eq 0 && "$st" == completed ]]
+    verdict "15 a user settings.json that does not parse: the task is not refused" $? "rc=$RC err=$ERR st=$st"
+    run_ad doctor --profile csub
+    [[ "$OUT" == *"WARN user-settings csub: cannot parse $HOME/.claude/settings.json as JSON, so it was not checked for a key, an apiKeyHelper or an endpoint (spec §3.6 A2); claude may still apply it — check it"* \
+        && "$OUT" != *"FAIL user-settings csub"* && "$OUT" != *"sk-broken-123"* ]]
+    verdict "15 doctor: WARN user-settings for a settings.json that does not parse, its text not quoted" $? "$OUT"
     printf '%s\n' "$user_settings" >"$HOME/.claude/settings.json"
 
     # --- 16. nothing left behind ---

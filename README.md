@@ -140,7 +140,7 @@ This table is the built-in scheme: with no `config.json` it is exactly what runs
 
 `bin/agent-dispatch` binds pipeline roles to **profiles**. A profile is a harness, a way to pay (the harness's own login or an API key), a model and an effort. A role takes a **chain** of profiles: the first is the primary, the others are fallbacks in order. Without a configuration file nothing changes.
 
-This release (0.12.0) ships the routing layer: profiles, keys, `route`, `doctor`, job status, and the pass-through to ZCode and Codex. You can already move the in-session roles to another Claude model or effort, and the external roles to other Codex models. Adapters for `claude -p`, DeepSeek Harness (`dsh`), OpenCode and pi come in the next releases. Until then, a profile on one of those harnesses is refused with `harness <h> is not available in this version`, and the orchestrator moves on to the next profile in the chain.
+This release (0.12.0) ships the routing layer (profiles, keys, `route`, `doctor`, job status, and the pass-through to ZCode and Codex) and the adapters for `claude -p`, DeepSeek Harness (`dsh`), OpenCode and pi. You can move the in-session roles to another Claude model or effort, and the external roles to other Codex models or to a profile on any of those four harnesses.
 
 `agent-dispatch` lives in the plugin's `bin/`. In your own terminal, call it by its absolute path; Claude can print it for you.
 
@@ -157,7 +157,7 @@ agent-dispatch doctor --profile deepseek-claude --probe             # 3. offline
 2. Store the key yourself, in your own terminal. `key set <name>` asks for it at a hidden prompt. From a Claude Code session you can pipe it instead: `! pbpaste | agent-dispatch key set <name>`, or on Linux `wl-paste` / `xclip -o -selection clipboard`. A key passed as an argument is refused. A `login` profile uses the harness's own login. For a profile with its own isolated directory, log in there with `agent-dispatch profile env <name> -- <login command>`: `-- opencode auth login`, or `-- claude` and then `/login`, or `-- pi` and then `/login`.
 3. `doctor --profile <name>` checks everything that can be checked without a model call. `--probe` adds one short paid request on your key or subscription; you run it, the pipeline never does.
 
-In 0.12.0 every preset targets `claude`, `dsh`, OpenCode or pi, so step 3 of this example ends in `harness claude is not available in this version` until that harness's adapter ships. The profiles that work today are written by hand: another Codex model or effort, or another Claude model in the session. For example, a cheaper control review and a Sonnet plan writer:
+Every preset targets `claude`, `dsh`, OpenCode or pi, and 0.12.0 ships all four adapters, so a profile copied from a preset is ready once `doctor` passes. Profiles on the other harnesses are written by hand: another Codex model or effort, or another Claude model in the session. For example, a cheaper control review and a Sonnet plan writer:
 
 ```json
 {
