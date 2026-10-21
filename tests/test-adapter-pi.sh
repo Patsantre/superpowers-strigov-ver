@@ -898,7 +898,7 @@ console.log(JSON.stringify([check(prev, "/w"), check({ ...prev, sessionId: "pi-0
 let status = 1;
 const ctx = { profileName: "p", env: { PATH: "/b1:/b2", HOME: "/h", OPENAI_API_KEY: "leak", PI_CODING_AGENT_DIR: "/user-pi" }, paths: { homes: "/data/homes" },
   fs: { stat: (f) => (["/b2/fd", "/b1/rg"].includes(f) ? { isFile: () => true, mode: 0o755 } : null), exists: (f) => ["/data/homes/p/pi", "/ext/ok.ts"].includes(f), readdir: () => null, readFile: () => null },
-  exec: (cmd, args, opts) => { calls.push({ cmd, args, env: opts.env }); return { status, stdout: JSON.stringify({ status: "x", authType: "api_key" }), stderr: "", error: null }; } };
+  exec: (cmd, args, opts) => { calls.push({ cmd, args, env: opts.env, timeoutMs: opts.timeoutMs }); return { status, stdout: JSON.stringify({ status: "x", authType: "api_key" }), stderr: "", error: null }; } };
 const keyed = { harness: "pi", auth: { key: "zai" }, keyVar: "ZAI_API_KEY", model: "zai/glm-5.3", home: "isolated", options: { extensions: ["builtin:llama.cpp", "/ext/ok.ts"] }, wrap: ["srt", "--"] };
 const short = (list) => list.map((c) => `${c.name}:${c.level}`).join(",");
 const a = short(pi.doctorChecks(keyed, ctx));
@@ -916,10 +916,10 @@ const noExec = calls.length === before;
 const typo = pi.doctorChecks({ ...login, options: { extensions: ["builtin:"] } }, ctx).find((c) => c.name === "pi-extension");
 const first = calls[0];
 console.log(JSON.stringify([a, b, c, d, e, f, g, h, i, noExec, typo.level, typo.hint, first.cmd, first.args, first.env.PI_CODING_AGENT_DIR, first.env.PI_OFFLINE, "ZAI_API_KEY" in first.env, "OPENAI_API_KEY" in first.env,
-  calls[3].env.PI_CODING_AGENT_DIR, mod.BUILTIN_EXTENSIONS]));')"
-    want='["pi-tools:ok,pi-extension:ok,pi-auth:ok","pi-tools:ok,pi-extension:ok,pi-auth:FAIL","pi-tools:ok,pi-extension:ok,pi-auth:FAIL","pi-tools:ok,pi-auth:ok","pi-tools:ok,pi-auth:FAIL","pi-tools:ok,pi-auth:WARN","pi-tools:ok,pi-extension:FAIL,pi-extension:WARN,pi-extension:WARN,pi-auth:FAIL","pi-tools:ok,pi-extension:ok,pi-auth:FAIL","pi-tools:ok,pi-extension:ok,pi-auth:FAIL",true,"WARN","builtin: is not one of pi'"'"'s built-in extensions (builtin:mcp, builtin:llama.cpp, builtin:codemode, builtin:tool-search); pi would stop with \"Failed to load extension\" (errorClass launch)","srt",["--","pi","auth","check","--provider","zai","--json"],"/data/homes/p/pi","1",false,false,"/user-pi",["builtin:mcp","builtin:llama.cpp","builtin:codemode","builtin:tool-search"]]'
+  calls[3].env.PI_CODING_AGENT_DIR, mod.BUILTIN_EXTENSIONS, first.timeoutMs]));')"
+    want='["pi-tools:ok,pi-extension:ok,pi-auth:ok","pi-tools:ok,pi-extension:ok,pi-auth:FAIL","pi-tools:ok,pi-extension:ok,pi-auth:FAIL","pi-tools:ok,pi-auth:ok","pi-tools:ok,pi-auth:FAIL","pi-tools:ok,pi-auth:WARN","pi-tools:ok,pi-extension:FAIL,pi-extension:WARN,pi-extension:WARN,pi-auth:FAIL","pi-tools:ok,pi-extension:ok,pi-auth:FAIL","pi-tools:ok,pi-extension:ok,pi-auth:FAIL",true,"WARN","builtin: is not one of pi'"'"'s built-in extensions (builtin:mcp, builtin:llama.cpp, builtin:codemode, builtin:tool-search); pi would stop with \"Failed to load extension\" (errorClass launch)","srt",["--","pi","auth","check","--provider","zai","--json"],"/data/homes/p/pi","1",false,false,"/user-pi",["builtin:mcp","builtin:llama.cpp","builtin:codemode","builtin:tool-search"],30000]'
     [[ "$got" == "$want" ]]
-    verdict "9 doctorChecks: [{name, level, hint}] — fd/rg, extensions (an unknown builtin: → WARN naming the set), pi auth check (through wrap, the profile home, no key, no caller credentials; a credential pi holds for a keyed profile → FAIL); no exec without a provider or home, nor for a keyed profile task refuses" $? "got:  $got" "want: $want"
+    verdict "9 doctorChecks: [{name, level, hint}] — fd/rg, extensions (an unknown builtin: → WARN naming the set), pi auth check (through wrap, the profile home, no key, no caller credentials, 30 s; a credential pi holds for a keyed profile → FAIL); no exec without a provider or home, nor for a keyed profile task refuses" $? "got:  $got" "want: $want"
 
     got="$(pi_js 'const ctx = { profileName: "p", env: {}, paths: { homes: "/data/homes" } };
 const profile = { harness: "pi", auth: { key: "zai" }, keyVar: "ZAI_API_KEY", model: "zai/glm-5.3", effort: "low", home: "isolated", options: { extensions: ["builtin:llama.cpp"] } };

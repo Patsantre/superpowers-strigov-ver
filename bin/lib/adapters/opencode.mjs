@@ -461,7 +461,8 @@ async function finalize(job, ctx) {
   const reduced = job.reduced;
   if (!reduced || reduced.ok === true || reduced.errorClass || typeof reduced.sessionId !== "string" || !reduced.sessionId) return null;
   if (job.io?.exit?.signal) return null; // killed from outside: a partial session is no answer
-  const r = await ctx.execHarness(["export", reduced.sessionId]);
+  // 60 s, not ctx.exec's 10: a cold start of opencode loads its plugins and session database first.
+  const r = await ctx.execHarness(["export", reduced.sessionId], { timeoutMs: 60_000 });
   if (r.error || r.status !== 0) return { meta: { export: `failed (${r.error?.code ?? `exit ${r.status}`})` } };
   let data = null;
   try {
@@ -541,7 +542,7 @@ async function storedLogins(profile, ctx) {
   }
   Object.assign(env, homeEnvOf(profile, ctx));
   const argv = [...wrap, bin, "auth", "list"];
-  const r = await ctx.exec(argv[0], argv.slice(1), { env });
+  const r = await ctx.exec(argv[0], argv.slice(1), { env, timeoutMs: 30_000 }); // a cold start of opencode, not ctx.exec's 10 s
   return { bin, r, names: r.error || r.status !== 0 ? null : authListNames(r.stdout) };
 }
 

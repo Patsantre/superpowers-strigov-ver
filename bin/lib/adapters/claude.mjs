@@ -465,7 +465,8 @@ function reduce(io) {
 function authStatus(profile, ctx, env, cwd) {
   const bin = profile.bin ?? "claude";
   const [cmd, ...args] = [...(Array.isArray(profile.wrap) ? profile.wrap : []), bin, "auth", "status", "--json"];
-  const r = ctx.exec(cmd, args, cwd ? { env, cwd } : { env });
+  // 30 s, not ctx.exec's 10: the status may refresh the login over the network.
+  const r = ctx.exec(cmd, args, cwd ? { env, cwd, timeoutMs: 30_000 } : { env, timeoutMs: 30_000 });
   if (r.error) return { error: `cannot run ${bin} auth status --json: ${r.error.code ?? r.error.message}` };
   try {
     const status = JSON.parse(String(r.stdout ?? "").trim());

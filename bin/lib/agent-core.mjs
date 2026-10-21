@@ -30,6 +30,13 @@
 //   discover → prepareHome → invocation → the harness (runCli) → scrub → reduce → finalize → the terminal record.
 //   The runner owns every stop of its harness: it watches the record and runs the adapter's ladder once the job is
 //   cancelled.
+//   One runner per job: it claims <id>.json.runner exclusively before anything else. That file is the job's
+//   append-only ownership log: the runner's and its harness's identity, and every other process group the job may
+//   own (an auxiliary command's, a descendant a snapshot found) by its leader's identity, each written before it could
+//   outlive what links it to the job (also after a terminal claim, when the record no longer changes).
+//   <id>.json.cleaned marks that nothing the log names is left; until then the write reservation stays held, a
+//   repeated cancel and the reaper resume the cleanup, by verified identities only, and the verdict stays as it was
+//   claimed.
 // other verbs, for core ids (route zt- / task- ids to the wrappers before calling these):
 //   statusCommand({ cwd, id, json, all }), resultCommand({ cwd, id }), await cancelCommand({ cwd, id }),
 //   releaseStaleCommand({ cwd }) — each returns the exit code and writes to an { stdout, stderr } sink.
@@ -40,7 +47,23 @@
 // errors: print `${CLI_NAME}: ${error.message}` and exit with exitCodeOf(error): 2 for UsageError (refusal without
 //   launch), 1 otherwise. Also exported: redactor(values), filterEnv / buildEnv / passthroughNames, readSecretLine
 //   and checkKeyText (key set), writePrivateFile, writeAdapterFiles, dataPaths(), makeCtx(), terminateTree(),
-//   ERROR_CLASSES.
+//   processIdentity(), boundedExec() (a short command under a hard deadline, with no controlling terminal),
+//   recordGroups() (the ownership log), ERROR_CLASSES.
+// Process identity: every stored pid (runner, reservation holder, the leader of a process group) is kept with its
+//   start time (processStart: /proc ticks since boot on Linux, `ps -o lstart` on macOS — neither moves with the wall
+//   clock) and compared before the pid decides anything — liveness, a descendant snapshot, a signal. A pid alive with
+//   another start time is a stranger (`foreign`); one whose start time cannot be read, or was never recorded, is
+//   `unknown`, which never authorizes a signal and never counts as gone. harnessGroupState() and processIdentity()
+//   therefore return four states: a caller that signals on anything but "ours" is wrong. A group of the ownership log
+//   is the job's only while its leader is (a group id outlives its leader, and a stranger can lead a group under it
+//   later); only the harness group, whose leader the runner watched, also counts while members outlive the leader
+//   (on Linux while they are in the harness's own session: inAnotherSession).
+//   A process that ended but was never reaped (a zombie, for good under a Linux container's pid 1 that does not reap)
+//   is gone for all of this: isAlive() and groupAlive() do not count it (a group only once a second /proc scan
+//   confirms the first, zombieOnlyGroups). A zombie is a process whose threads have all ended: one whose main thread
+//   alone ended reads Z too, and lives (hasEnded). Its start time still counts as identity: a zombie holding the
+//   harness group's leader pid makes that group foreign when its start time differs, unknown when it cannot be
+//   compared (harnessGroupState).
 // The adapter contract (spec §3.2) — adapters return data, the core owns processes, files, signals and keys:
 //   { id, idPrefix, manifest: { sessionId: "preassign" | "first-event", sessionIdFormat?: "uuid" | "job-id",
 //     cancel: { ladder: [[signal, waitMs], …] }, helpArgv?, requiredFlags?, homeEnv? },
@@ -56,10 +79,16 @@
 //   (§3.6 А); a null value removes a name. `dirs` (absolute; created 0700) and `files` ({ path, mode, content }) must
 //   lie under the data root. `meta` is a small JSON object the record keeps, redacted (resumeCheck reads prev.meta,
 //   e.g. the config or profile directory a session lives in). invocation and prepareHome must be pure: startJob calls
-//   them once at task time (req.harness is null then) to refuse a profile.env that touches a mandatory name. Only
+//   them once at task time, and runProbe before discovery (req.harness is null then both times), to refuse a
+//   profile.env that touches a mandatory name and to learn whether a key is needed; probe() always gets the harness. Only
 //   reduce() decides success; the exit code is informational. discover / prepareHome / finalize / resumeCheck reach
-//   processes and files only through ctx.exec and ctx.fs. discover's ctx.exec runs through the profile's `wrap`
-//   (ctx.execHost does not); finalize gets job.env (the harness environment without the key), job.wrap and
+//   processes and files only through ctx.exec and ctx.fs. ctx.exec(cmd, args, { timeoutMs, graceMs, cwd, env, input })
+//   is synchronous and returns { status, signal, stdout, stderr, error, timedOut, stopped } (error as spawnSync's); the
+//   command runs in a session and process group of its own (no controlling terminal; what it leaves in that group is
+//   killed when it is done) under a hard deadline (SIGTERM at timeoutMs, default 10 s, 0 or null for none; SIGKILL
+//   after graceMs) and, in a runner, is stopped the same way once the job is cancelled or the runner is gone, its group
+//   recorded in the job's ownership log before it starts (boundedExec). discover's ctx.exec runs through the profile's
+//   `wrap` (ctx.execHost does not); finalize gets job.env (the harness environment without the key), job.wrap and
 //   ctx.execHarness(args), which runs `<wrap> <bin> args` in that environment.
 //
 // Exit codes: 0 success · 1 runtime failure · 2 usage error or guard refusal (no job started).
@@ -74,6 +103,14 @@ export const CLI_NAME = "agent-dispatch";
 export const RUN_VERB = "__run";
 export const STATE_DIR_VAR = "AGENT_DISPATCH_STATE_DIR";
 export const TEST_BOOT_ID_VAR = "AGENT_TEST_BOOT_ID";
+// Tests only: "unavailable" makes every process start time unreadable (an unprivileged or broken ps, no /proc).
+export const TEST_PS_START_VAR = "AGENT_TEST_PS_START";
+// Tests only: a file a runner waits for between the reads its claim decision rests on and the exclusive runner claim
+// (runBarrier), so two runners that both read the job unclaimed commit their claims at the same moment.
+export const TEST_RUN_BARRIER_VAR = "AGENT_TEST_RUN_BARRIER";
+// Tests only: milliseconds an auxiliary command's supervisor waits before its first step (boundedExec), so its caller
+// can die before it initialized.
+export const TEST_EXEC_DELAY_VAR = "AGENT_TEST_EXEC_DELAY_MS";
 export const DEFAULT_TIMEOUT_MIN = 60;
 export const DEFAULT_MAX_PARALLEL = 2;
 export const DEFAULT_LADDER = [["SIGTERM", 5000], ["SIGKILL", 0]];
@@ -127,13 +164,18 @@ const STOP_POLL_MS = 250; // how often a runner checks its record for a terminal
 const SWEEP_ROUNDS = 10;
 const MAX_TIMER_MS = 2 ** 31 - 1; // setTimeout fires at once above this
 const EXEC_TIMEOUT_MS = 10_000;
+const EXEC_GRACE_MS = 1_000; // SIGTERM → SIGKILL for an auxiliary command (boundedExec)
+const EXEC_MARGIN_MS = 5_000; // the supervisor's own backstop beyond the command's deadline and grace
+const SETTLE_MS = 2_000; // how long a runner at its end waits for SIGKILLed groups to be reaped before it calls them survivors
+const EXEC_MAX_BUFFER = 16 * 1024 * 1024;
+const PS_TIMEOUT_MS = 5_000; // ps and sysctl: killed (SIGKILL) and read as "unreadable" beyond this
 // stdout held in memory for reduce(): the head and the tail of the stream (the log keeps all of it), so a long event
 // stream never grows one string toward V8's limit of about 2^29 characters.
 const STDOUT_HEAD_CHARS = 1 << 20;
 const STDOUT_TAIL_CHARS = 32 << 20;
 const META_MAX_CHARS = 16_384;
 // Fields the runner sets while its job runs; a terminal claim that raced one of them carries it over (finalizeRecord).
-const RUNTIME_FIELDS = ["runnerPid", "childPid", "childStartedAt", "harnessVersion", "meta"];
+const RUNTIME_FIELDS = ["runnerPid", "runnerStartedAt", "childPid", "childStartedAt", "harnessVersion", "meta"];
 export const PROBE_PROMPT = "Reply with exactly: PONG\n";
 const PROBE_TIMEOUT_MS = 120_000;
 const REBOOT_NOTE = "system rebooted since the job started";
@@ -484,6 +526,156 @@ export function updateRunning(file, patch, when = null) {
 
 const isTerminalNow = (file) => fs.existsSync(terminalFile(file)) || TERMINAL.has(readRecord(file)?.status);
 
+// ---------- the job's ownership log and the cleanup marker ----------
+// <record>.runner is the job's ownership log: JSON lines, only ever appended to. Its first line is the claim
+// { pid, startedAt, bootId, claimedAt } of the one runner a job ever gets, created atomically and exclusively
+// (link(2)), so a second `__run`, now or later, can never claim the job again. The runner appends its own updates —
+// { pid, childPid, childStartedAt } once its harness is spawned, { pid, startedAt } should its start time have been
+// unreadable at the claim — and anyone appends { groups: [{ pgid, startedAt }] } for another process group the job
+// may own, before that group could outlive what links it to the job: an auxiliary command's supervisor for its own
+// group, before it starts the command (boundedExec); the runner, cancel and the reaper for each group a snapshot of
+// the tree finds, before they signal it (a descendant that survives the signal loses its ppid link once its parent
+// dies). A group is named by its leader (pid = pgid) and the leader's start time — null only when the leader lived
+// but its start time could not be read — and counts as the job's only while that leader lives (survivingGroups): a
+// group whose leader is gone has nothing left to confirm it by, since its id may name a stranger's group by then, so
+// one found leaderless is not recorded at all. The log outlives a terminal claim that froze the record, which is what
+// lets cancel and the reaper find, by verified identity, what the record never got to name. <record>.cleaned marks
+// that nothing the log names may still be the job's (written by the runner when it ends, or by cancel / the reaper /
+// release-stale once they verified it); a terminal job without it may still own a live process.
+const runnerFile = (file) => `${file}.runner`;
+const cleanedFile = (file) => `${file}.cleaned`;
+
+function claimRunnerFile(file, claim) {
+  const tmp = tmpFile(runnerFile(file));
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(claim)}\n`, { flag: "wx", mode: 0o600 });
+    fs.linkSync(tmp, runnerFile(file));
+    return true;
+  } catch (error) {
+    if (error.code === "EEXIST") return false;
+    throw error;
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
+// One line appended to the ownership log of an existing claim; the log is never created here. Returns whether it
+// was written.
+function appendOwnership(file, entry) {
+  let fd = null;
+  try {
+    fd = fs.openSync(runnerFile(file), fs.constants.O_WRONLY | fs.constants.O_APPEND);
+    fs.writeSync(fd, `${JSON.stringify(entry)}\n`);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+}
+
+// A recorded group's key: its id and its leader's start time (an id comes back for another group once one is gone).
+const groupKey = (pgid, startedAt) => `${pgid} ${startedAt ?? ""}`;
+
+// The ownership log read back: the claim with its claimer's later lines merged in, plus `groups` — every recorded
+// group as { pgid, startedAt }, once per key. Null without a claim. A line a crash cut short is skipped.
+function readOwnership(file) {
+  let text;
+  try {
+    text = fs.readFileSync(runnerFile(file), "utf8");
+  } catch {
+    return null;
+  }
+  let claim = null;
+  const groups = new Map();
+  for (const line of text.split("\n")) {
+    let entry = null;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!isObject(entry)) continue;
+    if (claim === null) claim = entry;
+    else if (Array.isArray(entry.groups)) {
+      for (const group of entry.groups) {
+        if (!Number.isInteger(group?.pgid) || group.pgid <= 1) continue;
+        const startedAt = typeof group.startedAt === "string" && group.startedAt ? group.startedAt : null;
+        groups.set(groupKey(group.pgid, startedAt), { pgid: group.pgid, startedAt });
+      }
+    } else if (entry.pid === claim.pid) claim = { ...claim, ...entry };
+  }
+  return claim && { ...claim, groups: [...groups.values()] };
+}
+
+// The claimer's own lines. A start time of its own that could not be read at the claim is added once it can, so the
+// runner does not stay `unknown` for its whole life.
+function updateRunnerFile(file, patch) {
+  const current = readOwnership(file);
+  if (current?.pid !== process.pid) return;
+  appendOwnership(file, { pid: process.pid, ...(current.startedAt ? {} : { startedAt: ownStart() }), ...patch });
+}
+
+// Records process groups the job may own in the ownership log of the job record `file`, before the caller signals
+// them or lets them outlive their parent: each by its leader's start time, unless the log already has that pair (the
+// harness's included). A group without a live leader is skipped: nothing could confirm later that it is still the
+// job's. Returns false when something could not be written (no claim, a failed write).
+export function recordGroups(file, pgids, by) {
+  const log = readOwnership(file);
+  if (!log) return false;
+  const known = new Set([groupKey(log.childPid, log.childStartedAt), ...log.groups.map((group) => groupKey(group.pgid, group.startedAt))]);
+  const fresh = [];
+  for (const pgid of new Set(pgids)) {
+    if (!Number.isInteger(pgid) || pgid <= 1) continue;
+    const startedAt = processStart(pgid);
+    if (startedAt === null && !isAlive(pgid)) continue; // leaderless
+    if (known.has(groupKey(pgid, startedAt))) continue;
+    known.add(groupKey(pgid, startedAt));
+    fresh.push({ pgid, startedAt });
+  }
+  return fresh.length === 0 || appendOwnership(file, { groups: fresh, by, at: new Date().toISOString() });
+}
+
+function markCleaned(file) {
+  try {
+    fs.writeFileSync(cleanedFile(file), `${new Date().toISOString()}\n`);
+  } catch {
+    // best effort: the next cancel or reaper pass verifies again
+  }
+}
+
+// A terminal job whose process tree is not known to be stopped: it had (or may have had) a runner and no
+// <record>.cleaned yet.
+export function cleanupPending(jobsDir, record) {
+  if (!record || !TERMINAL.has(record.status) || typeof record.id !== "string") return false;
+  const file = jobFile(jobsDir, record.id);
+  if (fs.existsSync(cleanedFile(file))) return false;
+  return fs.existsSync(runnerFile(file)) || Number.isInteger(record.runnerPid) || Number.isInteger(record.childPid);
+}
+
+// The processes of a job with the start times recorded next to them: the runner and the harness from the ownership
+// log when there is one (it outlives a terminal claim), else from the record — each pid paired with the start time
+// of the same source — and the other groups the log records.
+function jobProcesses(jobsDir, record) {
+  const claim = readOwnership(jobFile(jobsDir, record.id));
+  const pair = (pid, startedAt) => ({ pid: Number.isInteger(pid) && pid > 0 ? pid : null, startedAt: typeof startedAt === "string" ? startedAt : null });
+  const runner = Number.isInteger(claim?.pid) ? pair(claim.pid, claim.startedAt) : pair(record.runnerPid, record.runnerStartedAt);
+  const child = Number.isInteger(claim?.childPid) ? pair(claim.childPid, claim.childStartedAt) : pair(record.childPid, record.childStartedAt);
+  return { runner, child, groups: claim?.groups ?? [] };
+}
+
+// The process groups the job may still own that are ours or unknown now, as { pgid, startedAt, state, harness }: the
+// harness group by harnessGroupState(), every group of the ownership log by its leader's identity alone
+// (processIdentity). Empty once nothing of the job is left.
+function survivingGroups(jobsDir, record) {
+  const { child, groups } = jobProcesses(jobsDir, record);
+  const all = [
+    ...(child.pid ? [{ pgid: child.pid, startedAt: child.startedAt, harness: true, state: harnessGroupState(child.pid, child.startedAt) }] : []),
+    ...groups.map((group) => ({ ...group, state: processIdentity(group.pgid, group.startedAt) })),
+  ];
+  return all.filter((group) => possiblyOurs(group.state));
+}
+
 export function listRecords(jobsDir) {
   let names = [];
   try {
@@ -500,14 +692,18 @@ export function listRecords(jobsDir) {
 
 // Atomic id allocation: one number sequence per workspace, shared by every core prefix (ct-, oc-, pi-, dt-), and
 // the record created exclusively ("wx"), so parallel read-only tasks never share an id. The record starts as
-// `running` without a runner; startJob removes it again on a refusal (the id was never announced).
+// `running` without a runner; startJob removes it again on a refusal (the id was never announced). A number stays
+// taken while anything of its job is left — the record, its .terminal / .runner / .cleaned side files, the log, the
+// job dir — not only the record: a record removed alone (by hand, or by a prune) must not hand its stale runner claim
+// or cleanup marker to a new job under the same id.
+const TRACE_NAME_RE = /^([a-z]{2})-(\d{4,})(?=$|\.)/;
 export function allocateJob(jobsDir, prefix, fields) {
   if (!/^[a-z]{2}$/.test(prefix ?? "") || FOREIGN_PREFIXES.has(prefix)) throw new Error(`invalid job id prefix: ${prefix}`);
   fs.mkdirSync(jobsDir, { recursive: true });
   for (let attempt = 0; attempt < 1000; attempt += 1) {
     const used = fs
       .readdirSync(jobsDir)
-      .map((name) => RECORD_NAME_RE.exec(name))
+      .map((name) => TRACE_NAME_RE.exec(name))
       .filter((match) => match && !FOREIGN_PREFIXES.has(match[1]))
       .map((match) => Number(match[2]));
     const id = formatId(prefix, 1 + Math.max(0, ...used));
@@ -526,7 +722,7 @@ export function allocateJob(jobsDir, prefix, fields) {
 function discardJob(jobsDir, id) {
   fs.rmSync(logFile(jobsDir, id), { force: true });
   fs.rmSync(jobDir(jobsDir, id), { recursive: true, force: true });
-  fs.rmSync(terminalFile(jobFile(jobsDir, id)), { force: true });
+  for (const side of [terminalFile, runnerFile, cleanedFile]) fs.rmSync(side(jobFile(jobsDir, id)), { force: true });
   fs.rmSync(jobFile(jobsDir, id), { force: true });
 }
 
@@ -558,25 +754,150 @@ export function tailLines(file, n) {
 
 // ---------- processes ----------
 
-export function isAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+const signalable = (target) => {
   try {
-    process.kill(pid, 0);
+    process.kill(target, 0);
     return true;
   } catch (error) {
     return error.code === "EPERM";
   }
+};
+
+// Zombies: a process that ended but was not reaped yet stays in the process table and in its group, and kill(…, 0)
+// finds it. On Linux that can last for good: under a pid 1 that never reaps (a container whose pid 1 is node, npx or
+// `sleep infinity`) every process the cleanup SIGKILLed would stay "alive". A zombie has ended: on Linux isAlive() and
+// groupAlive() do not count it. The state in /proc/<pid>/stat is its leader thread's, though: a process whose main
+// thread ended (pthread_exit) while other threads run reads Z as well ("Zl" in ps) and lives on. So a process has
+// ended when its state is Z or X and its thread count (field 20 of the same stat line) is down to that leader: 1, or 0
+// once it is being released (hasEnded). A group of threads down to a zombie leader never grows again: only a live
+// thread starts one. macOS needs no check: launchd reaps every orphan at once, and every other parent in a job's tree
+// is the job's own (stopped by the same cleanup) or a runner or supervisor, which reap — a zombie there is gone within
+// the waits that follow a signal.
+const ZOMBIE_STATES = new Set(["Z", "X"]);
+const threadCount = (fields) => (/^\d+$/.test(fields?.[20 - 3] ?? "") ? Number(fields[20 - 3]) : null);
+const hasEnded = (state, threads) => ZOMBIE_STATES.has(state) && Number.isInteger(threads) && threads <= 1;
+const isZombie = (pid) => {
+  if (process.platform !== "linux") return false;
+  const fields = procStatFields(pid);
+  return hasEnded(fields?.[0], threadCount(fields));
+};
+
+// One pass over /proc: every listed process as { pid, state, pgid, sid, threads, gone }, or null when /proc cannot be
+// listed — fields 3, 5, 6 and 20 of its stat line (state, process group, session, thread count). state and pgid are
+// null when its stat could not be read; `gone` then says why: true when the pid no longer exists (the process ended
+// and was reaped after the listing — routine wherever processes come and go), false when something still holds it
+// that /proc does not show (another user's process under hidepid, a pid reused at once).
+function procScan() {
+  let names;
+  try {
+    names = fs.readdirSync("/proc");
+  } catch {
+    return null;
+  }
+  const scan = [];
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    const pid = Number(name);
+    const fields = procStatFields(pid); // [state, ppid, pgrp, session, …]
+    const pgid = Number(fields?.[2]);
+    const sid = Number(fields?.[3]);
+    if (typeof fields?.[0] === "string" && fields[0] !== "" && Number.isInteger(pgid)) {
+      scan.push({ pid, state: fields[0], pgid, sid: Number.isInteger(sid) ? sid : null, threads: threadCount(fields), gone: false });
+    } else scan.push({ pid, state: null, pgid: null, sid: null, threads: null, gone: !signalable(pid) });
+  }
+  return scan;
 }
 
-// pid 1 is never a harness process group, and kill(-1) would signal every process of the user.
-export function groupAlive(pgid) {
-  if (!Number.isInteger(pgid) || pgid <= 1) return false;
-  try {
-    process.kill(-pgid, 0);
-    return true;
-  } catch (error) {
-    return error.code === "EPERM";
+const readable = (entry) => typeof entry?.state === "string" && Number.isInteger(entry.pgid);
+// A scan entry that has ended for good (hasEnded): a zombie whose other threads are gone too.
+const ended = (entry) => hasEnded(entry.state, entry.threads);
+
+// The members of the `wanted` groups in one scan (procScan's shape) as Map pgid → Map pid → whether it has ended
+// (ended), or null when the scan cannot tell. A process whose stat could not be read may be a member of any group.
+// One that is gone is skipped in a first scan (`first` null): whatever it forked after the listing is listed by the
+// confirming scan. In a confirming scan it is skipped only when the first scan read that pid (then another group's
+// process, or a zombie member reaped since, which changes the membership anyway); a new one may have been a member
+// that forked after its listing, so the scan cannot tell. One that is still there leaves any scan unable to tell.
+function scanMembers(scan, wanted, first = null) {
+  if (!Array.isArray(scan)) return null;
+  const known = first === null ? null : new Set(first.filter(readable).map((entry) => entry.pid));
+  const members = new Map();
+  for (const entry of scan) {
+    if (!readable(entry)) {
+      if (entry?.gone === true && (known === null || known.has(entry.pid))) continue;
+      return null;
+    }
+    if (!wanted.has(entry.pgid)) continue;
+    if (!members.has(entry.pgid)) members.set(entry.pgid, new Map());
+    members.get(entry.pgid).set(entry.pid, ended(entry));
   }
+  return members;
+}
+
+const allEnded = (members) => [...members.values()].every(Boolean);
+
+// Of `pgids`, the groups one scan shows with members that have all ended (zombies down to their leader thread):
+// candidates only (zombieOnlyGroups).
+export function zombieCandidates(pgids, scan) {
+  const members = scanMembers(scan, new Set(pgids));
+  return new Set(members ? [...members].filter(([, group]) => allEnded(group)).map(([pgid]) => pgid) : []);
+}
+
+// Of `pgids`, the groups that two /proc scans, taken one after the other, show as zombie-only; null when the second
+// scan cannot tell (scanMembers: take another). A scan lists the pids first and reads their stats after, so one scan
+// can miss a member: one that a listed member forked after the listing and then ended, all before its stat was read,
+// shows every listed member a zombie while the new one lives. A candidate of the first scan (zombieCandidates)
+// therefore counts only when the second lists exactly the same members, every one still ended: a new member forked
+// before the second listing shows there. Pure: the scans are procScan's results.
+export function zombieOnlyGroups(pgids, first, second) {
+  const candidates = zombieCandidates(pgids, first);
+  if (candidates.size === 0) return new Set();
+  const before = scanMembers(first, candidates);
+  const after = scanMembers(second, candidates, first);
+  if (!after) return null;
+  return new Set(
+    [...candidates].filter((pgid) => {
+      const was = before.get(pgid);
+      const now = after.get(pgid);
+      return now !== undefined && now.size === was.size && [...now.keys()].every((pid) => was.has(pid)) && allEnded(now);
+    }),
+  );
+}
+
+// Of `pgids`, the groups that are zombie-only, from the scans `scan()` takes: a second scan only when the first finds a
+// candidate, and up to CONFIRM_SCANS of them while they cannot tell; none that can confirms nothing (uncertainty keeps
+// a group alive).
+const CONFIRM_SCANS = 3;
+export function zombieGroupsFrom(pgids, scan) {
+  if (pgids.length === 0) return new Set();
+  const first = scan();
+  if (zombieCandidates(pgids, first).size === 0) return new Set();
+  for (let attempt = 0; attempt < CONFIRM_SCANS; attempt += 1) {
+    const confirmed = zombieOnlyGroups(pgids, first, scan());
+    if (confirmed) return confirmed;
+  }
+  return new Set();
+}
+
+// Linux: the ids of `pgids` whose members are all zombies, as /proc shows them (zombieGroupsFrom).
+function zombieGroups(pgids) {
+  return process.platform === "linux" ? zombieGroupsFrom(pgids, procScan) : new Set();
+}
+
+export function isAlive(pid) {
+  return Number.isInteger(pid) && pid > 0 && signalable(pid) && !isZombie(pid);
+}
+
+// The ids of `pgids` whose group still has a member that has not ended. pid 1 is never a harness process group, and
+// kill(-1) would signal every process of the user.
+function liveGroups(pgids) {
+  const found = pgids.filter((pgid) => Number.isInteger(pgid) && pgid > 1 && signalable(-pgid));
+  const zombies = zombieGroups(found);
+  return found.filter((pgid) => !zombies.has(pgid));
+}
+
+export function groupAlive(pgid) {
+  return liveGroups([pgid]).length > 0;
 }
 
 export function killGroup(pgid, signal) {
@@ -594,7 +915,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // on macOS (no /proc there) and Linux (spec §3.10).
 export function processTable() {
   for (const ps of ["ps", "/bin/ps"]) {
-    const r = spawnSync(ps, ["-A", "-o", "pid=,ppid=,pgid="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+    const r = spawnSync(ps, ["-A", "-o", "pid=,ppid=,pgid="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: PS_TIMEOUT_MS, killSignal: "SIGKILL" });
     if (r.error || r.status !== 0) continue;
     const rows = [];
     for (const line of r.stdout.split("\n")) {
@@ -638,11 +959,66 @@ export function treeGroups(roots, table) {
 const ownPgid = (table) => table?.find((row) => row.pid === process.pid)?.pgid ?? null;
 const rootList = (roots) => (Array.isArray(roots) ? roots : [roots]).filter((pgid) => Number.isInteger(pgid) && pgid > 1);
 
-// The start time of a process (`ps -o lstart=`, in the C locale so that every caller reads the same text), or null.
-export function processStart(pid) {
+// The start time of a process: an identity that stays the same for the whole life of the process, whoever reads it.
+//   Linux: `ticks:<n>`, field 22 of /proc/<pid>/stat — the start in clock ticks since boot (10 ms), fixed when the
+//     process is created. Not `ps -o lstart`: procps recomputes lstart on every call as /proc/stat btime + those
+//     ticks, and btime moves with every step of the wall clock (NTP, a VM or WSL resync after sleep, `date -s`), after
+//     which every live process would read as another one.
+//   elsewhere (macOS): `ps -o lstart=` in the C locale and in UTC, so that every caller — a runner, a later cancel
+//     from another shell or time zone — reads the same text. macOS keeps the start as a wall-clock time stored at
+//     fork, so a clock step does not change it. Its resolution is one second: a pid reused within the second it was
+//     freed passes as the same process.
+// `like` is a stored start time this one is to be compared with: it is read in that one's format (a value recorded
+// on another platform, or by an older core, is never compared with text of another kind). Null when it cannot be read.
+const TICKS_PREFIX = "ticks:";
+
+export function processStart(pid, { like = null } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
+  if (process.env[TEST_PS_START_VAR] === "unavailable") return null;
+  const stored = typeof like === "string" && like !== "";
+  if (stored ? like.startsWith(TICKS_PREFIX) : process.platform === "linux") {
+    const ticks = procStartTicks(pid);
+    if (ticks !== null) return `${TICKS_PREFIX}${ticks}`;
+    if (stored) return null; // a recorded tick count is compared with nothing else
+    // A Linux without a readable /proc: lstart, the next best (such a value is compared as lstart from then on).
+  }
+  return psStart(pid);
+}
+
+// The fields of a /proc/<pid>/stat line from field 3 (the state) on, or null. The command name (field 2) is in
+// parentheses and may itself hold spaces and parentheses, so the fields are counted after its last ")".
+function statFields(text) {
+  const close = String(text ?? "").lastIndexOf(")");
+  return close < 0 ? null : String(text).slice(close + 1).trim().split(/\s+/);
+}
+
+function procStatFields(pid) {
+  try {
+    return statFields(fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+// Field 22 (starttime) of a /proc/<pid>/stat line, or null.
+export function parseProcStat(text) {
+  const value = statFields(text)?.[22 - 3];
+  return /^\d+$/.test(value ?? "") ? value : null;
+}
+
+function procStartTicks(pid) {
+  const value = procStatFields(pid)?.[22 - 3];
+  return /^\d+$/.test(value ?? "") ? value : null;
+}
+
+function psStart(pid) {
   for (const ps of ["ps", "/bin/ps"]) {
-    const r = spawnSync(ps, ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: { ...process.env, LC_ALL: "C", LANG: "C" } });
+    const r = spawnSync(ps, ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+      timeout: PS_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
     if (r.error) continue;
     const text = (r.stdout ?? "").trim().replace(/\s+/g, " ");
     return r.status === 0 && text ? text : null;
@@ -650,22 +1026,83 @@ export function processStart(pid) {
   return null;
 }
 
-// Whether a harness process group recorded as { pgid, startedAt } is still the job's, before anything signals it by
-// that stored id (spec §3.6 А8: the tree widens zcode-dispatch's group-only kill, so a stale id must not reach a
-// stranger):
-//   ours    — the leader lives with the start time recorded at spawn, or the leader is gone but the group still has
-//             members (POSIX reuses no process group id while its group exists);
-//   foreign — the leader's pid lives with another start time (or one that cannot be read): the group ended and the
-//             pid now belongs to another process;
+let ownStartCache = null;
+// This process's own start time, as others will read it (processStart); null while it cannot be read (asked again
+// on the next call).
+export function ownStart() {
+  if (ownStartCache === null) ownStartCache = processStart(process.pid);
+  return ownStartCache;
+}
+
+// What a stored { pid, startedAt } names now. Every decision on a stored pid goes through this first:
+//   ours    — the pid lives with the start time recorded for it;
+//   foreign — the pid lives with another start time: the recorded process ended and the pid was reused;
+//   unknown — the pid lives, but its start time cannot be read now or was never recorded: it may be ours, so it is
+//             neither signalled nor treated as gone;
+//   gone    — no process has the pid.
+export function processIdentity(pid, startedAt) {
+  if (!Number.isInteger(pid) || pid <= 1 || !isAlive(pid)) return "gone";
+  if (typeof startedAt !== "string" || startedAt === "") return "unknown";
+  const now = processStart(pid, { like: startedAt });
+  if (now === null) return isAlive(pid) ? "unknown" : "gone";
+  return now === startedAt ? "ours" : "foreign";
+}
+
+// Why a pid that is "unknown" was not signalled: its start time is unreadable now, or none was recorded.
+const unconfirmedNote = (startedAt) =>
+  typeof startedAt === "string" && startedAt !== ""
+    ? "not signalled: it is alive, but its start time cannot be read to confirm it is the job's"
+    : "not signalled: it is alive, but no start time was recorded for it to confirm it is the job's";
+
+// A stored pid that may still be the process it was recorded for.
+const possiblyOurs = (state) => state === "ours" || state === "unknown";
+
+// Whether the harness process group, recorded as { pgid, startedAt }, is still the job's, before anything signals it
+// by that stored id (spec §3.6 А8: the tree widens zcode-dispatch's group-only kill, so a stale id must not reach a
+// stranger). The groups of the ownership log are not judged by this: they count only by their leader
+// (survivingGroups).
+//   ours    — the leader lives with the start time recorded at spawn, or the leader has ended (reaped, or a zombie with
+//             that start time) but the group still has members (POSIX reuses no process group id while its group
+//             exists): what a harness leaves behind in its group is the cleanup's main work, and the runner sweeps it
+//             the moment it reaps the harness;
+//   foreign — the leader's pid is held by a process with another start time — a live one, or one that ended but was
+//             never reaped (a zombie keeps its pid and its start time): the group ended and the pid, and with it the
+//             group id, now belongs to another process; on Linux also a group whose leader is reaped and whose members
+//             are in another session than the harness's own (inAnotherSession);
+//   unknown — the leader's pid is held, but the holder's start time cannot be read (or none was recorded) while the
+//             leader lives, or while a zombie holds it and the group has members: never signalled, and never
+//             released as gone (release-stale, the reaper's cleanup);
 //   gone    — neither the leader nor any member is left.
 export function harnessGroupState(pgid, startedAt) {
   if (!Number.isInteger(pgid) || pgid <= 1) return "gone";
-  if (isAlive(pgid)) {
-    const now = processStart(pgid);
-    if (now !== null) return typeof startedAt === "string" && now === startedAt ? "ours" : "foreign";
-    if (isAlive(pgid)) return "foreign"; // alive but unreadable: never signal on a guess
+  const leader = processIdentity(pgid, startedAt);
+  if (leader !== "gone") return leader;
+  // processIdentity counts a zombie as gone (it has ended), but its start time still tells whose the pid is: a stranger
+  // that reused the pid and ended while members of its group live must not make that group ours, nor may a zombie
+  // whose start time cannot be compared.
+  if (signalable(pgid)) {
+    const now = typeof startedAt === "string" && startedAt !== "" ? processStart(pgid, { like: startedAt }) : null;
+    if (now !== null && now !== startedAt) return "foreign";
+    if (now === null) return groupAlive(pgid) ? "unknown" : "gone";
+    return groupAlive(pgid) ? "ours" : "gone";
   }
-  return groupAlive(pgid) ? "ours" : "gone";
+  if (!groupAlive(pgid)) return "gone";
+  return inAnotherSession(pgid) ? "foreign" : "ours";
+}
+
+// Linux: whether /proc shows the members of process group `pgid` in a session other than session `pgid`. A group lies
+// in one session for its whole life, and the harness is spawned detached (setsid): it leads session `pgid`, so every
+// member of its group is in that session too, also once the harness is gone. A group with its leader reaped and its
+// members elsewhere was made by a process that took the pid later — a shell's pipeline (`a | b`, led by `a`, which
+// ended first) is in the shell's session. None of the group's members may read as in session `pgid`: one that leaves
+// the group by setsid can be read between its two changes (new session, old group). False when /proc cannot tell
+// (no member readable, not Linux): the group then counts as the harness's, as before.
+function inAnotherSession(pgid) {
+  if (process.platform !== "linux") return false;
+  const sessions = new Set(
+    (procScan() ?? []).filter((entry) => readable(entry) && entry.pgid === pgid && Number.isInteger(entry.sid)).map((entry) => entry.sid),
+  );
+  return sessions.size > 0 && !sessions.has(pgid);
 }
 
 export function normalizeLadder(ladder) {
@@ -684,8 +1121,10 @@ const ladderText = (ladder) => ladder.map(([signal, waitMs]) => (waitMs > 0 ? `$
 // a fresh snapshot adds the groups of new descendants, the signal goes to every live known group, and the step waits
 // up to waitMs for all of them to end. After the ladder, groups still alive get SIGKILL again (the re-sweep), so a
 // descendant forked during the last step does not survive. `roots` is one process group id or several. Never
-// signals pid ≤ 1, its own group or `exclude`.
-export async function terminateTree(roots, ladder = DEFAULT_LADDER, { exclude = [], log = () => {} } = {}) {
+// signals pid ≤ 1, its own group or `exclude`. `onGroups(pgids)` hears of every group a snapshot adds, before any
+// signal reaches it (the runner, cancel and the reaper record them in the job's ownership log). Returns
+// { groups, sent, survivors }.
+export async function terminateTree(roots, ladder = DEFAULT_LADDER, { exclude = [], log = () => {}, onGroups = null } = {}) {
   const steps = normalizeLadder(ladder);
   const seeds = rootList(roots);
   const known = new Set();
@@ -694,9 +1133,11 @@ export async function terminateTree(roots, ladder = DEFAULT_LADDER, { exclude = 
     const table = processTable();
     const own = ownPgid(table);
     if (own) skip.add(own);
-    for (const pgid of treeGroups([...seeds, ...known], table)) if (pgid > 1 && !skip.has(pgid)) known.add(pgid);
+    const found = [...treeGroups([...seeds, ...known], table)].filter((pgid) => pgid > 1 && !skip.has(pgid) && !known.has(pgid));
+    for (const pgid of found) known.add(pgid);
+    if (found.length > 0) tell(onGroups, found);
   };
-  const alive = () => [...known].filter(groupAlive);
+  const alive = () => liveGroups([...known]);
   const sent = [];
   for (const [signal, waitMs] of steps) {
     refresh();
@@ -723,13 +1164,51 @@ export async function terminateTree(roots, ladder = DEFAULT_LADDER, { exclude = 
 }
 
 // One snapshot, one signal to the whole tree, no waiting: the reaper's tool for a job whose runner died. The caller
-// checks harnessGroupState() first.
-export function killTreeSync(roots, signal = "SIGKILL", { exclude = [] } = {}) {
+// checks harnessGroupState() first. `onGroups` as for terminateTree.
+export function killTreeSync(roots, signal = "SIGKILL", { exclude = [], onGroups = null } = {}) {
   const table = processTable();
   const skip = new Set([...exclude, ownPgid(table)].filter((pgid) => Number.isInteger(pgid)));
   const groups = [...treeGroups(rootList(roots), table)].filter((pgid) => pgid > 1 && !skip.has(pgid));
+  if (groups.length > 0) tell(onGroups, groups);
   for (const pgid of groups) killGroup(pgid, signal);
   return groups;
+}
+
+// Hands the groups of a snapshot to an onGroups callback. Recording them is best effort: a failure never keeps a
+// signal from going out.
+function tell(onGroups, groups) {
+  try {
+    onGroups?.(groups);
+  } catch {
+    // the stop goes on
+  }
+}
+
+// The process groups of everything a live process started, except its own group: a runner's harness and the
+// auxiliary commands of boundedExec (each leads a group of its own below the runner's supervisor). Callers verify
+// the pid's identity first (processIdentity) — the snapshot follows ppid links of whoever holds the pid now.
+function descendantGroupsOf(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return [];
+  const table = processTable() ?? [];
+  const own = table.find((row) => row.pid === pid)?.pgid ?? pid;
+  const children = new Map();
+  for (const row of table) {
+    if (!children.has(row.ppid)) children.set(row.ppid, []);
+    children.get(row.ppid).push(row);
+  }
+  const groups = new Set();
+  const seen = new Set();
+  const queue = [pid];
+  while (queue.length > 0) {
+    const next = queue.pop();
+    if (seen.has(next)) continue;
+    seen.add(next);
+    for (const child of children.get(next) ?? []) {
+      if (child.pgid > 1 && child.pgid !== own) groups.add(child.pgid);
+      queue.push(child.pid);
+    }
+  }
+  return [...groups];
 }
 
 // ---------- boot identity: pids recorded in an earlier boot belong to nobody of ours ----------
@@ -745,7 +1224,7 @@ let currentBootId;
 
 function readBootId() {
   if (process.platform === "darwin") {
-    const r = spawnSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], { encoding: "utf8" });
+    const r = spawnSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], { encoding: "utf8", timeout: PS_TIMEOUT_MS, killSignal: "SIGKILL" });
     const id = r.stdout?.trim();
     if (!r.error && r.status === 0 && id) return id;
   } else if (process.platform === "linux") {
@@ -830,8 +1309,11 @@ function refuseUnavailableReservation(jobsDir, workspaceRoot) {
   }
   if (readJson(`${file}.released`)?.token === record.token) return;
   const rebooted = bootOf(record.bootId) === "earlier";
-  if (!rebooted && isAlive(record.holderPid)) reservationGuard(record);
-  const reason = rebooted ? "the system rebooted since it was taken" : `runner pid ${record.holderPid} is not alive`;
+  const holder = rebooted ? "gone" : processIdentity(record.holderPid, record.holderStartedAt);
+  if (possiblyOurs(holder)) reservationGuard(record);
+  const reason = rebooted
+    ? "the system rebooted since it was taken"
+    : `runner pid ${record.holderPid} is not alive${holder === "foreign" ? " (the pid now belongs to another process)" : ""}`;
   throw new UsageError(
     `workspace reservation generation ${generation} is stale (${reason}); run ${CLI_NAME} release-stale --cwd ${JSON.stringify(workspaceRoot)}`,
   );
@@ -851,14 +1333,15 @@ function createReservation(file, reservation) {
   }
 }
 
-// Hands the reservation to the runner. The task process is the only writer of its generation file, so a temp file
-// renamed over it replaces it atomically, flushed before the rename.
-function updateReservation(file, token, holderPid) {
+// Hands the reservation to the runner, with the runner's start time (its identity for every later liveness check).
+// The task process is the only writer of its generation file, so a temp file renamed over it replaces it
+// atomically, flushed before the rename.
+function updateReservation(file, token, holderPid, holderStartedAt = null) {
   const current = readJson(file);
   if (current?.token !== token) return false;
   const temp = `${file}.tmp-${process.pid}-${randomUUID()}`;
   try {
-    fs.writeFileSync(temp, `${JSON.stringify({ ...current, holderPid })}\n`, { flag: "wx", mode: 0o600, flush: true });
+    fs.writeFileSync(temp, `${JSON.stringify({ ...current, holderPid, holderStartedAt })}\n`, { flag: "wx", mode: 0o600, flush: true });
     fs.renameSync(temp, file);
   } finally {
     fs.rmSync(temp, { force: true });
@@ -881,58 +1364,115 @@ function acquireReservation(jobsDir, jobId, workspaceRoot) {
     if (current) refuseUnavailableReservation(jobsDir, workspaceRoot);
 
     const file = reservationFile(jobsDir, generation);
-    const reservation = { holderPid: process.pid, jobId, token: randomUUID(), generation, createdAt: new Date().toISOString(), bootId: bootId() };
+    const reservation = { holderPid: process.pid, holderStartedAt: ownStart(), jobId, token: randomUUID(), generation, createdAt: new Date().toISOString(), bootId: bootId() };
     if (createReservation(file, reservation)) return { file, token: reservation.token };
     // Another task created this generation. Re-read the highest generation before deciding.
   }
 }
 
+// The runner waits (briefly) until the task process has handed the reservation over to it. A previous holder that
+// is gone, or whose pid now belongs to another process, will never hand it over.
 async function claimRunnerReservation(file, jobId, token) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const current = readJson(file);
     if (current?.token !== token || current.jobId !== jobId) return false;
     if (current.holderPid === process.pid) return true;
-    if (!isAlive(current.holderPid)) return false;
+    if (!possiblyOurs(processIdentity(current.holderPid, current.holderStartedAt))) return false;
     await sleep(10);
   }
   return false;
 }
 
-// Liveness check: no record is ever left `running` with a dead runner.
-export function reapDeadRunners(jobsDir) {
+const FOREIGN_NOTE = "not signalled: its leader pid now belongs to another process";
+
+// Liveness check: no record is ever left `running` with a dead runner, and a terminal job whose runner died before
+// its processes were stopped (cleanupPending) gets them stopped here. A runner counts as dead only when its pid is
+// gone or provably reused (processIdentity: foreign); one that may still be ours (unknown) keeps its job. The reaper's
+// tool is one SIGKILL to the trees of the job's groups (reapOwnedSync), and only to groups that are provably the
+// job's. `except` names a job whose pending cleanup the caller resumes itself (cancel, with the adapter's ladder).
+// Returns what it did: [{ id, action, groups? }].
+export function reapDeadRunners(jobsDir, { except = null } = {}) {
+  const done = [];
   for (const record of listRecords(jobsDir)) {
-    if (record.status !== "running") continue;
     const file = jobFile(jobsDir, record.id);
+    const log = logFile(jobsDir, record.id);
     const boot = bootOf(record.bootId);
-    if (boot === "earlier") {
-      // Its runnerPid / childPid may now be unrelated processes: finalize without any signal.
-      const after = finalizeRecord(file, { status: "failed", errorClass: "crash", note: REBOOT_NOTE });
-      if (after?.note === REBOOT_NOTE) appendLog(logFile(jobsDir, record.id), `${REBOOT_NOTE}; liveness check marked the job failed/crash, no process signalled`);
-      continue;
-    }
-    if (record.runnerPid == null) {
-      if (Date.now() - Date.parse(record.startedAt) > STARTUP_GRACE_MS) {
-        finalizeRecord(file, { status: "failed", errorClass: "crash", note: "runner never started" });
+    if (record.status !== "running") {
+      if (record.id !== except && cleanupPending(jobsDir, record)) {
+        const resumed = resumeCleanupSync(jobsDir, record, boot, log);
+        if (resumed) done.push({ id: record.id, ...resumed });
       }
       continue;
     }
-    if (isAlive(record.runnerPid)) continue;
-    // The harness outlives a dead runner; its group is signalled only while it is provably still the job's.
-    const group = boot === "current" && record.childPid ? harnessGroupState(record.childPid, record.childStartedAt) : null;
-    const killed = group === "ours" ? killTreeSync(record.childPid, "SIGKILL") : [];
+    if (boot === "earlier") {
+      // Its runnerPid / childPid may now be unrelated processes: finalize without any signal.
+      const after = finalizeRecord(file, { status: "failed", errorClass: "crash", note: REBOOT_NOTE });
+      if (after?.note === REBOOT_NOTE) appendLog(log, `${REBOOT_NOTE}; liveness check marked the job failed/crash, no process signalled`);
+      markCleaned(file); // nothing of a job outlives a reboot
+      done.push({ id: record.id, action: "rebooted" });
+      continue;
+    }
+    const procs = jobProcesses(jobsDir, record);
+    if (procs.runner.pid === null) {
+      if (Date.now() - Date.parse(record.startedAt) > STARTUP_GRACE_MS) {
+        finalizeRecord(file, { status: "failed", errorClass: "crash", note: "runner never started" });
+        done.push({ id: record.id, action: "never-started" });
+      }
+      continue;
+    }
+    const runner = processIdentity(procs.runner.pid, procs.runner.startedAt);
+    if (possiblyOurs(runner)) continue;
+    // What outlives a dead runner (its harness tree, an auxiliary command, a descendant its ladder recorded) is
+    // signalled only where it is provably still the job's; nothing is signalled while the boot is unconfirmed.
+    const group = boot === "current" && procs.child.pid ? harnessGroupState(procs.child.pid, procs.child.startedAt) : null;
+    const killed = boot === "current" ? reapOwnedSync(jobsDir, record) : [];
     const after = finalizeRecord(file, { status: "failed", errorClass: "crash", note: "runner died" });
     if (after?.note === "runner died") {
-      const marked = "runner died; liveness check marked the job failed/crash";
-      appendLog(
-        logFile(jobsDir, record.id),
-        boot !== "current"
-          ? `${marked}; harness process group ${record.childPid} ${UNKNOWN_BOOT_NOTE}`
-          : group === "foreign"
-            ? `${marked}; harness process group ${record.childPid} not signalled: its leader pid now belongs to another process`
-            : `${marked}${killed.length > 0 ? `; SIGKILL to process groups ${killed.join(",")}` : ""}`,
-      );
+      const marked = `runner died${runner === "foreign" ? ` (pid ${procs.runner.pid} now belongs to another process)` : ""}; liveness check marked the job failed/crash`;
+      const notes = [
+        boot !== "current" ? `harness process group ${procs.child.pid} ${UNKNOWN_BOOT_NOTE}` : null,
+        group === "foreign" ? `harness process group ${procs.child.pid} ${FOREIGN_NOTE}` : null,
+        group === "unknown" ? `harness process group ${procs.child.pid} ${unconfirmedNote(procs.child.startedAt)}` : null,
+        killed.length > 0 ? `SIGKILL to process groups ${killed.join(",")}` : null,
+      ];
+      appendLog(log, [marked, ...notes.filter(Boolean)].join("; "));
     }
+    done.push({ id: record.id, action: "runner-died", groups: killed });
   }
+  return done;
+}
+
+// The reaper's part of a pending cleanup (a terminal job, its processes not known to be stopped): nothing while the
+// runner may still live (it owns the stop) or while the boot cannot be confirmed; else reapOwnedSync. Returns
+// { action, groups } when it signalled, else null.
+function resumeCleanupSync(jobsDir, record, boot, log) {
+  const file = jobFile(jobsDir, record.id);
+  if (boot === "earlier") {
+    markCleaned(file);
+    return null;
+  }
+  if (boot !== "current") return null; // nothing is signalled by a stored pid
+  const procs = jobProcesses(jobsDir, record);
+  if (possiblyOurs(processIdentity(procs.runner.pid, procs.runner.startedAt))) return null;
+  const harness = procs.child.pid !== null && harnessGroupState(procs.child.pid, procs.child.startedAt) === "ours";
+  const killed = reapOwnedSync(jobsDir, record);
+  if (killed.length === 0) return null;
+  const what = harness ? `harness process group ${procs.child.pid} was alive` : "process groups it may own were alive";
+  appendLog(log, `cleanup resumed: the job is ${record.status} but its runner pid ${procs.runner.pid} is gone and ${what}; SIGKILL to process groups ${killed.join(",")}`);
+  return { action: "cleanup-resumed", groups: killed };
+}
+
+// One reaper pass over what a job whose runner is gone may still own (survivingGroups): SIGKILL to the trees of the
+// groups that are provably the job's — the groups a snapshot adds recorded first — and nothing to one that is
+// unknown. The marker is written by the pass that finds nothing left, so a group that was just killed is confirmed
+// gone by the next one. Returns the groups signalled.
+function reapOwnedSync(jobsDir, record) {
+  const file = jobFile(jobsDir, record.id);
+  const left = survivingGroups(jobsDir, record);
+  const ours = left.filter((group) => group.state === "ours").map((group) => group.pgid);
+  const killed = ours.length > 0 ? killTreeSync(ours, "SIGKILL", { onGroups: (groups) => recordGroups(file, groups, "reaper") }) : [];
+  if (left.length === 0) markCleaned(file);
+  return killed;
 }
 
 // Allocation order of pending jobs: start time, then jobs dir and number as tie-breaks.
@@ -1056,8 +1596,9 @@ export function boundedText(headMax, tailMax) {
 // shouldStop(), polled every STOP_POLL_MS while the harness runs. After a normal exit, members of the harness's group
 // and the descendants still linked to them are stopped with the same ladder ("cleanup"): a server or watcher the
 // model backgrounded does not outlive the job (spec §3.6 А8, §3.9); descendants already orphaned to init are out of
-// reach.
-export function runCli({ argv, cwd, env, stdinPath = null, timeoutMs, logPath = null, onSpawn, shouldStop = null, redact = (text) => text, ladder = DEFAULT_LADDER, exclude = [] }) {
+// reach. `onGroups` goes to terminateTree. The result's `teardown` { survivors, error } is the outcome of that stop,
+// apart from the verdict: groups still alive after the ladder and its re-sweep, or the error that broke it off.
+export function runCli({ argv, cwd, env, stdinPath = null, timeoutMs, logPath = null, onSpawn, shouldStop = null, redact = (text) => text, ladder = DEFAULT_LADDER, exclude = [], onGroups = null }) {
   return new Promise((resolve) => {
     const stdout = boundedText(STDOUT_HEAD_CHARS, STDOUT_TAIL_CHARS);
     let stderr = "";
@@ -1086,18 +1627,28 @@ export function runCli({ argv, cwd, env, stdinPath = null, timeoutMs, logPath = 
     let childStart = null;
     let stopping = null; // the ladder's promise, once one runs
     let stoppedBy = null;
+    let teardown = { survivors: [], error: null };
     const runLadder = (label, reason = label) => {
       if (stopping || !child?.pid) return;
       stoppedBy = label;
       clearInterval(poller);
       appendLog(logPath, `${reason}: ${ladderText(ladder)} to the process tree of ${child.pid}`);
-      stopping = terminateTree(child.pid, ladder, { exclude, log: (line) => appendLog(logPath, `${label}: ${line}`) });
+      stopping = terminateTree(child.pid, ladder, { exclude, onGroups, log: (line) => appendLog(logPath, `${label}: ${line}`) });
     };
-    const sweepLeftovers = async () => {
-      if (harnessGroupState(child.pid, childStart) !== "ours") return; // nothing left, or the pid is no longer ours
+    const sweepLeftovers = () => {
+      if (harnessGroupState(child.pid, childStart) !== "ours") return null; // nothing left, or the pid is no longer ours
       stoppedBy = "cleanup";
       appendLog(logPath, `cleanup: the harness exited and left processes in its group; ${ladderText(ladder)} to the process tree of ${child.pid}`);
-      await terminateTree(child.pid, ladder, { exclude, log: (line) => appendLog(logPath, `cleanup: ${line}`) });
+      return terminateTree(child.pid, ladder, { exclude, onGroups, log: (line) => appendLog(logPath, `cleanup: ${line}`) });
+    };
+    const settleTeardown = async (stop) => {
+      try {
+        const stopped = await stop();
+        if (stopped) teardown = { survivors: stopped.survivors, error: null };
+      } catch (error) {
+        teardown = { survivors: [], error: error?.message ?? String(error) };
+        appendLog(logPath, `the stop of the process tree failed: ${redact(teardown.error)}`);
+      }
     };
     const finish = async () => {
       if (settled) return;
@@ -1105,8 +1656,8 @@ export function runCli({ argv, cwd, env, stdinPath = null, timeoutMs, logPath = 
       clearTimeout(timer);
       clearTimeout(closeTimer);
       clearInterval(poller);
-      if (stopping) await stopping.catch(() => {});
-      else if (child?.pid && !spawnError) await sweepLeftovers().catch(() => {});
+      if (stopping) await settleTeardown(() => stopping);
+      else if (child?.pid && !spawnError) await settleTeardown(sweepLeftovers);
       outLines.flush();
       errLines.flush();
       // A descendant that keeps the pipes open after the harness exited must not append to the log any more.
@@ -1120,6 +1671,7 @@ export function runCli({ argv, cwd, env, stdinPath = null, timeoutMs, logPath = 
         exitCode,
         signal,
         stoppedBy,
+        teardown,
         childStartedAt: childStart,
         stdout: redact(kept.text),
         stdoutDropped: kept.dropped,
@@ -1259,17 +1811,208 @@ const readOnlyFs = {
   },
 };
 
-// Runs one short command (`--version`, `--help`, `auth status`): never through a shell, always with a timeout.
-function defaultExec(env) {
-  return (cmd, args = [], { timeoutMs = EXEC_TIMEOUT_MS, cwd, env: childEnv, input } = {}) => {
-    const r = spawnSync(cmd, args, { cwd, env: childEnv ?? filterEnv(env), input, encoding: "utf8", timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
-    return { status: r.status, signal: r.signal, stdout: r.stdout ?? "", stderr: r.stderr ?? "", error: r.error ?? null };
-  };
+// The supervisor of one auxiliary command (boundedExec), run as `node -e`. boundedExec starts it as the leader of a
+// session and process group of its own (spawnSync's `detached`: setsid), and the command runs in that group: a
+// SIGKILL to the caller's group (a runner's) does not reach them. It never starts the command without leading that
+// group, and the group lives exactly as long as it does: every way out of it is one SIGKILL to its own group, itself
+// included — sent while it is alive, so the group id cannot name another group yet, and nobody signals that id once
+// it is reaped. In order: for a runner (cfg.ownerLog, its job's ownership log) it appends its group with its own start
+// time — so the group stays the job's should the runner die from here on — then checks that its parent is still the
+// caller it was given (cfg.callerPid; once the caller dies it has another parent, never the caller's pid again), and
+// only then starts the command, unless the deadline has passed already. The deadline counts from its own start, so it
+// is done by start + timeoutMs + graceMs whatever its first steps cost, well inside boundedExec's backstop: only an
+// outside SIGKILL to it alone can leave the command running without it. It sends SIGTERM to the group at the deadline
+// — or once the stop file exists (a runner's terminal claim), its caller is gone, or it is signalled itself — and ends
+// the group graceMs later; after a normal exit it ends it at once, with whatever the command left in it. It prints one
+// JSON result before that SIGKILL (none when its caller is gone) and never waits on the command beyond deadline +
+// grace, whatever the command does with its signals or its pipes. It loads nothing from disk: a plugin update that
+// replaces the core's directory during a long job does not break a runner's later ctx.exec. Its config arrives on
+// stdin (the command's environment must not show in argv); argv repeats the command for ps.
+const EXEC_SUPERVISOR = String.raw`
+"use strict";
+const { spawn, spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const startedAt = Date.now();
+const cfg = JSON.parse(fs.readFileSync(0, "utf8"));
+const deadline = cfg.timeoutMs > 0 ? startedAt + cfg.timeoutMs : Infinity;
+// This process's start time exactly as processStart() of agent-core.mjs reads it (keep the two in step): field 22 of
+// /proc/<pid>/stat on Linux, else ps's lstart in the C locale and UTC.
+const ownStart = () => {
+  if (process.platform === "linux") {
+    try {
+      const stat = fs.readFileSync("/proc/self/stat", "utf8");
+      const ticks = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/)[22 - 3];
+      if (/^\d+$/.test(ticks || "")) return "ticks:" + ticks;
+    } catch {}
+  }
+  for (const ps of ["ps", "/bin/ps"]) {
+    const r = spawnSync(ps, ["-o", "lstart=", "-p", String(process.pid)], { encoding: "utf8", env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" }, timeout: cfg.psTimeoutMs, killSignal: "SIGKILL" });
+    if (r.error) continue;
+    const text = (r.stdout || "").trim().replace(/\s+/g, " ");
+    return r.status === 0 && text ? text : null;
+  }
+  return null;
+};
+// One line appended to the job's ownership log, which must exist already (it is never created here).
+const recordOwnGroup = () => {
+  let fd = null;
+  try {
+    fd = fs.openSync(cfg.ownerLog, fs.constants.O_WRONLY | fs.constants.O_APPEND);
+    fs.writeSync(fd, JSON.stringify({ groups: [{ pgid: process.pid, startedAt: ownStart() }], by: "exec", at: new Date().toISOString() }) + "\n");
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) try { fs.closeSync(fd); } catch {}
+  }
+};
+const chunks = { stdout: [], stderr: [] };
+const sizes = { stdout: 0, stderr: 0 };
+let child = null, status = null, signal = null, error = null;
+let exited = false, timedOut = false, stopped = false, stopping = false, done = false, killTimer = null, closeTimer = null, poll = null;
+const callerGone = () => process.ppid !== cfg.callerPid;
+const failure = (e) => ({ code: typeof e.code === "string" ? e.code : null, errno: e.errno, detail: typeof e.code === "string" ? null : String(e.message) });
+const end = () => { try { process.kill(-process.pid, "SIGKILL"); } catch {} process.exit(1); };
+const finish = () => {
+  if (done) return;
+  done = true;
+  clearInterval(poll); clearTimeout(killTimer); clearTimeout(closeTimer);
+  if (callerGone()) return end();
+  for (const s of [child && child.stdout, child && child.stderr]) if (s) s.destroy();
+  if (child && child.pid && !exited) signal = "SIGKILL"; // still running: ended with the group
+  const text = (k) => Buffer.concat(chunks[k]).toString("utf8");
+  const result = JSON.stringify({ status, signal, stdout: text("stdout"), stderr: text("stderr"), error, timedOut, stopped });
+  process.stdout.on("error", end);
+  process.stdout.write(result, end);
+};
+const stop = (why) => {
+  if (stopping || done || !child || !child.pid) return;
+  stopping = true;
+  if (why === "timeout") { timedOut = true; error = { code: "ETIMEDOUT" }; }
+  else { stopped = true; error = { code: "ECANCELED", detail: "stopped: " + why }; }
+  try { process.kill(-process.pid, "SIGTERM"); } catch {} // this process too: the handler below ignores it while stopping
+  killTimer = setTimeout(finish, cfg.graceMs);
+};
+for (const s of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(s, () => { if (s !== "SIGTERM" || !stopping) end(); });
+const refuse = (detail) => { error = { code: "ESUPERVISOR", detail }; finish(); };
+const run = async () => {
+  if (cfg.testDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, cfg.testDelayMs));
+  try { process.kill(-process.pid, 0); } catch { return refuse("it leads no process group of its own"); }
+  if (cfg.ownerLog && !recordOwnGroup()) return refuse("its process group could not be recorded for the job");
+  if (callerGone()) return end(); // the caller died before this supervisor got here: nothing is started
+  if (Date.now() >= deadline) { timedOut = true; error = { code: "ETIMEDOUT", detail: "the deadline passed before the command started" }; return finish(); }
+  const input = cfg.inputBase64 != null ? Buffer.from(cfg.inputBase64, "base64") : cfg.input;
+  child = spawn(cfg.cmd, cfg.args, { cwd: cfg.cwd || undefined, env: cfg.env, stdio: ["pipe", "pipe", "pipe"] });
+  child.on("error", (e) => { error = failure(e); finish(); });
+  for (const k of ["stdout", "stderr"]) {
+    child[k].on("data", (chunk) => {
+      sizes[k] += chunk.length;
+      if (sizes[k] > cfg.maxBuffer) {
+        if (!error) error = { code: "ENOBUFS" };
+        try { child.kill("SIGKILL"); } catch {}
+        return finish();
+      }
+      chunks[k].push(chunk);
+    });
+  }
+  child.stdin.on("error", () => {});
+  child.stdin.end(input == null ? "" : input);
+  child.on("exit", (code, sig) => { exited = true; status = code; signal = sig; if (!closeTimer) closeTimer = setTimeout(finish, 200); });
+  child.on("close", (code, sig) => { exited = true; if (status === null && signal === null) { status = code; signal = sig; } finish(); });
+  poll = setInterval(() => {
+    if (callerGone()) stop("its caller is gone");
+    else if (Date.now() >= deadline) stop("timeout");
+    else if (cfg.stopFile && fs.existsSync(cfg.stopFile)) stop("the job was cancelled");
+  }, 50);
+};
+run().catch((e) => { error = failure(e); finish(); });
+`;
+
+// Node's error of a failed spawnSync (code, errno, syscall, path, spawnargs; message `spawnSync <cmd> <code>`), which
+// ctx.exec has always returned.
+function execError(code, cmd, args, { errno = null, detail = null } = {}) {
+  const number = Number.isInteger(errno) ? errno : os.constants.errno[code] ? -os.constants.errno[code] : undefined;
+  return Object.assign(new Error(`spawnSync ${cmd} ${code}${detail ? ` (${detail})` : ""}`), {
+    ...(number !== undefined ? { errno: number } : {}),
+    code,
+    syscall: `spawnSync ${cmd}`,
+    path: cmd,
+    spawnargs: args,
+  });
 }
 
-// The ctx handed to adapter hooks. Tests inject `exec` and `fs`.
-export function makeCtx({ env = process.env, profile = {}, profileName = null, exec, fs: fsApi, ...rest } = {}) {
-  return { env, profile, profileName, platform: process.platform, paths: dataPaths(env), exec: exec ?? defaultExec(env), fs: fsApi ?? readOnlyFs, ...rest };
+// Runs one short auxiliary command (`--version`, `--help`, `auth status`, an export) synchronously, never through a
+// shell, under a hard deadline: the command runs in a session and process group of its own, led by its supervisor (so
+// a cancel that finds a stuck runner reaches it among the runner's descendants, and a SIGKILL to the runner's group
+// does not orphan it), gets SIGTERM at timeoutMs and SIGKILL graceMs later, and is stopped the same way once
+// `stopFile` exists or the caller is gone; anything it leaves in its group is SIGKILLed when it is done — all by the
+// supervisor (EXEC_SUPERVISOR), so this function signals nothing. `owner` (a runner's job record) gets the group
+// recorded in its ownership log before the command starts. It has no controlling terminal, so it is not for a command
+// that prompts on one. A plain spawnSync timeout only sends SIGTERM and then waits for as long as the command ignores
+// it. timeoutMs counts from the supervisor's start (a command never starts past it). spawnSync's calling convention
+// otherwise: `timeoutMs` 0 or null is no deadline (a stop file and the caller's
+// death still end the command); `input` is a string, a Buffer or a typed array. Returns { status, signal, stdout,
+// stderr, error, timedOut, stopped }; error is spawnSync's (code, errno, syscall, path, spawnargs) with code ETIMEDOUT
+// after the deadline, ECANCELED after a stop, ENOBUFS beyond maxBuffer, the spawn error's (ENOENT, …) otherwise, or
+// ESUPERVISOR when the supervisor itself failed.
+export function boundedExec(cmd, args = [], { timeoutMs = EXEC_TIMEOUT_MS, graceMs = EXEC_GRACE_MS, cwd, env = process.env, input, stopFile = null, owner = null, maxBuffer = EXEC_MAX_BUFFER } = {}) {
+  const argv = (Array.isArray(args) ? args : []).map(String);
+  const ms = (value, fallback, min) => (typeof value === "number" && Number.isFinite(value) ? Math.min(Math.max(min, value), MAX_TIMER_MS) : fallback);
+  const binary = ArrayBuffer.isView(input);
+  const config = {
+    cmd: String(cmd),
+    args: argv,
+    cwd: cwd ?? null,
+    env,
+    input: binary || input == null ? null : String(input),
+    inputBase64: binary ? Buffer.from(input.buffer, input.byteOffset, input.byteLength).toString("base64") : null,
+    timeoutMs: timeoutMs === null || timeoutMs === 0 ? 0 : ms(timeoutMs, EXEC_TIMEOUT_MS, 1),
+    graceMs: ms(graceMs, EXEC_GRACE_MS, 0),
+    stopFile,
+    ownerLog: owner ? runnerFile(owner) : null,
+    callerPid: process.pid,
+    maxBuffer,
+    psTimeoutMs: PS_TIMEOUT_MS,
+    testDelayMs: Number(process.env[TEST_EXEC_DELAY_VAR]) || 0,
+  };
+  const r = spawnSync(process.execPath, ["-e", EXEC_SUPERVISOR, `${CLI_NAME}-exec`, config.cmd, ...argv], {
+    input: JSON.stringify(config),
+    encoding: "utf8",
+    env: { PATH: process.env.PATH ?? "" }, // the supervisor itself needs nothing; NODE_OPTIONS must not reach it
+    detached: true, // setsid: the supervisor leads the command's group (see EXEC_SUPERVISOR)
+    timeout: config.timeoutMs > 0 ? config.timeoutMs + config.graceMs + EXEC_MARGIN_MS : undefined,
+    killSignal: "SIGKILL",
+    maxBuffer: 16 * maxBuffer,
+  });
+  // Nothing is signalled here: the supervisor has ended its group itself, and its pid — the group's id — is free for
+  // reuse now that it is reaped. A supervisor SIGKILLed alone (by hand, by the OOM killer; the backstop above fires
+  // only on one stuck for EXEC_MARGIN_MS beyond its own end) leaves its command without a leader that could confirm the
+  // group is still this one: it is not signalled by its number, here or by a job's cleanup.
+  let res = null;
+  try {
+    res = JSON.parse(r.stdout ?? "");
+  } catch {
+    res = null;
+  }
+  if (!isObject(res)) {
+    const why = r.error?.code ?? (r.signal ? `signal ${r.signal}` : `exit ${r.status}`);
+    return { status: null, signal: null, stdout: "", stderr: "", error: execError("ESUPERVISOR", config.cmd, argv, { detail: `its supervisor failed: ${why}` }), timedOut: false, stopped: false };
+  }
+  const code = typeof res.error?.code === "string" ? res.error.code : "ESUPERVISOR"; // a failure without a code of its own
+  const error = isObject(res.error) ? execError(code, config.cmd, argv, { errno: res.error.errno, detail: res.error.detail ?? null }) : null;
+  return { status: res.status ?? null, signal: res.signal ?? null, stdout: res.stdout ?? "", stderr: res.stderr ?? "", error, timedOut: res.timedOut === true, stopped: res.stopped === true };
+}
+
+function defaultExec(env, { stopFile = null, owner = null } = {}) {
+  return (cmd, args = [], { timeoutMs = EXEC_TIMEOUT_MS, graceMs = EXEC_GRACE_MS, cwd, env: childEnv, input } = {}) =>
+    boundedExec(cmd, args, { timeoutMs, graceMs, cwd, env: childEnv ?? filterEnv(env), input, stopFile, owner });
+}
+
+// The ctx handed to adapter hooks. Tests inject `exec` and `fs`. `stopFile`: a file whose appearance stops the
+// default exec's command (a runner passes its job's terminal claim); `owner`: the job record whose ownership log
+// records the default exec's process groups (a runner passes its own).
+export function makeCtx({ env = process.env, profile = {}, profileName = null, exec, fs: fsApi, stopFile = null, owner = null, ...rest } = {}) {
+  return { env, profile, profileName, platform: process.platform, paths: dataPaths(env), exec: exec ?? defaultExec(env, { stopFile, owner }), fs: fsApi ?? readOnlyFs, ...rest };
 }
 
 function launchError(message) {
@@ -1634,7 +2377,8 @@ async function startJobUnredacted({ adapter, profileName, profile, role, write, 
   const log = logFile(ws.jobsDir, id);
   let reservation = null;
   let handedOff = false;
-  let announced = false; // a runner exists: from here on the job is finalized, never discarded
+  let announced = false; // a runner may exist: from here on the job is finalized, never discarded
+  let spawned = false; // a runner process was started
   try {
     const record = updateRunning(file, {
       sessionId: prev ? prev.sessionId : newSessionId(adapter, id),
@@ -1681,7 +2425,7 @@ async function startJobUnredacted({ adapter, profileName, profile, role, write, 
     }
     appendLog(log, `task ${id}: profile ${profileName} harness ${adapter.id} write=${write ? "yes" : "no"}${prev ? ` resumeOf=${prev.id}` : ""}`);
     const logFd = fs.openSync(log, "a");
-    let runner;
+    let runner = null;
     try {
       announced = true;
       // The runner works in the workspace root: a relative state dir is handed over resolved, so its data root
@@ -1696,7 +2440,8 @@ async function startJobUnredacted({ adapter, profileName, profile, role, write, 
       fs.closeSync(logFd);
     }
     if (!runner.pid) throw new Error(`failed to start the runner for ${id}`);
-    if (reservation && !updateReservation(reservation.file, reservation.token, runner.pid)) {
+    spawned = true;
+    if (reservation && !updateReservation(reservation.file, reservation.token, runner.pid, processStart(runner.pid))) {
       throw new Error(`workspace reservation was lost before the runner started for ${id}`);
     }
     runner.unref();
@@ -1705,7 +2450,11 @@ async function startJobUnredacted({ adapter, profileName, profile, role, write, 
   } catch (error) {
     if (!handedOff) {
       if (!announced && error instanceof UsageError) discardJob(ws.jobsDir, id); // refused: no trace, no job
-      else finalizeRecord(file, { status: "failed", errorClass: "launch", note: error.message });
+      else {
+        // The note is stored: it passes the redactor like the error itself (the key may be known by now).
+        finalizeRecord(file, { status: "failed", errorClass: "launch", note: redact(error?.message ?? String(error)) });
+        if (!spawned) markCleaned(file); // no runner, no harness: nothing to stop (a spawned runner marks it itself)
+      }
     }
     throw error;
   } finally {
@@ -1715,21 +2464,48 @@ async function startJobUnredacted({ adapter, profileName, profile, role, write, 
 
 // ---------- the runner (the CLI's RUN_VERB) ----------
 
+// Tests only (TEST_RUN_BARRIER_VAR): park after the reads the claim decision rests on and before the claim. The
+// runner writes what it read (`observed`) to `<barrier>.ready-<pid>` and waits for the barrier file, which may hold an
+// instant (ms since the epoch) to resume at — so that two parked runners commit their claims at the same moment.
+async function runBarrier(env, observed) {
+  const barrier = env[TEST_RUN_BARRIER_VAR];
+  if (!barrier) return;
+  fs.writeFileSync(`${barrier}.ready-${process.pid}`, JSON.stringify(observed));
+  for (const deadline = Date.now() + 30_000; !fs.existsSync(barrier) && Date.now() < deadline;) await sleep(10);
+  const until = Math.min(Number(readOnlyFs.readFile(barrier)) || 0, Date.now() + 5_000);
+  while (Date.now() < until); // a busy wait: a timer would resume the two up to a scheduler tick apart
+}
+
 export async function runJob({ id, jobsDir, token, adapters = {}, env = process.env, ctx: ctxOverrides = {} }) {
   if (!isCoreJobId(id ?? "") || !jobsDir || !token) throw new UsageError(`usage: ${CLI_NAME} ${RUN_VERB} <id> <jobs-dir> <reservation-token|-> (internal)`);
   const file = jobFile(jobsDir, id);
   const log = logFile(jobsDir, id);
-  // One runner per job: only a job without a runner can be claimed, so a second `__run` (by hand, or duplicated)
-  // never starts a second harness and never touches the job's record, key or reservation.
-  const record = updateRunning(file, { runnerPid: process.pid }, (current) => current.runnerPid == null || current.runnerPid === process.pid);
-  if (!record) {
-    const current = readRecord(file);
-    if (current?.status !== "running") return 0; // cancelled (or otherwise terminal) before the runner started
-    appendLog(log, `${RUN_VERB} refused for ${id} in pid ${process.pid}: runner pid ${current.runnerPid} owns the job`);
+  const refuse = (owner) => {
+    appendLog(log, `${RUN_VERB} refused for ${id} in pid ${process.pid}: runner pid ${owner ?? "?"} owns the job`);
     return 1;
+  };
+  // One runner per job: the claim file is created exclusively (claimRunnerFile), so of two `__run` (by hand, or
+  // duplicated) racing for one job exactly one wins, also when both read the job unclaimed; the other never starts a
+  // harness and never touches the job's record, key or reservation. A record that already names another runner is
+  // refused without a try.
+  const before = readRecord(file);
+  if (!before) return 0; // no such job (startJob discards a job only before it spawns a runner)
+  if (before.status === "running" && before.runnerPid != null && before.runnerPid !== process.pid) return refuse(before.runnerPid);
+  await runBarrier(env, { runnerPid: before.runnerPid ?? null, claimed: fs.existsSync(runnerFile(file)) });
+  if (!claimRunnerFile(file, { pid: process.pid, startedAt: ownStart(), bootId: bootId(), claimedAt: new Date().toISOString() })) {
+    return refuse(readOwnership(file)?.pid); // the job has (or had) its runner, which also finishes it
   }
+  // The job is this runner's from here on, whatever its record says: every way out removes the key and — once
+  // nothing the job may own is left — releases the reservation handed to it (only its holder can, so nobody else's)
+  // and marks the cleanup done.
   const lock = token === "-" ? null : reservationFileForToken(jobsDir, token);
+  let reserved = null;
+  const holdReservation = async () => {
+    if (reserved === null) reserved = Boolean(lock) && (await claimRunnerReservation(lock, id, token));
+    return reserved;
+  };
   let redact = redactor();
+  let teardown = null; // runCli's, once the harness ran
   const fail = (errorClass, note) => {
     const text = redact(note);
     const after = finalizeRecord(file, { status: "failed", errorClass, note: text });
@@ -1738,7 +2514,15 @@ export async function runJob({ id, jobsDir, token, adapters = {}, env = process.
   };
   const failClass = (error) => (ERROR_CLASSES.includes(error?.errorClass) ? error.errorClass : "launch");
   try {
-    if (token !== "-" && (!lock || !(await claimRunnerReservation(lock, id, token)))) return fail("launch", "workspace reservation was lost before the runner started");
+    const current = readRecord(file);
+    const record = current?.status === "running" ? updateRunning(file, { runnerPid: process.pid, runnerStartedAt: ownStart() }) : null;
+    if (!record) {
+      // Cancelled (or otherwise finished) before this runner started: nothing to run, but the reservation it was
+      // handed is still released below.
+      appendLog(log, `runner pid ${process.pid}: job ${id} is ${readRecord(file)?.status} already; nothing started`);
+      return 0;
+    }
+    if (token !== "-" && (!lock || !(await holdReservation()))) return fail("launch", "workspace reservation was lost before the runner started");
     const adapter = adapters[record.harness];
     if (!adapter) return fail("launch", `no adapter for harness ${record.harness}`);
     let secret = null;
@@ -1748,14 +2532,16 @@ export async function runJob({ id, jobsDir, token, adapters = {}, env = process.
       redact = redactor([secret]);
     }
     const profile = isObject(record.profileConfig) ? record.profileConfig : {};
-    const ctx = makeCtx({ env, profile, profileName: record.profile, ...ctxOverrides });
+    // ctx.exec's commands (discover, the help check, finalize's export) stop once the job is claimed terminal, and
+    // their groups are the job's (its ownership log).
+    const ctx = makeCtx({ env, profile, profileName: record.profile, stopFile: terminalFile(file), owner: file, ...ctxOverrides });
     let harness;
     try {
       harness = await discoverHarness(adapter, ctx);
     } catch (error) {
       return fail(failClass(error), error?.message ?? String(error));
     }
-    if (harness) updateRunning(file, { harnessVersion: harness.version });
+    if (harness) updateRunning(file, { harnessVersion: typeof harness.version === "string" ? redact(harness.version) : null });
     const req = requestOf(record, profile, harness, jobsDir);
     let plan;
     let run;
@@ -1783,7 +2569,11 @@ export async function runJob({ id, jobsDir, token, adapters = {}, env = process.
       redact,
       ladder,
       exclude: [process.pid],
+      onGroups: (groups) => recordGroups(file, groups, "runner"),
       onSpawn: (pid, { startedAt }) => {
+        // First the claim file, which a terminal claim does not freeze: if this runner dies from here on, cancel and
+        // the reaper still find the harness by its verified identity.
+        updateRunnerFile(file, { childPid: pid, childStartedAt: startedAt });
         dropSecret(jobsDir, id); // the key now lives only in the harness's environment
         if (updateRunning(file, { childPid: pid, childStartedAt: startedAt })) return null;
         return stopLabel(); // claimed terminal (cancelled) before the harness started
@@ -1792,6 +2582,7 @@ export async function runJob({ id, jobsDir, token, adapters = {}, env = process.
       // when the claimer never saw childPid (a cancel racing onSpawn) or died part-way.
       shouldStop: () => (fs.existsSync(claim) ? stopLabel() : null),
     });
+    teardown = result.teardown;
     const io = { ...harnessIo(result), cancelled: readRecord(file)?.status === "cancelled" };
     // spec §3.5: a harness can keep what it saw in files of its own (pi's session transcript), beyond the stream
     // redaction. On every path — completed, failed, timed out, cancelled — the adapter's scrub() returns those files
@@ -1853,7 +2644,35 @@ export async function runJob({ id, jobsDir, token, adapters = {}, env = process.
     return fail("crash", `runner error: ${error?.message ?? error}`);
   } finally {
     dropSecret(jobsDir, id);
-    if (lock) releaseReservation(lock, token);
+    // The cleanup is done only when the harness's teardown reported neither a survivor nor an error and nothing the
+    // ownership log names is left (a group just SIGKILLed gets a moment to be reaped). Then the reservation goes and
+    // the marker is written; otherwise both stay, whatever the verdict, and the reaper (once this runner is gone), a
+    // repeated cancel or release-stale finish the cleanup by verified identities.
+    const failed = teardown && (teardown.error || teardown.survivors.length > 0);
+    const left = failed ? [] : await settledSurvivors(jobsDir, id);
+    if (!failed && left.length === 0) {
+      if (lock && (await holdReservation())) releaseReservation(lock, token);
+      markCleaned(file);
+    } else {
+      const why = !failed
+        ? `process groups ${left.map((group) => group.pgid).join(",")} may still be the job's`
+        : teardown.error
+          ? `the stop of the harness tree failed (${redact(teardown.error)})`
+          : `process groups ${teardown.survivors.join(",")} survived the teardown`;
+      appendLog(log, `cleanup pending: ${why}${lock ? "; the workspace reservation stays held" : ""}`);
+    }
+  }
+}
+
+// What survivingGroups() still finds of a job once it has had up to SETTLE_MS to clear: a group whose members were
+// just SIGKILLed is alive until they are reaped.
+async function settledSurvivors(jobsDir, id) {
+  const deadline = Date.now() + SETTLE_MS;
+  for (;;) {
+    const record = readRecord(jobFile(jobsDir, id));
+    const left = record ? survivingGroups(jobsDir, record) : [];
+    if (left.length === 0 || Date.now() >= deadline) return left;
+    await sleep(POLL_MS);
   }
 }
 
@@ -1885,25 +2704,44 @@ export async function runProbe({
   const dir = fs.mkdtempSync(path.join(base, `${profileName}-`));
   try {
     const ctx = makeCtx({ env, profile, profileName, ...ctxOverrides });
-    const harness = await discoverHarness(adapter, ctx);
     const promptPath = path.join(dir, "prompt.md");
     writePrivateFile(promptPath, prompt);
-    const req = jobLessRequest({
+    const base = jobLessRequest({
       profile,
       profileName,
       dir,
       cwd: cwd ? path.resolve(cwd) : dir,
       promptPath,
       promptBytes: Buffer.byteLength(prompt),
-      harness,
+      harness: null,
       sessionId: adapter.manifest?.sessionId === "preassign" ? randomUUID() : null,
     });
-    const plan = await planInvocation(adapter, req, ctx, { probe: true });
-    let secret = null;
-    if (plan.secretEnv.length > 0) {
-      secret = await resolveKey(resolveSecret, profileName, plan.secretEnv);
-      redact.add(secret);
+    // The key before discovery, as a job's runner has it (spec §3.5): discover() and the help check run commands
+    // whose diagnostics end up in errors, and the redactor must know the key by then. A job-less plan says whether the
+    // adapter asks for one: invocation() with req.harness null, exactly as startJob calls it (the contract), not
+    // probe(), which has only ever been called with the harness known. A plan the adapter rejects ends the probe here,
+    // as it refuses a task (exit 2): without it there is no key to redact discovery's diagnostics with. A profile.env
+    // clash is refused before the key source is read.
+    let draft;
+    try {
+      draft = await planInvocation(adapter, base, ctx);
+    } catch (error) {
+      if (error instanceof UsageError) throw error;
+      throw new UsageError(`profile ${profileName}: ${error?.message ?? error}`);
     }
+    const clash = envConflicts(profile.env, draft);
+    if (clash.length > 0) throw new Error(`profile env ${clash.join(", ")} conflicts with a mandatory setting`);
+    let secret = null;
+    const ensureKey = async (names) => {
+      if (secret !== null || names.length === 0) return;
+      secret = await resolveKey(resolveSecret, profileName, names);
+      redact.add(secret);
+    };
+    await ensureKey(draft.secretEnv);
+    const harness = await discoverHarness(adapter, ctx);
+    const req = { ...base, harness };
+    const plan = await planInvocation(adapter, req, ctx, { probe: true });
+    await ensureKey(plan.secretEnv);
     const run = materialize(plan, { profile, secret, redact, env });
     const timeoutMin = positiveNumber(profile.timeoutMin, DEFAULT_TIMEOUT_MIN, `profile ${profileName}: timeoutMin`);
     const result = await runCli({
@@ -1934,7 +2772,7 @@ export async function runProbe({
       reportedModel: text(reduced?.reportedModel),
       usage: isObject(reduced?.usage) ? JSON.parse(redact(JSON.stringify(reduced.usage))) : null,
       errorText: reduced?.errorText ? redact(String(reduced.errorText)).slice(0, 4000) : null,
-      harness,
+      harness: harness ? { bin: redact(harness.bin), version: text(harness.version) } : null,
       exitCode: result.exitCode,
       signal: result.signal,
       stderrTail: result.stderrTail,
@@ -2006,71 +2844,115 @@ export function resultCommand({ cwd, id, env = process.env } = {}, out = default
 
 export async function cancelCommand({ cwd, id, env = process.env } = {}, out = defaultOut) {
   const ws = requireWorkspace(cwd, env);
-  reapDeadRunners(ws.jobsDir); // finalizes a job from an earlier boot, so its pids are never signalled below
+  // Finalizes a job from an earlier boot, so its pids are never signalled below. A pending cleanup of the job being
+  // cancelled is left to this command, which stops it with the adapter's ladder rather than the reaper's SIGKILL.
+  reapDeadRunners(ws.jobsDir, { except: isCoreJobId(id) ? id : null });
   const record = requireJob(ws.jobsDir, id);
   const file = jobFile(ws.jobsDir, record.id);
   const log = logFile(ws.jobsDir, record.id);
   // The cancelled record is written first, so the runner finishing meanwhile cannot overwrite it: the job is
   // cancelled by the dispatcher's own record, whatever the harness exits with (spec §3.6 А8).
   const after = record.status === "running" ? finalizeRecord(file, { status: "cancelled", errorClass: null, note: `cancelled by ${CLI_NAME} cancel` }) : record;
-  if (after.status !== "cancelled" || record.status !== "running") {
+  const fresh = record.status === "running" && after?.status === "cancelled";
+  // A job that was already terminal keeps its verdict; only a cleanup its claimer left unfinished (the claiming
+  // cancel and the runner both interrupted) is resumed.
+  if (!fresh && !cleanupPending(ws.jobsDir, after)) {
     out.stdout(`${record.id} is ${after.status}\n`);
     return 0;
   }
-  if (bootOf(record.bootId) !== "current") {
-    appendLog(log, `cancel: record set to cancelled; harness process group ${after.childPid} ${UNKNOWN_BOOT_NOTE}`);
-    out.stdout(`cancelled ${record.id} (harness process group ${after.childPid ?? "-"} ${UNKNOWN_BOOT_NOTE}; check it with: ps -g ${after.childPid ?? "<pgid>"})\n`);
+  const procs = jobProcesses(ws.jobsDir, after);
+  if (bootOf(after.bootId) !== "current") {
+    const group = procs.child.pid ?? "-";
+    appendLog(log, `cancel: ${fresh ? "record set to cancelled" : `the job is ${after.status}, cleanup pending`}; harness process group ${group} ${UNKNOWN_BOOT_NOTE}`);
+    out.stdout(
+      fresh
+        ? `cancelled ${record.id} (harness process group ${group} ${UNKNOWN_BOOT_NOTE}; check it with: ps -g ${procs.child.pid ?? "<pgid>"})\n`
+        : `${record.id} is ${after.status} (cleanup pending: harness process group ${group} ${UNKNOWN_BOOT_NOTE})\n`,
+    );
     return 0;
   }
   // The runner owns the stop: it sees the claim within STOP_POLL_MS, runs the adapter's ladder over the harness tree,
   // releases a write reservation and exits. cancel waits for that (bounded), so the tree is dead and free for the next
-  // write task when cancel returns; only a runner that is gone or stuck leaves the stop to cancel itself.
+  // write task when cancel returns; only a runner that is gone or stuck leaves the stop to cancel itself. A resumed
+  // cleanup waits only for what is left of that time since the claim: a runner that had it is stuck or gone.
   const ladder = normalizeLadder(after.cancelLadder);
-  appendLog(log, `cancel: record set to cancelled; the runner stops the process tree (${ladderText(ladder)})`);
+  appendLog(log, fresh ? `cancel: record set to cancelled; the runner stops the process tree (${ladderText(ladder)})` : `cancel: the job is ${after.status}, but its process tree is not known to be stopped; cleanup resumed`);
   const holders = jobHolders(ws.jobsDir, after);
   const waitMs = stopWaitMs(ladder);
-  const deadline = Date.now() + waitMs;
-  while (holders.some(isAlive) && Date.now() < deadline) await sleep(POLL_MS);
-  const latest = readRecord(file) ?? after;
-  const runner = Number.isInteger(latest.runnerPid) && isAlive(latest.runnerPid) ? latest.runnerPid : null;
-  const harnessLeft = Number.isInteger(latest.childPid) && harnessGroupState(latest.childPid, latest.childStartedAt) === "ours";
-  if (runner === null && !harnessLeft) {
-    out.stdout(`cancelled ${record.id}\n`);
-    return 0;
-  }
-  appendLog(log, runner !== null ? `cancel: runner pid ${runner} did not finish within ${waitMs} ms; cancel stops the tree itself` : "cancel: the runner is gone; cancel stops the tree itself");
-  const roots = harnessLeft ? [latest.childPid] : childGroupsOf(runner);
-  const stopped = await terminateTree(roots, ladder, {
-    exclude: [latest.runnerPid].filter(Number.isInteger),
-    log: (line) => appendLog(log, `cancel: ${line}`),
-  });
-  out.stdout(`cancelled ${record.id}${stopped.survivors.length > 0 ? ` (process groups still alive: ${stopped.survivors.join(",")})` : ""}\n`);
+  const claimedAt = fresh ? Date.now() : Date.parse(after.finishedAt);
+  const deadline = (Number.isFinite(claimedAt) ? claimedAt : Date.now()) + waitMs;
+  while (Date.now() < deadline && holders.some((holder) => possiblyOurs(processIdentity(holder.pid, holder.startedAt)))) await sleep(POLL_MS);
+  const { notes, stopped } = await stopJobTree(ws.jobsDir, readRecord(file) ?? after, ladder, log, waitMs);
+  const detail = notes.join("; ");
+  if (fresh) out.stdout(`cancelled ${record.id}${detail ? ` (${detail})` : ""}\n`);
+  else if (stopped || detail) out.stdout(`${record.id} is ${after.status} (cleanup resumed${detail ? `: ${detail}` : ""})\n`);
+  else out.stdout(`${record.id} is ${after.status}\n`); // its runner was just finishing: nothing was left to stop
   return 0;
 }
 
-// The processes cancel waits for: the job's runner and, for a write job, the holder of its unreleased reservation
-// (the runner itself once it started; the reservation names it before the record does).
+// What is left of a job once its runner had its time to stop it: every group of the job (survivingGroups: the
+// harness group, the groups of its ownership log) that is provably the job's, and — while the runner itself lives
+// (stuck) and is provably the job's — the groups of everything below it (a harness the record does not name yet, an
+// auxiliary command), all stopped with the adapter's ladder, the groups a snapshot adds recorded before they are
+// signalled. A pid that is foreign or unknown is never signalled, nor searched for descendants. The cleanup is marked
+// done once neither the runner, the reservation holder nor any group of the job may be alive — and only for a job that
+// has a runner on record: one whose runner has not claimed it yet (parked before runJob, or never to start) gets the
+// marker from that runner, which finds the job terminal and starts nothing. Returns { notes, stopped } for cancel's
+// line (stopped: a ladder ran).
+async function stopJobTree(jobsDir, record, ladder, log, waitMs) {
+  const file = jobFile(jobsDir, record.id);
+  const procs = jobProcesses(jobsDir, record);
+  const runner = processIdentity(procs.runner.pid, procs.runner.startedAt);
+  const harness = harnessGroupState(procs.child.pid, procs.child.startedAt);
+  const left = survivingGroups(jobsDir, record);
+  // The reservation names the runner before the runner's claim does (and the task process before that).
+  const waiting = jobHolders(jobsDir, record).filter((holder) => holder.pid !== procs.runner.pid && possiblyOurs(processIdentity(holder.pid, holder.startedAt)));
+  const recorded = fs.existsSync(runnerFile(file)) || procs.runner.pid !== null || procs.child.pid !== null;
+  const notes = [];
+  if (waiting.length > 0) appendLog(log, `cancel: pid ${waiting.map((holder) => holder.pid).join(",")} holds the job's reservation without having claimed the job; a runner that claims it now finds it ${record.status} and starts nothing`);
+  if (runner === "foreign") appendLog(log, `cancel: runner pid ${procs.runner.pid} not signalled: the pid now belongs to another process`);
+  if (runner === "unknown") notes.push(`runner pid ${procs.runner.pid} ${unconfirmedNote(procs.runner.startedAt)}`);
+  if (harness === "foreign") appendLog(log, `cancel: harness process group ${procs.child.pid} ${FOREIGN_NOTE}`);
+  if (harness === "unknown") notes.push(`harness process group ${procs.child.pid} ${unconfirmedNote(procs.child.startedAt)}`);
+  for (const group of left) if (!group.harness && group.state === "unknown") notes.push(`process group ${group.pgid} ${unconfirmedNote(group.startedAt)}`);
+  const ours = left.filter((group) => group.state === "ours").map((group) => group.pgid);
+  const roots = [...ours, ...(runner === "ours" ? descendantGroupsOf(procs.runner.pid) : [])];
+  let survivors = [];
+  if (roots.length > 0) {
+    appendLog(log, runner === "ours" ? `cancel: runner pid ${procs.runner.pid} did not finish within ${waitMs} ms; cancel stops the tree itself` : "cancel: the runner is gone; cancel stops the tree itself");
+    const stopped = await terminateTree(roots, ladder, {
+      exclude: [procs.runner.pid].filter(Number.isInteger),
+      log: (line) => appendLog(log, `cancel: ${line}`),
+      onGroups: (groups) => recordGroups(file, groups, "cancel"),
+    });
+    survivors = stopped.survivors;
+    if (survivors.length > 0) notes.push(`process groups still alive: ${survivors.join(",")}`);
+  }
+  for (const note of notes) appendLog(log, `cancel: ${note}`);
+  const done = recorded && waiting.length === 0 && !possiblyOurs(runner) && survivors.length === 0 && survivingGroups(jobsDir, record).length === 0;
+  if (done) markCleaned(file);
+  return { notes, stopped: roots.length > 0 };
+}
+
+// The processes cancel waits for, as { pid, startedAt }: the job's runner and, for a write job, the holder of its
+// unreleased reservation (the runner itself once it started; the reservation names it before the record does).
 function jobHolders(jobsDir, record) {
-  const pids = [];
-  if (Number.isInteger(record.runnerPid)) pids.push(record.runnerPid);
+  const holders = [];
+  const { runner } = jobProcesses(jobsDir, record);
+  if (runner.pid !== null) holders.push(runner);
   if (record.write === true) {
     const current = currentReservation(jobsDir);
     const held = current?.record;
-    if (held?.jobId === record.id && Number.isInteger(held.holderPid) && readJson(`${current.file}.released`)?.token !== held.token) pids.push(held.holderPid);
+    if (held?.jobId === record.id && Number.isInteger(held.holderPid) && readJson(`${current.file}.released`)?.token !== held.token) {
+      holders.push({ pid: held.holderPid, startedAt: typeof held.holderStartedAt === "string" ? held.holderStartedAt : null });
+    }
   }
-  return [...new Set(pids)];
+  return holders;
 }
 
 // How long cancel waits for the runner to stop the tree and exit: the poll, the ladder, the re-sweep, the pipe
 // drain and a margin.
 const stopWaitMs = (ladder) => STOP_POLL_MS + ladder.reduce((sum, [, waitMs]) => sum + waitMs, 0) + SWEEP_ROUNDS * POLL_MS + CLOSE_WAIT_MS + 2_000;
-
-// The process groups a runner's own children lead (it spawns its harness detached, so the harness leads one).
-function childGroupsOf(pid) {
-  if (!Number.isInteger(pid)) return [];
-  const rows = (processTable() ?? []).filter((row) => row.ppid === pid && row.pgid !== pid && row.pgid > 1);
-  return [...new Set(rows.map((row) => row.pgid))];
-}
 
 export function releaseStaleCommand({ cwd, env = process.env } = {}, out = defaultOut) {
   const ws = requireWorkspace(cwd, env);
@@ -2084,16 +2966,35 @@ export function releaseStaleCommand({ cwd, env = process.env } = {}, out = defau
   if (readJson(`${file}.released`)?.token === record.token) {
     throw new UsageError(`workspace reservation generation ${generation} is already released`);
   }
-  // Taken in an earlier boot: its holder and the job's harness are gone whatever their pids show now.
+  // Taken in an earlier boot: its holder and the job's processes are gone whatever their pids show now. Otherwise
+  // the reservation stays while any process of the job may still be alive: a holder, runner or process group (the
+  // harness's, or one of the job's ownership log) that is provably the job's, or whose identity cannot be read
+  // (unknown) — only gone or provably reused pids release it. A job with its cleanup marker has none left: what holds
+  // its old pids now is not its.
   const rebooted = bootOf(record.bootId) === "earlier";
-  if (!rebooted && isAlive(record.holderPid)) {
-    throw new UsageError(`workspace reservation generation ${generation} is held by live runner pid ${record.holderPid}`);
+  const holder = rebooted ? "gone" : processIdentity(record.holderPid, record.holderStartedAt);
+  if (possiblyOurs(holder)) {
+    const why = typeof record.holderStartedAt === "string" && record.holderStartedAt ? "its start time cannot be read" : "no start time was recorded for it";
+    const unconfirmed = holder === "unknown" ? ` (${why} to confirm whether it is still the job's runner)` : "";
+    throw new UsageError(`workspace reservation generation ${generation} is held by live runner pid ${record.holderPid}${unconfirmed}`);
   }
 
   const job = isCoreJobId(record.jobId) ? readRecord(jobFile(ws.jobsDir, record.jobId)) : null;
   const jobRebooted = rebooted || (job !== null && bootOf(job.bootId) === "earlier");
-  if (!jobRebooted && job?.childPid && harnessGroupState(job.childPid, job.childStartedAt) === "ours") {
-    throw new UsageError(`workspace reservation generation ${generation} still has live harness process group ${job.childPid}`);
+  if (!jobRebooted && job && !fs.existsSync(cleanedFile(jobFile(ws.jobsDir, job.id)))) {
+    const procs = jobProcesses(ws.jobsDir, job);
+    const runner = procs.runner.pid !== null && procs.runner.pid !== record.holderPid ? processIdentity(procs.runner.pid, procs.runner.startedAt) : "gone";
+    if (possiblyOurs(runner)) {
+      throw new UsageError(`workspace reservation generation ${generation}: job ${job.id} still has live runner pid ${procs.runner.pid}`);
+    }
+    const left = survivingGroups(ws.jobsDir, job);
+    const group = left.find((candidate) => candidate.state === "ours") ?? left[0];
+    if (group) {
+      const what = group.harness ? `harness process group ${group.pgid}` : `process group ${group.pgid} of job ${job.id}`;
+      if (group.state === "ours") throw new UsageError(`workspace reservation generation ${generation} still has live ${what}`);
+      const why = group.startedAt ? "its start time cannot be read" : "no start time was recorded for it";
+      throw new UsageError(`workspace reservation generation ${generation} still has ${what} alive, unconfirmed (${why}); not released`);
+    }
   }
 
   const latest = currentReservation(ws.jobsDir);
@@ -2111,6 +3012,7 @@ export function releaseStaleCommand({ cwd, env = process.env } = {}, out = defau
       note: jobRebooted ? REBOOT_NOTE : "stale reservation released",
     });
   }
+  if (job) markCleaned(jobFile(ws.jobsDir, record.jobId)); // nothing of the job may be alive (checked above)
   if (!createReservation(`${file}.released`, { holderPid: process.pid, token: record.token })) {
     throw new UsageError(`workspace reservation generation ${generation} is already released`);
   }

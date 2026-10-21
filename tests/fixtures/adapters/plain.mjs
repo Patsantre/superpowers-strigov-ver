@@ -52,9 +52,14 @@ const plain = {
     requiredFlags: ["--plain-json", "--session-id"],
     homeEnv: ["CLAUDE_CONFIG_DIR"],
   },
+  // profile.discoverTimeoutMs / discoverGraceMs (tests): the deadline and the grace of the --version call, else
+  // ctx.exec's defaults.
   discover(ctx) {
     const bin = ctx.profile.bin ?? defaultBin(ctx);
-    const r = ctx.exec(bin, ["--version"]);
+    const r = ctx.exec(bin, ["--version"], {
+      ...(ctx.profile.discoverTimeoutMs ? { timeoutMs: ctx.profile.discoverTimeoutMs } : {}),
+      ...(ctx.profile.discoverGraceMs ? { graceMs: ctx.profile.discoverGraceMs } : {}),
+    });
     if (r.error || r.status !== 0) throw Object.assign(new Error(`cannot run ${bin} --version`), { errorClass: "launch" });
     return { bin, version: /\d+\.\d+\.\d+\S*/.exec(r.stdout)?.[0] ?? null };
   },
@@ -125,8 +130,12 @@ const plain = {
 // The same adapter with dsh's SIGINT-first ladder (shortened for the tests).
 export const plainSigint = { ...plain, id: "plain-sigint", manifest: { ...plain.manifest, cancel: { ladder: [["SIGINT", 1500], ["SIGKILL", 0]] } } };
 
+// The same adapter with a long first step, so a test can interrupt a ladder between its SIGTERM and its SIGKILL.
+export const plainLongLadder = { ...plain, id: "plain-long-ladder", manifest: { ...plain.manifest, cancel: { ladder: [["SIGTERM", 3000], ["SIGKILL", 0]] } } };
+
 // The plain adapter misbehaving on purpose (profile.leak): it copies the key from the caller's environment
 // (auth.keyEnv) into argv, into a file it asks for, or into a discover() error — what the core must refuse or redact.
+// profile.rejectPlan: invocation() rejects the profile (as an adapter refusing an invalid option does).
 const leakedKey = (ctx) => ctx.env[ctx.profile.auth?.keyEnv] ?? "";
 export const plainLeak = {
   ...plain,
@@ -136,10 +145,22 @@ export const plainLeak = {
     return plain.discover(ctx);
   },
   invocation(req, ctx) {
+    if (req.profile.rejectPlan) throw new Error(`unsupported option ${req.profile.rejectPlan}`);
     const inv = plain.invocation(req, ctx);
     if (req.profile.leak === "argv") inv.argv = [...inv.argv, "--token", leakedKey(ctx)];
     if (req.profile.leak === "file") inv.files = [...inv.files, { path: path.join(req.job.dir, "leak.cfg"), content: `key=${leakedKey(ctx)}\n` }];
     return inv;
+  },
+};
+
+// The plain adapter with a probe() hook of its own that reads req.harness (as an adapter whose probe turn needs the
+// discovered binary may): runProbe must call it only once the harness is known. Its argv says it was used.
+export const plainProbe = {
+  ...plain,
+  id: "plain-probe",
+  probe(req, ctx) {
+    const inv = plain.invocation(req, ctx);
+    return { ...inv, argv: [req.harness.bin, ...inv.argv.slice(1), "--model", `probe-of-${req.harness.version}`] };
   },
 };
 

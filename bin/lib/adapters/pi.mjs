@@ -318,7 +318,7 @@ function authCheck(profile, ctx) {
   let r;
   try {
     const cmd = [...(Array.isArray(profile.wrap) ? profile.wrap : []), profile.bin ?? "pi"];
-    r = ctx.exec(cmd[0], [...cmd.slice(1), "auth", "check", "--provider", provider, "--json"], { env: doctorEnv(profile, ctx) });
+    r = ctx.exec(cmd[0], [...cmd.slice(1), "auth", "check", "--provider", provider, "--json"], { env: doctorEnv(profile, ctx), timeoutMs: 30_000 }); // 30 s, not ctx.exec's 10
   } catch (error) {
     return { name: "pi-auth", level: "WARN", hint: `pi auth check not run: ${error?.message ?? error}` };
   }
