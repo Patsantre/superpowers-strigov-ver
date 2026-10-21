@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Launcher for the plugin's universal dispatcher (bin/lib/agent-dispatch.mjs).
+#
+# Resolves agent-dispatch.mjs regardless of install layout (marketplace cache,
+# newest version first, then the local dev tree), pins AGENT_DISPATCH_STATE_DIR
+# so config.json, keys/, homes/ and job state live under
+# ~/.claude/plugins/data/superpowers-strigov-ver-agents (next to the -zcode and
+# -codex data dirs), and execs node. The .mjs runs coding-agent harnesses
+# headless as background jobs and passes the zcode / codex profiles through to
+# the sibling wrappers zcode-dispatch and codex-dispatch.
+#
+# Usage: agent-dispatch <task|status|result|cancel|release-stale|tree-state|route|channels|doctor|key|profile|preset> [args...]
+set -eu
+
+resolve_mjs() {
+  local marketplace_glob="$HOME/.claude/plugins/cache/strigov-cc-plugins/superpowers-strigov-ver/*/bin/lib/agent-dispatch.mjs"
+  local path
+  for path in $(ls -1d $marketplace_glob 2>/dev/null | sort -rV); do
+    if [ -f "$path" ]; then echo "$path"; return; fi
+  done
+
+  local self_dir
+  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [ -f "$self_dir/lib/agent-dispatch.mjs" ]; then echo "$self_dir/lib/agent-dispatch.mjs"; return; fi
+
+  echo ""
+}
+
+MJS="$(resolve_mjs)"
+if [ -z "$MJS" ]; then
+  echo "agent-dispatch: cannot find bin/lib/agent-dispatch.mjs" >&2
+  echo "  searched: ~/.claude/plugins/cache/strigov-cc-plugins/superpowers-strigov-ver/*/bin/lib/... and \$(dirname agent-dispatch)/lib/..." >&2
+  exit 1
+fi
+
+export AGENT_DISPATCH_STATE_DIR="${AGENT_DISPATCH_STATE_DIR:-$HOME/.claude/plugins/data/superpowers-strigov-ver-agents}"
+
+exec node "$MJS" "$@"

@@ -16,9 +16,11 @@ Use when dispatching a design spec review to Codex Astra xhigh after Opus writes
 
 No `--write`. Review is read-only.
 
+**Profile.** This is the `spec-reviewer` role: run `"$AD" route spec-reviewer` first (`$AD` and the route format: `../agent-invocation/SKILL.md`, manual-only). By default it is `astra` — exactly the command above. Another `codex` profile → the same command with its `--model` / `--effort`; `zcode` (`glm`) → `"$ZDISPATCH" task --background --prompt-file …` (no model flags; GLM has no read-only mode — `route` warns, and the job runs inside `../agent-invocation/SKILL.md` "No-edit check"; round 2+ `--resume-task <its zt-id>`); a core harness → `"$AD" task --profile <p> --role spec-reviewer --background --prompt-file …` (no `--write`; round 2+ `--resume-task <its id>` on the same profile); on `zcode` and core harnesses the reviewer preamble from `../agent-invocation/SKILL.md` opens the prompt file; `inproc` → the Agent tool at the profile's model and effort, FRESH each round with the full prompt plus a digest of prior rounds.
+
 For round 2+, add `--resume-task <task-id of round 1's review>` and tell Codex the spec file was updated and must be re-read (thread-addressed resume — see `../codex-invocation/SKILL.md` "Resume semantics"; `Read` it — manual-only. If a stale job record forces `--fresh`, send the full first-round prompt + a digest of prior rounds instead of the follow-up prompt.) Do NOT send the full spec text — always point to the file.
 
-Poll with Monitor using the terminal-only filter from `../codex-invocation/SKILL.md` (`Read` it — manual-only). Fetch result via `"$DISPATCH" result task-XXXX`.
+Poll with Monitor using the terminal-only filter from `../codex-invocation/SKILL.md` (`Read` it — manual-only). Fetch result via `"$DISPATCH" result task-XXXX` (core ids: `"$AD" result <id>`, loop in `../agent-invocation/SKILL.md`).
 
 ## First-round prompt template
 

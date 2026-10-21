@@ -10,6 +10,8 @@ disable-model-invocation: true
 
 > GLM-5.3-Flash through Z.ai's ZCode CLI — the dev-orchestrator default implementer — has its own wrapper and skill: `Read` `../zcode-invocation/SKILL.md` (manual-only; never through the Skill tool). This skill covers Codex only.
 
+> Role routing (`"$AD" route <role>`) and the other headless harnesses (`claude -p`, OpenCode, pi, `dsh`) live in `../agent-invocation/SKILL.md` (manual-only). The built-in Codex profiles `luna`, `sol`, `astra` and `astra-high` keep exactly the commands below.
+
 The plugin vendors the Codex companion runtime under `vendor/codex-companion/` and exposes it through the `codex-dispatch` shell wrapper in `bin/`. **Do not** call the upstream OpenAI codex plugin — we do not depend on it being installed.
 
 The wrapper handles three things on every call:
