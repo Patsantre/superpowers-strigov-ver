@@ -343,6 +343,8 @@ function routeFields(entry) {
 
 // A field path for a message: provider.deepseek.options.apiKey; a name with other characters is quoted.
 const fieldName = (parts) => parts.map((part) => (/^[A-Za-z0-9_.-]+$/.test(part) ? part : JSON.stringify(part))).join(".");
+// Names for a message: three at most, the rest counted.
+const listed = (names) => (names.length > 3 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", "));
 
 // OpenCode always reads opencode.json and opencode.jsonc from ~/.opencode — <HOME>/.opencode, HOME being the one the
 // harness gets — and from the managed dir (MANAGED_CONFIG_DIRS, merged after OPENCODE_CONFIG_CONTENT), whatever
@@ -354,8 +356,9 @@ const fieldName = (parts) => parts.map((part) => (/^[A-Za-z0-9_.-]+$/.test(part)
 // global config, where it wins just the same, and the adapter does not check it. A harmless entry ({}, a name, model
 // metadata, timeouts) runs. An empty file (no bytes, or a BOM only) is skipped: OpenCode loads it as {} (config.ts
 // loadFile: `if (!text) return {}`; not pinned in [02]). Any other file that cannot be read as a JSON(C) object cannot
-// be checked and is refused too. The macOS MDM plist ai.opencode.managed [02 §9 item 9] is not checked: reading it
-// needs plutil.
+// be checked and is refused too, and so is one with a top-level key holding {env:…} or {file:…} (SUBSTITUTED): it may
+// become provider, and the variable or the file it names is not read. The macOS MDM plist ai.opencode.managed [02 §9
+// item 9] is not checked: reading it needs plutil.
 function globalProviderProblem(profile, ctx, keyVar) {
   const home = effectiveEnv(profile, ctx, "HOME");
   const provider = providerOf(profile);
@@ -384,6 +387,11 @@ function globalProviderProblem(profile, ctx, keyVar) {
         const move = admin || `, or move its provider.${provider ?? "<provider>"} settings that carry no credential (baseURL, api, npm) into ${own}`;
         return `${file} cannot be read as a JSON or JSONC object: OpenCode reads it whatever the isolation, and a provider entry there could win over ${keyVar}, so it is not run unchecked; fix the file${move}`;
       }
+      const unknown = Object.keys(config).filter((key) => SUBSTITUTED.test(key)).map((key) => fieldName([key]));
+      if (unknown.length > 0) {
+        const one = unknown.length === 1;
+        return `${file} has the top-level ${one ? "key" : "keys"} ${listed(unknown)}: OpenCode reads it whatever the isolation and fills in {env:…} and {file:…} before it parses the file, so ${one ? "that key" : "those keys"} may become provider and win over ${keyVar}; it is not run unchecked: write ${one ? "it" : "them"} out${admin}`;
+      }
       const ours = (id) => provider === null || id === provider || SUBSTITUTED.test(id);
       const fields =
         config.provider === undefined
@@ -393,7 +401,7 @@ function globalProviderProblem(profile, ctx, keyVar) {
             : ["provider"];
       if (fields.length > 0) {
         const one = fields.length === 1;
-        const named = fields.length > 3 ? `${fields.slice(0, 3).join(", ")} and ${fields.length - 3} more` : fields.join(", ");
+        const named = listed(fields);
         const move = admin || `; only a setting that carries no credential (baseURL, api, npm) may move into ${own}: OpenCode reads that file too, and an apiKey, a header or an env there would win over ${keyVar} just the same`;
         return `${file} sets ${named}: OpenCode reads it whatever the isolation, and ${one ? "that setting" : "those settings"} would win over ${keyVar} or send the requests elsewhere; remove ${one ? "it" : "them"}${move}`;
       }

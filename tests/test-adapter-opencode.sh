@@ -1167,6 +1167,26 @@ check("~/.opencode/opencode.jsonc with a line comment ended by a lone CR and onl
 gput("opencode.json", JSON.stringify({ provider: { "{env:PROVIDER}": { options: { apiKey: "k" } }, deepseek: "x" } }));
 gj = await gjudge(keyedProfile());
 check("~/.opencode/opencode.json: an entry whose id holds {env:…} (OpenCode substitutes it before parsing) is checked as the profile provider; an entry that is not an object is named whole", gj === sets(gjson, ['provider."{env:PROVIDER}".options.apiKey', "provider.deepseek"]), gj);
+// Astra round 3, finding 2: a top-level key holding {env:…} or {file:…} may become provider once OpenCode fills it
+// in; the guard cannot tell, so it refuses, naming the key, never a value, and never reads the variable or the file.
+const rooted = (file, key, admin = "") => `${file} has the top-level key ${key}: OpenCode reads it whatever the isolation and fills in {env:…} and {file:…} before it parses the file, so that key may become provider and win over DEEPSEEK_API_KEY; it is not run unchecked: write it out${admin}`;
+const astraR3 = '{"{env:SECTION}":{"deepseek":{"options":{"apiKey":"x"}}}}';
+gput("opencode.json", astraR3);
+gj = await gjudge(keyedProfile({ env: { SECTION: "provider" } }));
+check("~/.opencode/opencode.json with a top-level {env:SECTION} key (provider once SECTION=provider): refused by invocation, probe and doctor alike, naming the key, not the apiKey under it", gj === rooted(gjson, '"{env:SECTION}"') && !gj.includes("apiKey"), gj);
+const reads = [];
+const rctx = { ...hctx, fs: { ...hctx.fs, readFile: (f, o) => (reads.push(f), hctx.fs.readFile(f, o)) } };
+gput("opencode.jsonc", '{\n  "theme": "dark",\n  "{file:~/.config/section.txt}": { "deepseek": { "options": { "apiKey": "sk-personal-key-c" } } },\n}\n');
+gj = await gjudge(keyedProfile(), rctx);
+check("~/.opencode/opencode.jsonc with a top-level {file:…} key: refused naming the key, not the value under it; the file it names is never read", gj === rooted(gjsonc, '"{file:~/.config/section.txt}"') && !gj.includes("sk-personal") && reads.length > 0 && reads.every((f) => !f.includes("section")), `${gj} reads: ${reads.join(", ")}`);
+gput("opencode.json", JSON.stringify({ theme: "{env:THEME}", username: "{file:~/.config/me}" }));
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.json with {env:…} and {file:…} only inside top-level values (a theme, a username): the key runs", gj === null, gj);
+gput("opencode.json", "{env:CONFIG}");
+const wholeRoot = await gjudge(keyedProfile());
+gput("opencode.json", '{"provider": {env:PROVIDERS}}');
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.json where {env:…} stands outside a string (the whole file, or the provider value): does not parse, refused as unreadable", wholeRoot === unreadable(gjson) && gj === unreadable(gjson), `${wholeRoot} / ${gj}`);
 gput("opencode.jsonc", '{\n  "provider": { "deepseek": {}\n');
 gj = await gjudge(keyedProfile());
 check("~/.opencode/opencode.jsonc that does not parse even as JSONC: cannot be checked, refused naming the isolated config", gj === unreadable(gjsonc), gj);
@@ -1210,6 +1230,8 @@ gj = await gjudge(keyedProfile(), managedCtx("darwin", macManaged, '// set by IT
 check("darwin managed config in JSONC with only a theme: the key runs", gj === null, gj);
 gj = await gjudge(keyedProfile(), managedCtx("linux", linuxManaged, '{"provider":{"deepseek":{}}}'));
 check("linux managed config with an empty provider.deepseek entry: the key runs", gj === null, gj);
+gj = await gjudge(keyedProfile({ env: { SECTION: "provider" } }), managedCtx("darwin", macManaged, astraR3));
+check("darwin managed config with a top-level {env:SECTION} key (Astra round 3): refused naming the key, its administrator fixes it", gj === rooted(macManaged, '"{env:SECTION}"', " (the machine's managed OpenCode config: its administrator does that)"), gj);
 gj = await gjudge(keyedProfile(), managedCtx("linux", linuxManaged, '{"provider":'));
 check("linux managed config that does not parse: refused, its administrator fixes it", gj === `${linuxManaged} cannot be read as a JSON or JSONC object: OpenCode reads it whatever the isolation, and a provider entry there could win over DEEPSEEK_API_KEY, so it is not run unchecked; fix the file (the machine's managed OpenCode config: its administrator does that)`, gj);
 // Astra round 2: an empty file (no bytes, or a BOM only) is loaded by OpenCode as {} and routes nothing.
