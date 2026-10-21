@@ -259,6 +259,7 @@ main() {
     "pi-key-fast": { $zai, "timeoutMin": 0.02 },
     "pi-key-tamper-root": { $zai, "wrap": ["sh", "$TEST_ROOT/tamper.sh", "$STATE", "$TEST_ROOT/tampered-root"] },
     "pi-key-tamper-keys": { $zai, "wrap": ["sh", "$TEST_ROOT/tamper.sh", "$STATE/keys", "$TEST_ROOT/tampered-keys"] },
+    "pi-key-tamper-job": { $zai, "wrap": ["sh", "$TEST_ROOT/tamper.sh", "$JOBS/pi-9999/sessions", "$TEST_ROOT/tampered-job"] },
     "pi-native": { $zai, "sandbox": "native" },
     "pi-offline0": { $zai, "env": { "PI_OFFLINE": "0" } },
     "pi-clash-home": { $zai, "env": { "PI_CODING_AGENT_DIR": "$TEST_ROOT/elsewhere" } },
@@ -630,9 +631,10 @@ const h = JSON.parse(lines[0]); h.cwd = "/somewhere/else"; lines[0] = JSON.strin
     [[ "$st" == failed/timeout && -z "$got" ]] && grep -qF 'ZAI_API_KEY=<redacted>' "$JOBS/$ID/sessions/"*.jsonl
     verdict "6 a timed-out job: its session file is redacted too" $? "st: $st files with the key: $got"
     # The record lives under state/, which a sandboxed job may write: a job that rewrites its own meta.sessionDir to
-    # the data root or to keys/ must not steer the runner's scrub there. The wrap runs the stub, then rewrites
-    # <jobs>/<id>.json (and records the meta.sessionDir it reads back, the one the runner's scrub sees); the scrub still
-    # takes <job dir>/sessions, and keys/zai keeps the key.
+    # the data root or to keys/ must not steer the runner's scrub there. The wrap runs the stub, then rewrites the
+    # record of its job — the one in <jobs> whose childPid is the wrap itself (a resume runs in the dir of its chain's
+    # first job, so --session-dir does not name it) — and records the meta.sessionDir it reads back, the one the record
+    # holds when the runner scrubs; the scrub still takes <job dir>/sessions, and keys/zai keeps the key.
     cat >"$TEST_ROOT/tamper.sh" <<'EOF'
 target="$1"
 mark="$2"
@@ -645,7 +647,10 @@ for arg in "$@"; do
 done
 "$@"
 rc=$?
-node -e 'const fs = require("node:fs"); const [file, target, mark] = process.argv.slice(1); const r = JSON.parse(fs.readFileSync(file, "utf8")); r.meta = { ...(r.meta || {}), sessionDir: target }; fs.writeFileSync(file + ".tamper", JSON.stringify(r)); fs.renameSync(file + ".tamper", file); fs.writeFileSync(mark, JSON.parse(fs.readFileSync(file, "utf8")).meta.sessionDir);' "$(dirname "$dir").json" "$target" "$mark"
+node -e 'const fs = require("node:fs"); const path = require("node:path"); const [jobs, pid, target, mark] = process.argv.slice(1);
+const read = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
+const file = fs.readdirSync(jobs).filter((n) => n.endsWith(".json")).map((n) => path.join(jobs, n)).find((f) => read(f)?.childPid === Number(pid));
+const r = read(file); r.meta = { ...(r.meta || {}), sessionDir: target }; fs.writeFileSync(file + ".tamper", JSON.stringify(r)); fs.renameSync(file + ".tamper", file); fs.writeFileSync(mark, read(file).meta.sessionDir);' "$(dirname "$(dirname "$dir")")" "$$" "$target" "$mark"
 exit $rc
 EOF
     for line in root:"$STATE" keys:"$STATE/keys"; do
@@ -655,6 +660,42 @@ EOF
         [[ "$st" == completed/ && -z "$got" && "$(cat "$TEST_ROOT/tampered-${line%%:*}" 2>/dev/null)" == "${line#*:}" && "$(cat "$STATE/keys/zai")" == *"$ZKEY"* ]] && grep -qF 'key=<redacted>' "$JOBS/$ID/sessions/"*.jsonl
         verdict "6 a job that rewrites its record meta.sessionDir to ${line%%:*} (${line#*:}): the scrub still redacts <job dir>/sessions only — keys/zai keeps the key" $? "st: $st meta.sessionDir before the scrub: $(cat "$TEST_ROOT/tampered-${line%%:*}" 2>/dev/null) files with the key: $got" "keys/zai holds the key: $(grep -cF "$ZKEY" "$STATE/keys/zai")"
     done
+    # Another job's dir has the adapter's shape too: a job that rewrites its meta.sessionDir to <jobs>/pi-9999/sessions
+    # (a file there holds the key) must not steer the scrub away from its own transcript. The runner hands scrub() and
+    # finalize() the meta its invocation returned before pi started (job.planMeta), not the record: the job's own
+    # transcript is redacted and pi-9999 keeps its file as it was. A resume of that job runs in its chain's first dir,
+    # which its plan names: the scrub redacts there, and finalize finds there the new session file a lost resume left.
+    # (pi-9999 moves the next ids to pi-10000 and on: still core job ids.)
+    local other="$JOBS/pi-9999/sessions" planted tampered
+    planted="$other/2026-10-21T00-00-00-000Z_pi-9999.jsonl"
+    mkdir -p "$other"
+    printf '%s\n' "{\"type\":\"session\",\"version\":3,\"id\":\"pi-9999\",\"cwd\":\"$repo\"}" "{\"type\":\"note\",\"text\":\"key=$ZKEY\"}" >"$planted"
+    cp "$planted" "$TEST_ROOT/planted.copy"
+    # others_leaks <id> — leaks_of without the planted file.
+    others_leaks() { leaks_of "$1" | tr ' ' '\n' | grep -v -e '^$' -e '/pi-9999/' | tr '\n' ' '; }
+    start AGENT_STUB_MODE=leak-secret AGENT_STUB_SECRET_VAR=ZAI_API_KEY -- --profile pi-key-tamper-job --prompt-file "$prompt"
+    tampered="$ID"
+    st="$(outcome "$tampered")"
+    got="$(others_leaks "$tampered")"
+    [[ -n "$tampered" && "$st" == completed/ && -z "$got" && "$(cat "$TEST_ROOT/tampered-job" 2>/dev/null)" == "$other" ]] && cmp -s "$planted" "$TEST_ROOT/planted.copy" \
+        && grep -qF 'key=<redacted>' "$JOBS/$tampered/sessions/"*.jsonl
+    verdict "6 a job that rewrites its record meta.sessionDir to another job's valid-shaped dir (pi-9999/sessions): the scrub takes the dir of its plan — its own transcript is redacted, pi-9999 keeps its file untouched" $? "st: $st meta.sessionDir before the scrub: $(cat "$TEST_ROOT/tampered-job" 2>/dev/null) files with the key: $got" "pi-9999 untouched: $(cmp -s "$planted" "$TEST_ROOT/planted.copy" && echo yes || echo no)"
+    n="$(cat "$JOBS/$tampered/sessions/"*.jsonl 2>/dev/null | grep -c 'key=<redacted>')"
+    rm -f "$TEST_ROOT/tampered-job"
+    start AGENT_STUB_MODE=leak-secret AGENT_STUB_SECRET_VAR=ZAI_API_KEY AGENT_STUB_RECORD="$TEST_ROOT/rec/tamper-resume.json" -- --profile pi-key-tamper-job --resume-task "$tampered" --prompt-file "$prompt"
+    st="$(outcome "$ID")"
+    got="$(others_leaks "$ID")"
+    [[ -n "$ID" && "$st" == completed/ && -z "$got" && "$(cat "$TEST_ROOT/tampered-job" 2>/dev/null)" == "$other" && "$(jfield argv <"$TEST_ROOT/rec/tamper-resume.json")" == *"\"--session-dir\",\"$JOBS/$tampered/sessions\""* \
+        && "$(cat "$JOBS/$tampered/sessions/"*.jsonl | grep -c 'key=<redacted>')" -gt "$n" && ! -e "$JOBS/$ID/sessions" ]] && cmp -s "$planted" "$TEST_ROOT/planted.copy"
+    verdict "6 its resume, which rewrites meta.sessionDir the same way: the scrub takes the chain's first dir from the plan — the key printed there is redacted, pi-9999 still untouched" $? "st: $st meta.sessionDir before the scrub: $(cat "$TEST_ROOT/tampered-job" 2>/dev/null) files with the key: $got" "redacted lines before: $n after: $(cat "$JOBS/$tampered/sessions/"*.jsonl | grep -c 'key=<redacted>')"
+    rm -f "$TEST_ROOT/tampered-job"
+    start AGENT_STUB_MODE=lose-session AGENT_STUB_STDERR_LINES=250 -- --profile pi-key-tamper-job --resume-task "$tampered" --prompt-file "$prompt"
+    st="$(outcome "$ID")"
+    got="$(job "$ID" errorText)"
+    [[ -n "$ID" && "$st" == failed/resume-lost && "$got" == "pi started a new session file "*"_$tampered.jsonl in $JOBS/$tampered/sessions instead of resuming session $tampered" \
+        && "$(cat "$TEST_ROOT/tampered-job" 2>/dev/null)" == "$other" ]] && cmp -s "$planted" "$TEST_ROOT/planted.copy"
+    verdict "6 finalize reads the plan too: a lost resume whose record names pi-9999/sessions (the warning out of the stderr tail) is still resume-lost, from the new session file in the chain's dir" $? "st: $st errorText: $got" "meta.sessionDir before finalize: $(cat "$TEST_ROOT/tampered-job" 2>/dev/null)"
+    rm -rf "$JOBS/pi-9999"
 
     # --- 7. two read-only jobs at once: distinct sessions ---
     start AGENT_STUB_MODE=slow AGENT_STUB_DELAY_MS=600 AGENT_STUB_RECORD="$TEST_ROOT/rec/par1.json" -- --profile pi-many --prompt-file "$prompt"
@@ -851,16 +892,21 @@ console.log(JSON.stringify([
     verdict "9 finalize: the lost-session warning means resume-lost only for a resumed job" $? "got: $got"
 
     # Without the warning (gone from the 200-line tail): a session file of this id and cwd that was not there when the
-    # job started (meta.sessionFilesBefore) is the new session pi started instead.
+    # job started (meta.sessionFilesBefore) is the new session pi started instead. The dir and the list come from the
+    # plan (job.planMeta) when the runner passes it, whatever the record says by then; record.meta only without one.
     got="$(pi_js 'const head = (cwd) => JSON.stringify({ type: "session", version: 3, id: "pi-0001", cwd }) + "\n{}\n";
 const [f0, f1, f2] = ["2026-10-21T00-00-00-000Z_pi-0001.jsonl", "2026-10-21T01-00-00-000Z_pi-0001.jsonl", "2026-10-21T02-00-00-000Z_pi-0001.jsonl"];
-const files = { "/d": [f2, f0, "notes.txt", f1], [`/d/${f0}`]: head("/w"), [`/d/${f1}`]: head("/w"), [`/d/${f2}`]: head("/elsewhere") };
+const files = { "/d": [f2, f0, "notes.txt", f1], [`/d/${f0}`]: head("/w"), [`/d/${f1}`]: head("/w"), [`/d/${f2}`]: head("/elsewhere"), "/j/pi-9999/sessions": [] };
 const ctx = { fs: { readdir: (d) => files[d] ?? null, readFile: (f) => files[f] ?? null } };
 const job = (before, extra = {}) => ({ cwd: "/w", record: { resumeOf: "pi-0001", sessionId: "pi-0001", meta: { sessionDir: "/d", ...(before ? { sessionFilesBefore: before } : {}) }, ...extra }, io: { stderrTail: "[extension] chatter line 250" } });
-console.log(JSON.stringify([pi.finalize(job([f0]), ctx), pi.finalize(job([f0, f1]), ctx), pi.finalize(job(null), ctx), pi.finalize(job([f0], { resumeOf: null }), ctx), pi.finalize(job([f0]))]));')"
-    want='[{"ok":false,"response":null,"errorClass":"resume-lost","errorText":"pi started a new session file 2026-10-21T01-00-00-000Z_pi-0001.jsonl in /d instead of resuming session pi-0001"},null,null,null,null]'
+const planned = (planMeta, meta) => ({ ...job(null, { meta }), planMeta });
+console.log(JSON.stringify([pi.finalize(job([f0]), ctx), pi.finalize(job([f0, f1]), ctx), pi.finalize(job(null), ctx), pi.finalize(job([f0], { resumeOf: null }), ctx), pi.finalize(job([f0])),
+  pi.finalize(planned({ sessionDir: "/d", sessionFilesBefore: [f0] }, { sessionDir: "/j/pi-9999/sessions", sessionFilesBefore: [f0] }), ctx) !== null,
+  pi.finalize(planned({ sessionDir: "/d", sessionFilesBefore: [f0] }, { sessionDir: "/d", sessionFilesBefore: [f0, f1] }), ctx) !== null,
+  pi.finalize(planned({ sessionDir: "/d", sessionFilesBefore: [f0, f1] }, { sessionDir: "/d", sessionFilesBefore: [f0] }), ctx)]));')"
+    want='[{"ok":false,"response":null,"errorClass":"resume-lost","errorText":"pi started a new session file 2026-10-21T01-00-00-000Z_pi-0001.jsonl in /d instead of resuming session pi-0001"},null,null,null,null,true,true,null]'
     [[ "$got" == "$want" ]]
-    verdict "9 finalize: a new session file of the id and cwd (not in meta.sessionFilesBefore) → resume-lost; one of another cwd, a record without the list, a fresh job → not" $? "got:  $got" "want: $want"
+    verdict "9 finalize: a new session file of the id and cwd (not in meta.sessionFilesBefore) → resume-lost; one of another cwd, a record without the list, a fresh job → not; the plan (job.planMeta) wins over a rewritten record.meta" $? "got:  $got" "want: $want"
 
     # scrub(): the session dir's text files that hold a registered value, redacted, with their mode — what the core
     # writes back (writeAdapterFiles: atomic, the given mode, under the data root). Real files under the run's temp root.
@@ -880,7 +926,7 @@ const blob = put("blob.bin", Buffer.concat([Buffer.from([0xff, 0x00]), Buffer.fr
 const inode = (f) => fs.statSync(f).ino;
 const before = [inode(clean), inode(blob)];
 const ctx = { fs: core.makeCtx({ env }).fs, redact: core.redactor([key, key2]) };
-const job = { dir: path.join(root, "jobs", "pi-0001"), record: { meta: { sessionDir: dir } } };
+const job = { dir: path.join(root, "jobs", "pi-0001"), planMeta: { sessionDir: dir }, record: { meta: { sessionDir: dir } } };
 const plan = pi.scrub(job, ctx);
 core.writeAdapterFiles({ files: plan }, env);
 const text = fs.readFileSync(session, "utf8");
@@ -918,8 +964,8 @@ const job2 = path.join(env.AGENT_DISPATCH_STATE_DIR, "jobs", "pi-0002");
 fs.mkdirSync(job2, { recursive: true });
 fs.symlinkSync(outside, path.join(job2, "sessions"));
 const ctx = { fs: core.makeCtx({ env }).fs, redact: core.redactor([key]) };
-const plan = pi.scrub({ dir: jobDir, record: { meta: { sessionDir: dir } } }, ctx);
-const plan2 = pi.scrub({ dir: job2, record: { meta: { sessionDir: path.join(job2, "sessions") } } }, ctx);
+const plan = pi.scrub({ dir: jobDir, planMeta: { sessionDir: dir } }, ctx);
+const plan2 = pi.scrub({ dir: job2, planMeta: { sessionDir: path.join(job2, "sessions") } }, ctx);
 core.writeAdapterFiles({ files: [...plan, ...plan2] }, env);
 const holds = (f) => fs.readFileSync(f, "utf8").includes(key);
 const isLink = (f) => fs.lstatSync(f).isSymbolicLink();
@@ -929,6 +975,36 @@ console.log(JSON.stringify([plan.map((e) => path.relative(dir, e.path)), plan2.l
     want='[["nested/n.txt","s_pi-0001.jsonl"],0,true,"755",true,false]'
     [[ "$got" == "$want" ]]
     verdict "9 scrub never follows a symlink: a symlinked dir (nested too, the session dir itself, a loop) or file is skipped — the files outside keep their content, their dir its mode, the links stay links; real files beside them are still redacted" $? "got:  $got" "want: $want"
+
+    # The scrub dir is the plan's (job.planMeta), never the record's: a job can rewrite its record's meta.sessionDir to
+    # another job's dir of the same shape. A resumed job's plan names its chain's first dir; a planMeta dir of another
+    # shape (the data root, keys/) or none at all falls back to <job dir>/sessions.
+    got="$(pi_js 'const fs = await import("node:fs");
+const path = await import("node:path");
+const root = fs.mkdtempSync(path.join(process.argv[1], "scrub-plan-"));
+const env = { AGENT_DISPATCH_STATE_DIR: root };
+const key = "zai-key-value-424242";
+const jobs = path.join(root, "jobs");
+const sessions = (id) => path.join(jobs, id, "sessions");
+for (const id of ["pi-0001", "pi-0003", "pi-9999"]) {
+  fs.mkdirSync(sessions(id), { recursive: true });
+  fs.writeFileSync(path.join(sessions(id), `s_${id}.jsonl`), `${key}\n`);
+}
+fs.mkdirSync(path.join(root, "keys"));
+fs.writeFileSync(path.join(root, "keys", "zai"), `${key}\n`);
+const ctx = { fs: core.makeCtx({ env }).fs, redact: core.redactor([key]) };
+const scrubbed = (job) => pi.scrub(job, ctx).map((e) => path.relative(root, e.path));
+const record = { meta: { sessionDir: sessions("pi-9999") } };
+console.log(JSON.stringify([
+  scrubbed({ dir: path.join(jobs, "pi-0003"), planMeta: { sessionDir: sessions("pi-0003") }, record }),
+  scrubbed({ dir: path.join(jobs, "pi-0002"), planMeta: { sessionDir: sessions("pi-0001") }, record }),
+  scrubbed({ dir: path.join(jobs, "pi-0003"), record }),
+  scrubbed({ dir: path.join(jobs, "pi-0003"), planMeta: { sessionDir: root }, record }),
+  scrubbed({ dir: path.join(jobs, "pi-0003"), planMeta: { sessionDir: path.join(root, "keys") }, record }),
+]));' "$TEST_ROOT")"
+    want='[["jobs/pi-0003/sessions/s_pi-0003.jsonl"],["jobs/pi-0001/sessions/s_pi-0001.jsonl"],["jobs/pi-0003/sessions/s_pi-0003.jsonl"],["jobs/pi-0003/sessions/s_pi-0003.jsonl"],["jobs/pi-0003/sessions/s_pi-0003.jsonl"]]'
+    [[ "$got" == "$want" ]]
+    verdict "9 scrub takes its dir from the plan (job.planMeta), never from the record: a record rewritten to another valid-shaped job dir (pi-9999) is ignored, a resume scrubs its chain's first dir, a planMeta of another shape or none falls back to <job dir>/sessions" $? "got:  $got" "want: $want"
 
     got="$(pi_js 'const D = "/j/pi-0001/sessions";
 const files = {

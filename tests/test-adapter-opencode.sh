@@ -400,30 +400,32 @@ EOF
     n="$(find "$STATE/state" -name 'oc-*.json' | wc -l | tr -d ' ')"
     [[ "$ok" -eq 2 && "$erra" == *"profile oc-key: $authjson exists: a login stored there by opencode auth login wins over DEEPSEEK_API_KEY; remove that file"* && "$n" == "$n0" ]]
     verdict "4 a key whose isolated home holds an auth.json is refused (exit 2), naming the file to remove; neither refusal left a job" $? "rc=$ok err: $erra" "records: $n0 → $n"
-    # OpenCode reads ~/.opencode/opencode.json(c) whatever the isolation [02 §9]: a provider entry there for the key's
-    # provider (a personal apiKey, a proxy baseURL) would win over keyVar — refused (exit 2, no job, the value not
-    # shown); a file that is not plain JSON cannot be checked and is refused too; another provider's entry runs.
+    # OpenCode reads ~/.opencode/opencode.json(c) whatever the isolation [02 §9], as JSONC: a field of the key's
+    # provider entry there that picks the credential or the endpoint (a personal apiKey, a proxy baseURL) would win
+    # over keyVar — refused (exit 2, no job, the field named, the value not shown); a file that does not parse even as
+    # JSONC cannot be checked and is refused too; a harmless entry, another provider's entry, comments run.
     local gcfg="$HOME/.opencode/opencode.json" own="$STATE/homes/oc-key/config/opencode/opencode.json" errg errc
     mkdir -p "$HOME/.opencode"
     printf '%s\n' '{"provider":{"deepseek":{"options":{"apiKey":"sk-personal-key-c-7777","baseURL":"https://proxy.example.invalid/v1"}}}}' >"$gcfg"
     run_ad task --profile oc-key --background --prompt-file "$PROMPT"
     ok=$RC errg="$ERR"
     rm -f "$gcfg"
-    printf '// mine\n{"provider":{"github-copilot":{}}}\n' >"$HOME/.opencode/opencode.jsonc"
+    printf '// mine\n{"provider":{"github-copilot":{}}\n' >"$HOME/.opencode/opencode.jsonc"
     run_ad task --profile oc-key --background --prompt-file "$PROMPT"
     line=$RC errc="$ERR"
     rm -f "$HOME/.opencode/opencode.jsonc"
     n="$(find "$STATE/state" -name 'oc-*.json' | wc -l | tr -d ' ')"
-    [[ "$ok" -eq 2 && "$errg" == "agent-dispatch: profile oc-key: $gcfg sets provider.deepseek: OpenCode reads it whatever the isolation, and that entry (its apiKey, baseURL or headers) would win over DEEPSEEK_API_KEY; remove that entry, or move it into $own without an apiKey (OpenCode reads that file too, and an apiKey there would win over DEEPSEEK_API_KEY just the same)" \
-        && "$errg" != *sk-personal-key-c-7777* && "$line" -eq 2 && "$errc" == "agent-dispatch: profile oc-key: $HOME/.opencode/opencode.jsonc cannot be read as plain JSON (comments and trailing commas are not read here): "* && "$n" == "$n0" ]]
-    verdict "4 a key while ~/.opencode/opencode.json sets provider.deepseek is refused (exit 2) naming the file and where the entry goes, not its value; a ~/.opencode/opencode.jsonc that is not plain JSON too; no job" $? "rc=$ok err: $errg" "rc=$line err: $errc" "records: $n0 → $n"
+    [[ "$ok" -eq 2 && "$errg" == "agent-dispatch: profile oc-key: $gcfg sets provider.deepseek.options.apiKey, provider.deepseek.options.baseURL: OpenCode reads it whatever the isolation, and those settings would win over DEEPSEEK_API_KEY or send the requests elsewhere; remove them; only a setting that carries no credential (baseURL, api, npm) may move into $own: OpenCode reads that file too, and an apiKey, a header or an env there would win over DEEPSEEK_API_KEY just the same" \
+        && "$errg" != *sk-personal-key-c-7777* && "$errg" != *proxy.example* && "$line" -eq 2 \
+        && "$errc" == "agent-dispatch: profile oc-key: $HOME/.opencode/opencode.jsonc cannot be read as a JSON or JSONC object: OpenCode reads it whatever the isolation, and a provider entry there could win over DEEPSEEK_API_KEY, so it is not run unchecked; fix the file, or move its provider.deepseek settings that carry no credential (baseURL, api, npm) into $own" && "$n" == "$n0" ]]
+    verdict "4 a key while ~/.opencode/opencode.json sets provider.deepseek.options.apiKey and baseURL is refused (exit 2) naming the file, the fields and which settings may move to the isolated config, not their values; a ~/.opencode/opencode.jsonc that does not parse even as JSONC too; no job" $? "rc=$ok err: $errg" "rc=$line err: $errc" "records: $n0 → $n"
     rec="$REC/key-global-other.json"
-    printf '%s\n' '{"provider":{"github-copilot":{"options":{"enterpriseUrl":"https://ghe.example"}}}}' >"$gcfg"
+    printf '%s\n' '// mine' '{' '  "theme": "dark", /* the look */' '  "provider": {' '    "deepseek": { "name": "DeepSeek // personal", "options": { "timeout": 600000 } },' '    "github-copilot": { "options": { "enterpriseUrl": "https://ghe.example" } },' '  },' '}' >"$HOME/.opencode/opencode.jsonc"
     id="$(AGENT_STUB_RECORD="$rec" start oc-key)"
     st="$(finish "$id")"
     rm -rf "$HOME/.opencode"
     [[ "$st" == "completed -" && "$(rjs "$rec" "$secrets")" == DEEPSEEK_API_KEY ]]
-    verdict "4 ~/.opencode/opencode.json with another provider entry only: the key runs" $? "id=$id st=$st err: $(cat "$TEST_ROOT/start.err")"
+    verdict "4 ~/.opencode/opencode.jsonc with comments, trailing commas, a harmless provider.deepseek entry (a name, a timeout) and another provider entry: the key runs" $? "id=$id st=$st err: $(cat "$TEST_ROOT/start.err")"
 
     # --- 5. options: permission merged into the writer's agent, only its deny rules into the reviewer's; plugins drop
     # OPENCODE_PURE (spec §3.6 А4, Б) ---
@@ -793,9 +795,9 @@ process.stdout.write(JSON.stringify(impl));' -- "$(impl_set "$HOME/.local/share"
     rm -f "$REC/probe-global.json"
     AGENT_STUB_MODE=ok AGENT_STUB_RESPONSE=PONG AGENT_STUB_RECORD="$REC/probe-global.json" run_ad doctor --profile oc-key --probe
     rm -rf "$HOME/.opencode"
-    want="$HOME/.opencode/opencode.jsonc sets provider.deepseek: OpenCode reads it whatever the isolation, and that entry (its apiKey, baseURL or headers) would win over DEEPSEEK_API_KEY; remove that entry, or move it into $STATE/homes/oc-key/config/opencode/opencode.json without an apiKey (OpenCode reads that file too, and an apiKey there would win over DEEPSEEK_API_KEY just the same)"
+    want="$HOME/.opencode/opencode.jsonc sets provider.deepseek.options.baseURL: OpenCode reads it whatever the isolation, and that setting would win over DEEPSEEK_API_KEY or send the requests elsewhere; remove it; only a setting that carries no credential (baseURL, api, npm) may move into $STATE/homes/oc-key/config/opencode/opencode.json: OpenCode reads that file too, and an apiKey, a header or an env there would win over DEEPSEEK_API_KEY just the same"
     [[ "$ok" -eq 1 && "$got" == *"FAIL home oc-key: $want"* && "$RC" -eq 1 && "$OUT" == *"FAIL home oc-key: $want"* && "$OUT" != *"ok probe"* && ! -e "$REC/probe-global.json" ]]
-    verdict "15 doctor and doctor --probe: provider.deepseek in ~/.opencode/opencode.jsonc → FAIL home naming the file and the isolated config, as the run refuses it; no probe turn" $? "doctor rc=$ok: $(grep 'home oc-key' <<<"$got")" "probe rc=$RC: $(tail -2 <<<"$OUT") err: $ERR"
+    verdict "15 doctor and doctor --probe: provider.deepseek.options.baseURL in ~/.opencode/opencode.jsonc → FAIL home naming the file, the field and the isolated config, as the run refuses it; no probe turn" $? "doctor rc=$ok: $(grep 'home oc-key' <<<"$got")" "probe rc=$RC: $(tail -2 <<<"$OUT") err: $ERR"
     run_ad doctor --profile oc-ask
     [[ "$OUT" == *"WARN permission oc-ask: options.permission asks for bash: a headless run auto-rejects an ask and ends blocked"* ]]
     verdict "15 doctor: an 'ask' in options.permission → WARN (it can only end blocked)" $? "$OUT"
@@ -1081,9 +1083,16 @@ check("invocation: a key in an isolated home without auth.json runs", e === null
 e = refusal({ harness: "opencode", auth: "login", model: "a/b", home: "isolated" }, { ...ctx, fs: fsWith([authFile]) });
 check("invocation: a login profile's auth.json is its login (no refusal)", e === null, e?.message);
 
-// ~/.opencode/opencode.json(c) of the HOME the harness gets, read by OpenCode whatever the isolation [02 §9]: a
-// provider entry for a keyed profile's provider is refused by invocation, probe and doctor alike (home FAIL), naming
-// the file and the isolated config to move it to, never its value; plain JSON only.
+// parseJsonc: OpenCode reads both files as JSONC; comments and trailing commas go, strings (escapes included) stay.
+const jsonc = mod.parseJsonc(String.fromCharCode(0xfeff) + '{"a": "x // y", "b": "p /* q */ r", "c": "say \\"hi\\" // z", "d": [1, 2,], "e": "\\\\", } // end');
+check("parseJsonc: // and /* */ inside strings are text, an escaped quote or backslash does not end a string early, trailing commas and comments go", eq(jsonc, { a: "x // y", b: "p /* q */ r", c: 'say "hi" // z', d: [1, 2], e: "\\" }), JSON.stringify(jsonc));
+check("parseJsonc: block comments between tokens, a line comment before the object", eq(mod.parseJsonc('// head\n/* a */ {"k": /* b */ 1 /* c */,\n "l": 2 // d\n}'), { k: 1, l: 2 }));
+check("parseJsonc: what still does not parse → null (unclosed object, unclosed comment, empty, two commas, an extra brace)", ['{"k": 1', "/* open", "", null, "[1,,]", '{"k": 1}}'].every((text) => mod.parseJsonc(text) === null));
+check("parseJsonc: a line comment ends at a lone CR too (as jsonc-parser), so the text after it is read", eq(mod.parseJsonc('// set by IT\r{"theme":"dark"}'), { theme: "dark" }) && eq(mod.parseJsonc('{"theme":"x", // c\r"provider":{"deepseek":{"options":{"apiKey":"k"}}},\n"a":1}'), { theme: "x", provider: { deepseek: { options: { apiKey: "k" } } }, a: 1 }));
+// ~/.opencode/opencode.json(c) of the HOME the harness gets, read by OpenCode whatever the isolation [02 §9]: the
+// entry for a keyed profile's provider is read as JSONC, and a field there that picks the credential or the endpoint
+// is refused by invocation, probe and doctor alike (home FAIL), naming the file, the field and which settings (no
+// credential) may move to the isolated config, never its value; a harmless entry, none, or an empty file runs.
 const ghome = path.join(root, "unit-home");
 const gdir = path.join(ghome, ".opencode");
 fs.mkdirSync(gdir, { recursive: true });
@@ -1105,16 +1114,71 @@ const gjudge = async (profile, gctx = hctx) => {
   const same = (inv === null && pr === null && home.length === 0) || (inv instanceof core.UsageError && pr?.message === inv.message && eq(home, [inv.message.replace("profile u1: ", "")]));
   return same ? (inv === null ? null : inv.message.replace("profile u1: ", "")) : `MISMATCH ${inv?.message} / ${pr?.message} / ${JSON.stringify(home)}`;
 };
-const sets = (file, id) => `${file} sets provider.${id}: OpenCode reads it whatever the isolation, and that entry (its apiKey, baseURL or headers) would win over DEEPSEEK_API_KEY; remove that entry, or move it into ${ownConfig} without an apiKey (OpenCode reads that file too, and an apiKey there would win over DEEPSEEK_API_KEY just the same)`;
+const sets = (file, fields, more = 0) => {
+  const one = fields.length === 1 && more === 0;
+  return `${file} sets ${fields.join(", ")}${more ? ` and ${more} more` : ""}: OpenCode reads it whatever the isolation, and ${one ? "that setting" : "those settings"} would win over DEEPSEEK_API_KEY or send the requests elsewhere; remove ${one ? "it" : "them"}; only a setting that carries no credential (baseURL, api, npm) may move into ${ownConfig}: OpenCode reads that file too, and an apiKey, a header or an env there would win over DEEPSEEK_API_KEY just the same`;
+};
+const gjson = path.join(gdir, "opencode.json");
+const gjsonc = path.join(gdir, "opencode.jsonc");
+const unreadable = (file) => `${file} cannot be read as a JSON or JSONC object: OpenCode reads it whatever the isolation, and a provider entry there could win over DEEPSEEK_API_KEY, so it is not run unchecked; fix the file, or move its provider.deepseek settings that carry no credential (baseURL, api, npm) into ${ownConfig}`;
 gput("opencode.json", JSON.stringify({ provider: { deepseek: { options: { apiKey: "sk-personal-key-c", baseURL: "https://proxy.example.invalid/v1" } } } }));
 let gj = await gjudge(keyedProfile());
-check("~/.opencode/opencode.json with provider.deepseek: a deepseek key is refused by invocation, probe and doctor (home FAIL) alike, naming the file and the isolated config; the value is not shown", gj === sets(path.join(gdir, "opencode.json"), "deepseek") && !gj.includes("sk-personal"), gj);
+check("~/.opencode/opencode.json with provider.deepseek.options.apiKey and baseURL: a deepseek key is refused by invocation, probe and doctor (home FAIL) alike, naming the file, both fields and the isolated config; the value is not shown", gj === sets(gjson, ["provider.deepseek.options.apiKey", "provider.deepseek.options.baseURL"]) && !gj.includes("sk-personal") && !gj.includes("proxy.example"), gj);
+// Astra round 2, finding 2: neither an empty entry nor a JSONC file without a provider entry changes the key.
 gput("opencode.jsonc", JSON.stringify({ provider: { deepseek: {} } }));
 gj = await gjudge(keyedProfile());
-check("~/.opencode/opencode.jsonc (plain JSON) with provider.deepseek: refused the same way", gj === sets(path.join(gdir, "opencode.jsonc"), "deepseek"), gj);
-gput("opencode.jsonc", '{\n  // my proxy\n  "provider": { "github-copilot": {} },\n}\n');
+check("~/.opencode/opencode.jsonc with an empty provider.deepseek entry: the key runs (nothing there picks the key or the endpoint)", gj === null, gj);
+gput("opencode.jsonc", '// my settings\n{\n  /* the look */ "theme": "dark",\n}\n');
 gj = await gjudge(keyedProfile());
-check("~/.opencode/opencode.jsonc with comments or a trailing comma: cannot be checked, refused", typeof gj === "string" && gj.startsWith(`${path.join(gdir, "opencode.jsonc")} cannot be read as plain JSON (comments and trailing commas are not read here): `) && gj.includes(ownConfig), gj);
+check("~/.opencode/opencode.jsonc with comments, a trailing comma and only a theme: read as JSONC, the key runs", gj === null, gj);
+gput("opencode.jsonc", '{\n  // my key\n  "provider": { "deepseek": { "options": { "apiKey": "sk-personal-key-c", }, }, },\n}\n');
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.jsonc with a trailing comma and provider.deepseek.options.apiKey: read as JSONC and refused naming the field, not its value", gj === sets(gjsonc, ["provider.deepseek.options.apiKey"]) && !gj.includes("sk-personal"), gj);
+gput("opencode.json", JSON.stringify({ provider: { deepseek: { options: { baseURL: "https://proxy.example.invalid/v1" } } } }));
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.json with provider.deepseek.options.baseURL alone: refused naming it", gj === sets(gjson, ["provider.deepseek.options.baseURL"]), gj);
+gput("opencode.json", JSON.stringify({ provider: { deepseek: { options: { headers: { Authorization: "Bearer sk-personal-key-c" } } } } }));
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.json with provider.deepseek.options.headers: refused naming it, not the header; the remedy is to remove it, not to move it", gj === sets(gjson, ["provider.deepseek.options.headers"]) && !gj.includes("Bearer") && !gj.includes(", or move"), gj);
+gput("opencode.json", JSON.stringify({ provider: { deepseek: { npm: "@ai-sdk/openai-compatible", api: "https://proxy.example.invalid/v1", env: ["MY_OTHER_KEY"] } } }));
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.json with provider.deepseek npm, api and env (SDK, base URL, key variables): refused naming the three", gj === sets(gjson, ["provider.deepseek.npm", "provider.deepseek.api", "provider.deepseek.env"]), gj);
+gput("opencode.json", JSON.stringify({ provider: { deepseek: { id: "deepseek", name: "DeepSeek" } } }));
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.json with provider.deepseek id (kept from a copied catalog entry) and name: any field of the entry outside name, whitelist, blacklist, models and options is refused, as the README says", gj === sets(gjson, ["provider.deepseek.id"]), gj);
+gput("opencode.json", JSON.stringify({ provider: { deepseek: { options: { timeout: 600000, apiKey: "k", baseURL: "u", headers: {}, queryParams: { key: "k" } } } } }));
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.json: options go whole to the provider SDK, so a key the guard does not know (queryParams) is refused too; past three fields the rest is counted; timeout passes", gj === sets(gjson, ["provider.deepseek.options.apiKey", "provider.deepseek.options.baseURL", "provider.deepseek.options.headers"], 1), gj);
+gput("opencode.json", JSON.stringify({ provider: { deepseek: { models: { "deepseek-v4-pro": { provider: { npm: "@ai-sdk/openai-compatible", api: "https://proxy.example.invalid/v1" }, headers: { "X-Key": "k" }, options: { baseURL: "u", reasoningEffort: "high" }, variants: { high: { apiKey: "k", reasoningEffort: "high" } } } } } } }));
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.json: a model of the entry with its own provider (npm, api), headers, or apiKey / baseURL / headers in its options or a variant: refused naming each; its reasoning options are not named", gj === sets(gjson, ["provider.deepseek.models.deepseek-v4-pro.provider", "provider.deepseek.models.deepseek-v4-pro.headers", "provider.deepseek.models.deepseek-v4-pro.options.baseURL"], 1) && !gj.includes("reasoningEffort"), gj);
+gput("opencode.json", JSON.stringify({ provider: { deepseek: { name: "DeepSeek", whitelist: ["deepseek-v4-pro"], blacklist: ["deepseek-old"], options: { timeout: 600000, chunkTimeout: 300000, setCacheKey: true }, models: { "deepseek-v4-pro": { name: "V4 Pro", limit: { context: 1000000, output: 64000 }, options: { reasoningEffort: "high" }, variants: { high: { reasoningEffort: "high" }, max: { disabled: true } } } } } } }));
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.json with a harmless provider.deepseek entry (name, whitelist, blacklist, timeouts, setCacheKey, model metadata, reasoning options and variants): the key runs", gj === null, gj);
+gput("opencode.jsonc", '{\n  "$schema": "https://opencode.ai/config.json", // a URL holds //\n  "theme": "a /* not a comment */ b",\n  "provider": { "deepseek": { "name": "DeepSeek // mine" } },\n}\n');
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.jsonc whose string values hold // and /* */: parsed as strings (the line goes on), the harmless entry runs", gj === null, gj);
+gput("opencode.jsonc", '{"theme":"x", // c\r"provider":{"deepseek":{"options":{"apiKey":"sk-personal-key-c"}}},\n"a":1}');
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.jsonc where a line comment ends at a lone CR: the apiKey after it is read (as OpenCode reads it) and refused", gj === sets(gjsonc, ["provider.deepseek.options.apiKey"]) && !gj.includes("sk-personal"), gj);
+gput("opencode.jsonc", '// set by IT\r{"theme":"dark"}');
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.jsonc with a line comment ended by a lone CR and only a theme: the key runs", gj === null, gj);
+gput("opencode.json", JSON.stringify({ provider: { "{env:PROVIDER}": { options: { apiKey: "k" } }, deepseek: "x" } }));
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.json: an entry whose id holds {env:…} (OpenCode substitutes it before parsing) is checked as the profile provider; an entry that is not an object is named whole", gj === sets(gjson, ['provider."{env:PROVIDER}".options.apiKey', "provider.deepseek"]), gj);
+gput("opencode.jsonc", '{\n  "provider": { "deepseek": {}\n');
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.jsonc that does not parse even as JSONC: cannot be checked, refused naming the isolated config", gj === unreadable(gjsonc), gj);
+gput("opencode.json", "[1, 2]");
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.json that is not an object: refused the same way", gj === unreadable(gjson), gj);
+gput("opencode.json", " \n");
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.json with whitespace only (jsonc-parser rejects it, OpenCode fails at launch): refused as unreadable", gj === unreadable(gjson), gj);
+gput("opencode.json", JSON.stringify({ provider: ["deepseek"] }));
+gj = await gjudge(keyedProfile());
+check("~/.opencode/opencode.json whose provider is not an object (OpenCode would not load it): named whole", gj === sets(gjson, ["provider"]), gj);
 gput("opencode.json", JSON.stringify({ provider: { "github-copilot": { options: { enterpriseUrl: "https://ghe.example" } } }, theme: "x" }));
 gj = await gjudge(keyedProfile());
 check("~/.opencode/opencode.json with another provider entry only: the deepseek key runs", gj === null, gj);
@@ -1128,18 +1192,42 @@ gj = await gjudge(keyedProfile());
 check("no ~/.opencode config: the key runs", gj === null, gj);
 // The managed config dir, read whatever HOME and XDG_* say [02 §9 item 8]: /Library/Application Support/opencode on
 // darwin, /etc/opencode on linux — reached here through the injected ctx.fs, so no file outside the test root is made.
-const managedCtx = (platform, file) => ({ ...hctx, platform, fs: { ...hctx.fs, exists: (f) => f === file || hctx.fs.exists(f), readFile: (f, o) => (f === file ? JSON.stringify({ provider: { deepseek: { options: { baseURL: "https://corp-proxy/v1" } } } }) : hctx.fs.readFile(f, o)) } });
-const managedSets = (file) => `${file} sets provider.deepseek: OpenCode reads it whatever the isolation, and that entry (its apiKey, baseURL or headers) would win over DEEPSEEK_API_KEY; remove that entry (the machine's managed OpenCode config: its administrator does that)`;
+const proxied = JSON.stringify({ provider: { deepseek: { options: { baseURL: "https://corp-proxy/v1" } } } });
+const managedCtx = (platform, file, text = proxied) => ({ ...hctx, platform, fs: { ...hctx.fs, exists: (f) => f === file || hctx.fs.exists(f), readFile: (f, o) => (f === file ? text : hctx.fs.readFile(f, o)) } });
+const managedSets = (file) => `${file} sets provider.deepseek.options.baseURL: OpenCode reads it whatever the isolation, and that setting would win over DEEPSEEK_API_KEY or send the requests elsewhere; remove it (the machine's managed OpenCode config: its administrator does that)`;
 const macManaged = "/Library/Application Support/opencode/opencode.json";
 const linuxManaged = "/etc/opencode/opencode.json";
 gj = await gjudge(keyedProfile(), managedCtx("darwin", macManaged));
-check("darwin managed config with provider.deepseek: refused by invocation, probe and doctor alike, naming the file", gj === managedSets(macManaged), gj);
+check("darwin managed config with provider.deepseek.options.baseURL: refused by invocation, probe and doctor alike, naming the file and the field", gj === managedSets(macManaged), gj);
 gj = await gjudge(keyedProfile(), managedCtx("linux", linuxManaged));
-check("linux managed config (/etc/opencode) with provider.deepseek: refused the same way", gj === managedSets(linuxManaged), gj);
+check("linux managed config (/etc/opencode) with provider.deepseek.options.baseURL: refused the same way", gj === managedSets(linuxManaged), gj);
 gj = await gjudge(keyedProfile(), managedCtx("linux", macManaged));
 check("the darwin managed path on linux is not read: the key runs", gj === null, gj);
 gj = await gjudge(keyedProfile({ env: { HOME: "relative-home" } }), managedCtx("darwin", macManaged));
 check("a HOME that is not absolute still has the managed config checked", gj === managedSets(macManaged), gj);
+// Astra round 2, finding 2: a harmless managed config must not disable every keyed profile.
+gj = await gjudge(keyedProfile(), managedCtx("darwin", macManaged, '// set by IT\n{ "theme": "dark", /* no provider */ }\n'));
+check("darwin managed config in JSONC with only a theme: the key runs", gj === null, gj);
+gj = await gjudge(keyedProfile(), managedCtx("linux", linuxManaged, '{"provider":{"deepseek":{}}}'));
+check("linux managed config with an empty provider.deepseek entry: the key runs", gj === null, gj);
+gj = await gjudge(keyedProfile(), managedCtx("linux", linuxManaged, '{"provider":'));
+check("linux managed config that does not parse: refused, its administrator fixes it", gj === `${linuxManaged} cannot be read as a JSON or JSONC object: OpenCode reads it whatever the isolation, and a provider entry there could win over DEEPSEEK_API_KEY, so it is not run unchecked; fix the file (the machine's managed OpenCode config: its administrator does that)`, gj);
+// Astra round 2: an empty file (no bytes, or a BOM only) is loaded by OpenCode as {} and routes nothing.
+gj = await gjudge(keyedProfile(), managedCtx("linux", linuxManaged, ""));
+check("linux managed config that is empty (zero bytes, OpenCode loads it as {}): the key runs", gj === null, gj);
+gj = await gjudge(keyedProfile(), managedCtx("darwin", macManaged, String.fromCharCode(0xfeff)));
+check("darwin managed config that holds a BOM only: skipped as empty, the key runs", gj === null, gj);
+gj = await gjudge(keyedProfile(), { ...managedCtx("linux", linuxManaged), fs: { ...managedCtx("linux", linuxManaged).fs, readFile: (f, o) => (f === linuxManaged ? null : hctx.fs.readFile(f, o)) } });
+check("linux managed config that exists but cannot be read (a null read): still refused, not skipped as empty", gj === `${linuxManaged} cannot be read as a JSON or JSONC object: OpenCode reads it whatever the isolation, and a provider entry there could win over DEEPSEEK_API_KEY, so it is not run unchecked; fix the file (the machine's managed OpenCode config: its administrator does that)`, gj);
+gput("opencode.json", "");
+gj = await gjudge(keyedProfile());
+gput(null);
+check("~/.opencode/opencode.json that is empty (touch): the key runs", gj === null, gj);
+// A model that names no provider: every entry is checked (doctor only; the run refuses such a model first).
+gput("opencode.json", JSON.stringify({ provider: { openai: { name: "OpenAI" }, deepseek: { options: { apiKey: "sk-personal-key-c" } } } }));
+const noProvider = (await oc.doctorChecks(keyedProfile({ model: "gpt-x" }), hctx)).filter((c) => c.name === "home").map((c) => c.hint);
+gput(null);
+check("doctor, a keyed model that names no provider: every provider entry is checked, the one with an apiKey is named", eq(noProvider, [sets(gjson, ["provider.deepseek.options.apiKey"])]), JSON.stringify(noProvider));
 
 // resumeCheck
 check("resumeCheck: same --dir and data dir → null", oc.resumeCheck({ meta: { dir, dataDir: "/h/.local/share" } }, { home: "user" }, req({}), ctx) === null);

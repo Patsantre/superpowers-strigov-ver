@@ -78,7 +78,10 @@
 //   `env` holds the adapter's defaults (§3.6 Б), `mandatoryEnv` and prepareHome's `env` the mandatory settings
 //   (§3.6 А); a null value removes a name. `dirs` (absolute; created 0700) and `files` ({ path, mode, content }) must
 //   lie under the data root. `meta` is a small JSON object the record keeps, redacted (resumeCheck reads prev.meta,
-//   e.g. the config or profile directory a session lives in). invocation and prepareHome must be pure: startJob calls
+//   e.g. the config or profile directory a session lives in). scrub and finalize, which run after the harness, also get
+//   job.planMeta: the meta this job's invocation returned, before the harness ran; record.meta may have been rewritten
+//   by the harness (the record lies under state/, which a sandboxed job may write), so either hook takes the paths it
+//   reads or rewrites from planMeta, not from job.record. invocation and prepareHome must be pure: startJob calls
 //   them once at task time, and runProbe before discovery (req.harness is null then both times), to refuse a
 //   profile.env that touches a mandatory name and to learn whether a key is needed; probe() always gets the harness. Only
 //   reduce() decides success; the exit code is informational. discover / prepareHome / finalize / resumeCheck reach
@@ -2607,10 +2610,11 @@ export async function runJob({ id, jobsDir, token, adapters = {}, env = process.
     // spec §3.5: a harness can keep what it saw in files of its own (pi's session transcript), beyond the stream
     // redaction. On every path — completed, failed, timed out, cancelled — the adapter's scrub() returns those files
     // with the job's redactor applied, and the core writes them back before the record turns terminal (a cancelled one
-    // already is): under the data root, atomically, each with the mode the adapter gives.
+    // already is): under the data root, atomically, each with the mode the adapter gives. Where those files are comes
+    // from the plan (job.planMeta), not from the record the harness could rewrite meanwhile.
     if (typeof adapter.scrub === "function" && secret !== null) {
       try {
-        const files = await adapter.scrub({ ...req.job, record: readRecord(file), io }, { ...ctx, redact });
+        const files = await adapter.scrub({ ...req.job, record: readRecord(file), io, planMeta: plan.meta }, { ...ctx, redact });
         writeAdapterFiles({ files: Array.isArray(files) ? files : [] }, env);
       } catch (error) {
         appendLog(log, `scrub() failed: ${redact(error?.message ?? error)}`);
@@ -2631,7 +2635,7 @@ export async function runJob({ id, jobsDir, token, adapters = {}, env = process.
         const bin = [...wrap, plan.argv[0]];
         const execHarness = (args = [], options = {}) => ctx.exec(bin[0], [...bin.slice(1), ...args], { cwd: plan.cwd, env: harnessEnv, ...options });
         try {
-          const extra = await adapter.finalize({ ...req.job, record: readRecord(file), io, reduced, env: harnessEnv, wrap, harness }, { ...ctx, execHarness });
+          const extra = await adapter.finalize({ ...req.job, record: readRecord(file), io, reduced, env: harnessEnv, wrap, harness, planMeta: plan.meta }, { ...ctx, execHarness });
           if (isObject(extra)) {
             const meta = { ...(isObject(reduced?.meta) ? reduced.meta : {}), ...(isObject(extra.meta) ? extra.meta : {}) };
             reduced = { ...(reduced ?? {}), ...extra, meta };

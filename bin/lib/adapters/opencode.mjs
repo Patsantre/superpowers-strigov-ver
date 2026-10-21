@@ -36,9 +36,10 @@
 //                      runs only in its isolated home, and only while that home holds no auth.json (exit 2 otherwise).
 //                      Two config sources survive the isolation [02 §9]: ~/.opencode/opencode.json(c) and the managed
 //                      dir (/Library/Application Support/opencode | /etc/opencode, merged after
-//                      OPENCODE_CONFIG_CONTENT): a provider entry there for the profile's provider would win over the
-//                      variable too, and is refused the same way. The macOS MDM plist ai.opencode.managed [02 §9
-//                      item 9] is not checked (reading it needs plutil).
+//                      OPENCODE_CONFIG_CONTENT), both read as JSONC: a field of the profile's provider entry there that
+//                      picks the credential or the endpoint (options.apiKey, baseURL, headers, npm, api, env, …) would
+//                      win over the variable too, and is refused the same way; a harmless entry runs. The macOS MDM
+//                      plist ai.opencode.managed [02 §9 item 9] is not checked (reading it needs plutil).
 //
 // Outcome (§3.6 А9, §3.8): reduce() reads the JSONL events — the session id from any event's sessionID, the answer
 // from the text parts of the last message (the last messageID of any part, not the last one with text), usage from
@@ -256,43 +257,145 @@ function storedLoginProblem(profile, ctx) {
 // checked).
 const MANAGED_CONFIG_DIRS = { darwin: "/Library/Application Support/opencode", linux: "/etc/opencode" };
 
+// OpenCode reads opencode.json and opencode.jsonc alike as JSONC: comments and trailing commas are allowed (its error
+// is "Config file at … is not valid JSON(C)" [02 §11]). This reader drops // and /* */ comments outside strings
+// (escapes respected; a // comment ends at a line break, LF or CR, as in jsonc-parser) and a comma before } or ], then
+// runs JSON.parse; null when the text still does not parse.
+export function parseJsonc(text) {
+  const src = String(text ?? "");
+  let out = "";
+  let comma = -1; // where in `out` a comma stands with only whitespace after it
+  for (let i = src.charCodeAt(0) === 0xfeff ? 1 : 0; i < src.length; ) {
+    const c = src[i];
+    if (c === '"') {
+      let end = i + 1;
+      while (end < src.length && src[end] !== '"') end += src[end] === "\\" ? 2 : 1;
+      out += src.slice(i, end + 1);
+      comma = -1;
+      i = end + 1;
+    } else if (c === "/" && src[i + 1] === "/") {
+      while (i < src.length && src[i] !== "\n" && src[i] !== "\r") i += 1;
+    } else if (c === "/" && src[i + 1] === "*") {
+      const end = src.indexOf("*/", i + 2);
+      if (end < 0) return null;
+      out += " ";
+      i = end + 2;
+    } else {
+      if ((c === "}" || c === "]") && comma >= 0) out = out.slice(0, comma) + out.slice(comma + 1);
+      if (c === ",") comma = out.length;
+      else if (!/\s/.test(c)) comma = -1;
+      out += c;
+      i += 1;
+    }
+  }
+  try {
+    return JSON.parse(out);
+  } catch {
+    return null;
+  }
+}
+
+// The fields of a provider entry that leave the credential and the endpoint alone [02 §5]. At the top of the entry:
+// name, whitelist, blacklist, models and options; npm (the SDK package), api (the base URL), env (the variables the key
+// is read from) and any field not known here are refused. options goes whole into the provider SDK's settings, where
+// apiKey, baseURL and headers (and, by SDK, queryParams, authToken, organization, region, endpoint, …) pick the key or
+// the endpoint: only the timeouts and setCacheKey pass. A model of the entry (models.<id>, the models.dev model format
+// of the catalog — its fields are not pinned in [02]) is metadata, except its own provider (npm and api) and headers,
+// which reach the SDK as well; its options and variants are request options (the reasoning effort) and pass without
+// apiKey, baseURL or headers.
+const SAFE_ENTRY = new Set(["name", "whitelist", "blacklist", "models", "options"]);
+const SAFE_OPTIONS = new Set(["timeout", "chunkTimeout", "setCacheKey"]);
+const MODEL_ROUTE = new Set(["provider", "headers"]);
+const REQUEST_ROUTE = new Set(["apiKey", "baseURL", "headers"]);
+// OpenCode expands {env:…} and {file:…} in a config file [02 §5, §6], in its text before parsing (not pinned in [02]):
+// a name holding one may become any field, or the profile's provider id.
+const SUBSTITUTED = /\{(?:env|file):/;
+
+// The refused fields of a provider entry, as paths within it (["options", "apiKey"]); [] for a harmless entry. A value
+// where an object belongs that is not one (OpenCode would not load it) is named whole.
+function routeFields(entry) {
+  const found = [];
+  const fieldsOf = (value, at) => {
+    if (isObject(value)) return Object.keys(value);
+    found.push(at);
+    return [];
+  };
+  const routes = (set, key) => set.has(key) || SUBSTITUTED.test(key);
+  for (const field of fieldsOf(entry, [])) if (!SAFE_ENTRY.has(field)) found.push([field]);
+  if (!isObject(entry)) return found;
+  if (entry.options !== undefined) for (const key of fieldsOf(entry.options, ["options"])) if (!SAFE_OPTIONS.has(key)) found.push(["options", key]);
+  if (entry.models === undefined) return found;
+  for (const id of fieldsOf(entry.models, ["models"])) {
+    const model = entry.models[id];
+    for (const field of fieldsOf(model, ["models", id])) if (routes(MODEL_ROUTE, field)) found.push(["models", id, field]);
+    if (!isObject(model)) continue;
+    if (model.options !== undefined) {
+      for (const key of fieldsOf(model.options, ["models", id, "options"])) if (routes(REQUEST_ROUTE, key)) found.push(["models", id, "options", key]);
+    }
+    if (model.variants === undefined) continue;
+    for (const name of fieldsOf(model.variants, ["models", id, "variants"])) {
+      const at = ["models", id, "variants", name];
+      for (const key of fieldsOf(model.variants[name], at)) if (routes(REQUEST_ROUTE, key)) found.push([...at, key]);
+    }
+  }
+  return found;
+}
+
+// A field path for a message: provider.deepseek.options.apiKey; a name with other characters is quoted.
+const fieldName = (parts) => parts.map((part) => (/^[A-Za-z0-9_.-]+$/.test(part) ? part : JSON.stringify(part))).join(".");
+
 // OpenCode always reads opencode.json and opencode.jsonc from ~/.opencode — <HOME>/.opencode, HOME being the one the
 // harness gets — and from the managed dir (MANAGED_CONFIG_DIRS, merged after OPENCODE_CONFIG_CONTENT), whatever
-// XDG_CONFIG_HOME and OPENCODE_DISABLE_PROJECT_CONFIG say; a provider.<id> entry there (options.apiKey, baseURL,
-// headers) is merged over the provider's catalog entry and beats the key in keyVar [02 §9; provider.ts]. So for a
-// keyed profile such an entry for its provider (any entry when the model names none) refuses the run: its place is
-// the isolated home's own config, without an apiKey (OpenCode reads that file as its global config, where an apiKey
-// wins just the same, and the adapter does not check it). The file is parsed as plain JSON: one that does not parse
-// (JSONC comments or trailing commas included) cannot be checked and is refused too. The macOS MDM plist
-// ai.opencode.managed [02 §9 item 9] is not checked: reading it needs plutil.
+// XDG_CONFIG_HOME and OPENCODE_DISABLE_PROJECT_CONFIG say; a provider.<id> entry there is merged over the provider's
+// catalog entry and beats the key in keyVar [02 §9; provider.ts]. So for a keyed profile the entry of its provider
+// (every entry when the model names none) is read, as JSONC, and a field there that picks the credential or the
+// endpoint (routeFields) refuses the run, named, never with its value. An endpoint setting (baseURL, api, npm) may move
+// into the isolated home's own config; a credential (apiKey, headers, env) may not: OpenCode reads that file as its
+// global config, where it wins just the same, and the adapter does not check it. A harmless entry ({}, a name, model
+// metadata, timeouts) runs. An empty file (no bytes, or a BOM only) is skipped: OpenCode loads it as {} (config.ts
+// loadFile: `if (!text) return {}`; not pinned in [02]). Any other file that cannot be read as a JSON(C) object cannot
+// be checked and is refused too. The macOS MDM plist ai.opencode.managed [02 §9 item 9] is not checked: reading it
+// needs plutil.
 function globalProviderProblem(profile, ctx, keyVar) {
   const home = effectiveEnv(profile, ctx, "HOME");
   const provider = providerOf(profile);
   const own = path.join(isolatedHome(ctx), "config", "opencode", "opencode.json");
   const managed = MANAGED_CONFIG_DIRS[ctx?.platform] ?? null;
   const dirs = [...(typeof home === "string" && path.isAbsolute(home) ? [path.join(home, ".opencode")] : []), ...(managed ? [managed] : [])];
+  const read = (file) => {
+    try {
+      return ctx.fs.readFile?.(file) ?? null;
+    } catch {
+      return null;
+    }
+  };
   for (const dir of dirs) {
-    // A managed file is its administrator's to change; a ~/.opencode entry may move into the isolated config.
+    // A managed file is its administrator's to change; a ~/.opencode endpoint setting may move into the isolated config.
     const admin = dir === managed ? " (the machine's managed OpenCode config: its administrator does that)" : "";
     for (const name of ["opencode.json", "opencode.jsonc"]) {
       const file = path.join(dir, name);
       if (ctx?.fs?.exists?.(file) !== true) continue;
-      let config = null;
-      try {
-        config = JSON.parse(ctx.fs.readFile?.(file) ?? "");
-      } catch {
-        config = null;
-      }
+      // An empty file routes nothing (OpenCode loads it as {}); a null read (unreadable) and whitespace only (which
+      // jsonc-parser rejects, so OpenCode fails at launch) are still refused below.
+      const text = read(file);
+      if (text === "" || (text?.length === 1 && text.charCodeAt(0) === 0xfeff)) continue;
+      const config = parseJsonc(text);
       if (!isObject(config)) {
-        const move = admin || `, or move that entry into ${own} without an apiKey`;
-        return `${file} cannot be read as plain JSON (comments and trailing commas are not read here): OpenCode reads it whatever the isolation, and a provider entry there would win over ${keyVar}; make it plain JSON without a provider.${provider ?? "<provider>"} entry${move}`;
+        const move = admin || `, or move its provider.${provider ?? "<provider>"} settings that carry no credential (baseURL, api, npm) into ${own}`;
+        return `${file} cannot be read as a JSON or JSONC object: OpenCode reads it whatever the isolation, and a provider entry there could win over ${keyVar}, so it is not run unchecked; fix the file${move}`;
       }
-      const providers = isObject(config.provider) ? Object.keys(config.provider) : [];
-      const hit = provider === null ? providers[0] : providers.find((id) => id === provider);
-      if (hit !== undefined) {
-        const id = /^[A-Za-z0-9_.-]+$/.test(hit) ? hit : JSON.stringify(hit);
-        const move = admin || `, or move it into ${own} without an apiKey (OpenCode reads that file too, and an apiKey there would win over ${keyVar} just the same)`;
-        return `${file} sets provider.${id}: OpenCode reads it whatever the isolation, and that entry (its apiKey, baseURL or headers) would win over ${keyVar}; remove that entry${move}`;
+      const ours = (id) => provider === null || id === provider || SUBSTITUTED.test(id);
+      const fields =
+        config.provider === undefined
+          ? []
+          : isObject(config.provider)
+            ? Object.keys(config.provider).filter(ours).flatMap((id) => routeFields(config.provider[id]).map((at) => fieldName(["provider", id, ...at])))
+            : ["provider"];
+      if (fields.length > 0) {
+        const one = fields.length === 1;
+        const named = fields.length > 3 ? `${fields.slice(0, 3).join(", ")} and ${fields.length - 3} more` : fields.join(", ");
+        const move = admin || `; only a setting that carries no credential (baseURL, api, npm) may move into ${own}: OpenCode reads that file too, and an apiKey, a header or an env there would win over ${keyVar} just the same`;
+        return `${file} sets ${named}: OpenCode reads it whatever the isolation, and ${one ? "that setting" : "those settings"} would win over ${keyVar} or send the requests elsewhere; remove ${one ? "it" : "them"}${move}`;
       }
     }
   }

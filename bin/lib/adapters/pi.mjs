@@ -182,7 +182,8 @@ function refuseStoredCredential(profile, ctx, profileName) {
 
 // A session dir recorded in a job's meta, only in the shape the adapter writes it — <jobs dir>/<core job id>/sessions
 // — else null. The record lives under state/, which a sandboxed job may write: a dir taken from it as written would
-// let the job choose the tree the runner's scrub rewrites (keys/, the data root) and the dir a resume runs in.
+// let the job choose the dir a resume runs in. The scrub reads no record (job.planMeta, see scrub) and checks its
+// dir here too, as defence in depth.
 function recordedSessionDir(meta, jobsDir) {
   const dir = meta?.sessionDir;
   if (typeof dir !== "string" || !path.isAbsolute(dir) || path.normalize(dir) !== dir || path.basename(dir) !== "sessions") return null;
@@ -561,7 +562,8 @@ const pi = {
   // with id …" in the stderr tail (only for a resume: the same warning opens every fresh job), and a session file of
   // this id and cwd that was not in the session dir when the job started (meta.sessionFilesBefore) — the one pi created
   // instead. The second does not depend on the warning, printed at startup, surviving the core's 200-line tail behind
-  // a chatty extension's stderr.
+  // a chatty extension's stderr. The dir and the list come from the plan (job.planMeta, kept by the runner from before
+  // pi started), which the record's meta only copies and a job may have rewritten; record.meta only without a plan.
   finalize(job, ctx) {
     if (!job?.record?.resumeOf) return null;
     const lost = (errorText) => ({ ok: false, response: null, errorClass: "resume-lost", errorText });
@@ -569,7 +571,7 @@ const pi = {
       .split("\n")
       .find((text) => LOST_SESSION_RE.test(text));
     if (line) return lost(line.trim());
-    const { sessionDir: dir, sessionFilesBefore: before } = job.record.meta ?? {};
+    const { sessionDir: dir, sessionFilesBefore: before } = job.planMeta ?? job.record.meta ?? {};
     const sessionId = job.record.sessionId;
     if (!Array.isArray(before) || typeof dir !== "string" || !dir || typeof sessionId !== "string" || !ctx?.fs) return null;
     const created = sessionFilesOf(ctx.fs, dir, sessionId)
@@ -586,9 +588,12 @@ const pi = {
   // back what this returns: each text file of the session dir that held a registered value,
   // redacted (<redacted>, as in the log), with its mode. A resume reads only the header's id and cwd
   // (findSessionHeader), which redaction leaves alone, and the model gets <redacted> where the key was. The session dir
-  // comes from the record only in the adapter's own shape (recordedSessionDir), else <job dir>/sessions.
+  // is the one this job's invocation planned (job.planMeta: the runner keeps it from before pi started; for a resume
+  // the dir of the chain's first job), never the record's: a job can rewrite its record's meta.sessionDir to any dir
+  // of the same shape, another job's too, and the scrub would miss its own transcript. Only in the adapter's own shape
+  // (recordedSessionDir), as defence in depth, else <job dir>/sessions.
   scrub(job, ctx) {
-    const dir = job?.dir ? (recordedSessionDir(job.record?.meta, path.dirname(job.dir)) ?? path.join(job.dir, "sessions")) : null;
+    const dir = job?.dir ? (recordedSessionDir(job.planMeta, path.dirname(job.dir)) ?? path.join(job.dir, "sessions")) : null;
     if (typeof ctx?.redact !== "function" || typeof dir !== "string" || !dir) return [];
     return scrubSessionFiles(ctx.fs, dir, ctx.redact);
   },
